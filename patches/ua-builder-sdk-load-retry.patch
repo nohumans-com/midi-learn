@@ -1,0 +1,110 @@
+diff --git a/src/model/collection.ts b/src/model/collection.ts
+index 5a231e1..1602bcf 100644
+--- a/src/model/collection.ts
++++ b/src/model/collection.ts
+@@ -84,7 +84,12 @@ export class Collection<T extends Node> implements List<T> {
+   /** Fetch the member list (and, with the default `levels: 2`, each member's properties). */
+   load(): Promise<void> {
+     if (!this.loading) {
+-      this.loading = this.client.store.load(this.path, this.loadOptions).then(() => undefined);
++      const loading = this.client.store.load(this.path, this.loadOptions).then(() => undefined);
++      // Forget a failure, so the next load() asks again instead of replaying it (fact 103).
++      loading.catch(() => {
++        if (this.loading === loading) this.loading = undefined;
++      });
++      this.loading = loading;
+     }
+     return this.loading;
+   }
+diff --git a/src/model/node.ts b/src/model/node.ts
+index 64bd37f..fb072a0 100644
+--- a/src/model/node.ts
++++ b/src/model/node.ts
+@@ -27,12 +27,18 @@ export abstract class Node {
+   }
+ 
+   /**
+-   * Fetch this node's properties (and child names) once. Later calls return the same promise.
++   * Fetch this node's properties (and child names) once. Later calls return the same promise,
++   * unless it failed: then the next call fetches again.
+    * Pushes keep the cells current afterwards as long as an ancestor is watched.
+    */
+   load(options?: GetOptions): Promise<void> {
+     if (!this.loading) {
+-      this.loading = this.client.store.load(this.path, options).then(() => undefined);
++      const loading = this.client.store.load(this.path, options).then(() => undefined);
++      // Forget a failure, so the next load() asks again instead of replaying it (fact 103).
++      loading.catch(() => {
++        if (this.loading === loading) this.loading = undefined;
++      });
++      this.loading = loading;
+     }
+     return this.loading;
+   }
+diff --git a/src/model/session.ts b/src/model/session.ts
+index 9f90f80..280e955 100644
+--- a/src/model/session.ts
++++ b/src/model/session.ts
+@@ -202,7 +202,16 @@ export class Session extends Node {
+     if (!this.readyPromise) {
+       const watch = this.client.store.watch(this.path, { recursive: true, load: { flatvalue: true, commands: false } });
+       this.watchRelease = watch.release;
+-      this.readyPromise = watch.ready.then(() => Promise.all([this.tracks.load(), this.buses.load(), this.playlists.load(), this.musical.ready(), this.markers.load(), this.contexts.load()])).then(() => undefined);
++      const ready = watch.ready.then(() => Promise.all([this.tracks.load(), this.buses.load(), this.playlists.load(), this.musical.ready(), this.markers.load(), this.contexts.load()])).then(() => undefined);
++      // A failed load is not remembered: LUNA can time a request out while it is still opening
++      // the session (fact 103), and the next ready() must try again rather than replay the error.
++      ready.catch(() => {
++        if (this.readyPromise !== ready) return;
++        this.readyPromise = undefined;
++        this.watchRelease?.();
++        this.watchRelease = undefined;
++      });
++      this.readyPromise = ready;
+     }
+     return this.readyPromise;
+   }
+diff --git a/tests/unit/store-regressions.test.ts b/tests/unit/store-regressions.test.ts
+index 79b0182..60fbc9c 100644
+--- a/tests/unit/store-regressions.test.ts
++++ b/tests/unit/store-regressions.test.ts
+@@ -134,3 +134,40 @@ describe('Store watches', () => {
+     await store.close();
+   });
+ });
++
++describe('Retrying after a failed load (fact 103)', () => {
++  async function opened(tracks = ['Kick']) {
++    const { Luna } = await import('../../src/index');
++    const engine = new MockEngine();
++    engine.addSession('abc', { name: 'Opening', tracks });
++    await engine.settled();
++    const luna = await Luna.connect({ port_: engine.port() });
++    await luna.sessions.ready();
++    return { engine, luna, session: luna.sessions.current()! };
++  }
++
++  it('session.ready() asks again after a load that timed out, instead of replaying the failure', async () => {
++    const { engine, luna, session } = await opened();
++    engine.fail('/sessions/abc/tracks', 'timeout', 1); // LUNA still opening the session
++    await expect(session.ready()).rejects.toMatchObject({ code: 'timeout' });
++    await session.ready();
++    expect(session.visibleTracks.map((t) => t.name.value)).toEqual(['Kick']);
++    await luna.close();
++  });
++
++  it('collection.load() and node.load() forget a failure', async () => {
++    const { engine, luna, session } = await opened();
++    await session.ready();
++    const kick = session.visibleTracks[0]!;
++    engine.fail(kick.main.controls.path, 'timeout', 1);
++    await expect(kick.main.controls.load()).rejects.toMatchObject({ code: 'timeout' });
++    await kick.main.controls.load();
++    expect(kick.gain.display.value).toBe('0.0');
++    const solo = kick.controls.get('solo');
++    engine.fail(solo.path, 'timeout', 1);
++    await expect(solo.load()).rejects.toMatchObject({ code: 'timeout' });
++    await solo.load();
++    expect(solo.name.value).toBe('solo');
++    await luna.close();
++  });
++});

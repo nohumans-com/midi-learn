@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>MIDI Learn</title>
+  <style>
+    /* Vocal Booth's tokens. The room (--tape) is any colour; on dark ones the ink flips to white. */
+    :root {
+      --chalk: #F6F6F3; --tape: #FFB65A; --ink: #000; --paper: #E9E9E6;
+      --red: #FF3B30; --yellow: #FFC400; --green: #34C759;
+      --fg: #000; --fg-2: rgba(0, 0, 0, 0.5); --line: rgba(0, 0, 0, 0.09); --well: rgba(0, 0, 0, 0.07);
+      --grid: rgba(0, 0, 0, 0.07); /* the background grid only: quieter than any line that means something */
+      --card: rgba(255, 255, 255, 0.55); --card-hi: rgba(255, 255, 255, 0.78); --rule: rgba(0, 0, 0, 0.14); --stroke: rgba(0, 0, 0, 0.32);
+      --solid: #000; --on-solid: #fff; --cell: 44px; --gap: 14px;
+      --spring: cubic-bezier(0.32, 0.72, 0, 1);
+      --type: "Helvetica Neue", "Neue Haas Grotesk Text", Helvetica, Arial, -apple-system, sans-serif;
+      color-scheme: light;
+    }
+    :root[data-tone="dark"] {
+      --fg: #fff; --fg-2: rgba(255, 255, 255, 0.62); --line: rgba(255, 255, 255, 0.12); --well: rgba(255, 255, 255, 0.12);
+      --grid: rgba(255, 255, 255, 0.035); /* barely there on dark rooms, so it never competes with the controls */
+      --card: rgba(255, 255, 255, 0.09); --card-hi: rgba(255, 255, 255, 0.16); --rule: rgba(255, 255, 255, 0.16); --stroke: rgba(255, 255, 255, 0.34);
+      --solid: #fff; --on-solid: #000; color-scheme: dark;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { height: 100%; overscroll-behavior: none; }
+    body {
+      margin: 0; background: var(--tape); color: var(--fg); font: 15px/1.25 var(--type); -webkit-font-smoothing: antialiased;
+      display: flex; flex-direction: column; overflow: hidden; transition: background-color 300ms ease, color 300ms ease;
+      -webkit-user-select: none; user-select: none;
+    }
+    input { -webkit-user-select: text; user-select: text; }
+    button, select, input { font: inherit; color: inherit; }
+    button { cursor: pointer; border: 0; background: none; padding: 0; }
+    button:disabled { opacity: 0.35; cursor: default; }
+    :focus-visible { outline: 2px solid var(--fg); outline-offset: 3px; }
+    [hidden] { display: none !important; }
+    select option { color: #000; }
+
+    /* ---- Status line ---------------------------------------------------------------- */
+    .status { display: flex; align-items: center; gap: 8px; padding: 10px 16px 8px; font-size: 13px; font-weight: 500; flex: none; min-width: 0; }
+    .status .session { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
+    .status .session b { font-weight: 700; }
+    .status .session span { color: var(--fg-2); }
+    .chip {
+      position: relative; display: flex; align-items: center; gap: 6px; height: 28px; min-width: 0; max-width: min(280px, 44vw);
+      padding: 0 26px 0 11px; border-radius: 14px; background: rgba(128, 128, 128, 0.18); cursor: pointer; transition: background-color 200ms; flex: 0 1 auto;
+    }
+    .chip:hover { background: rgba(128, 128, 128, 0.26); }
+    .chip:focus-within { outline: 2px solid var(--fg); outline-offset: 2px; }
+    .chip .k { font-size: 12px; font-weight: 500; color: var(--fg-2); flex: none; }
+    .chip select { appearance: none; -webkit-appearance: none; border: 0; background: transparent; padding: 0; min-width: 0; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; cursor: pointer; outline: none; }
+    .chip::after { content: ""; position: absolute; right: 11px; top: 50%; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.8px 1.8px 0; transform: translateY(-70%) rotate(45deg); pointer-events: none; }
+    .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: #bbb; flex: none; transition: background 300ms; }
+    .chip .dot.live { background: var(--green); }
+    .chip .dot.hit { background: var(--hit, var(--yellow)); transition: none; }
+    .link { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--fg-2); flex: none; }
+    .link::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #bbb; transition: background 300ms; }
+    .link.live::before { background: var(--green); }
+    .help-btn { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; flex: none; font-size: 15px; font-weight: 700; background: rgba(128, 128, 128, 0.18); }
+    .help-btn:hover { background: rgba(128, 128, 128, 0.26); }
+    .help { width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 70px); overflow-y: auto; padding: 16px 18px; }
+    .pop.help h4 { margin: 0 0 4px; font-size: 18px; letter-spacing: -0.02em; }
+    .help > p { margin: 0 0 10px; font-size: 13px; color: rgba(0, 0, 0, 0.6); }
+    .help details { border-top: 1px solid rgba(0, 0, 0, 0.1); }
+    .help summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; padding: 10px 0; font-size: 14px; font-weight: 700; }
+    .help summary::-webkit-details-marker { display: none; }
+    .help summary::before { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.8px 1.8px 0; transform: rotate(-45deg); transition: transform 200ms var(--spring); flex: none; }
+    .help details[open] > summary::before { transform: rotate(45deg); }
+    .help .doc { padding: 0 0 12px 14px; font-size: 13px; line-height: 1.45; color: rgba(0, 0, 0, 0.78); -webkit-user-select: text; user-select: text; }
+    .help .doc p { margin: 0 0 8px; }
+    .help .doc dl { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 12px; }
+    .help .doc dt { font-weight: 700; color: #000; }
+    .help .doc dd { margin: 0; }
+    .help kbd { font: 600 11px Menlo, ui-monospace, monospace; background: rgba(0, 0, 0, 0.07); padding: 1px 5px; border-radius: 4px; }
+    .swatch { width: 28px; height: 28px; border-radius: 50%; background: var(--tape); box-shadow: inset 0 0 0 2px var(--fg), inset 0 0 0 4px var(--chalk); flex: none; }
+
+    /* ---- Board: one page, three columns that stack ---------------------------------- */
+    .board {
+      flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 6px 16px 20px;
+      display: grid; gap: 22px var(--gap); grid-template-columns: minmax(0, 1fr); align-content: start;
+      background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+      background-size: var(--cell) var(--cell); background-position: -1px -1px;
+    }
+    .col { display: flex; flex-direction: column; gap: 14px; min-width: 0; container-type: inline-size; }
+    h2 { margin: 0; font-size: clamp(26px, 5vw, 34px); font-weight: 700; letter-spacing: -0.035em; line-height: 1; }
+    h3 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: baseline; gap: 8px; }
+    h3 small { font-size: 13px; font-weight: 600; color: var(--fg-2); letter-spacing: 0; font-variant-numeric: tabular-nums; }
+    .lede { margin: 6px 0 0; color: var(--fg-2); font-size: 14px; max-width: 46ch; }
+    .head { display: flex; align-items: center; gap: 8px; min-height: 32px; flex-wrap: wrap; }
+    .head h3 { margin-right: auto; }
+
+    /* Wide (the long bottom-tab shape): Proxy, Mappings and Channel Focus | Parameters, each
+       column scrolling on its own. */
+    @media (min-width: 720px) {
+      .board { grid-template-columns: minmax(0, 1fr) var(--c3, 330px); grid-template-rows: minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
+      .board.fold-browse { --c3: max-content; }
+      .col { overflow-y: auto; overscroll-behavior: contain; padding-bottom: 20px; scrollbar-width: thin; }
+      /* A scrolling column clips what reaches outside it; give it 12px of room on each side (and
+         take it back with the margin), so an open mapping's outline isn't cut off. */
+      .col { margin: 0 -12px; padding-left: 12px; padding-right: 12px; }
+    }
+    @media (min-width: 720px) and (max-width: 1079px) {
+      .board { grid-template-columns: minmax(0, 1fr) var(--c3, 290px); }
+    }
+
+    /* ---- Learn ---------------------------------------------------------------------- */
+
+    /* Folding: a section's header stays, its body goes; in the wide layout the column narrows. */
+    .body { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+    .col.folded > .body { display: none; } /* its own body only, not a section nested inside it */
+    .col.folded { container-type: normal; } /* size containment would make a folded column 0 wide */
+    .fold { display: flex; align-items: center; gap: 8px; text-align: left; margin-right: auto; min-width: 0; }
+    .fold::before { content: ""; width: 7px; height: 7px; border: solid currentColor; border-width: 0 2px 2px 0; transform: rotate(45deg) translate(-2px, -2px); transition: transform 260ms var(--spring); flex: none; }
+    .fold[aria-expanded="false"]::before { transform: rotate(-45deg); }
+    .head .fold h3 { margin: 0; }
+
+    /* The learn bar: opens at the top of the section that is learning. */
+    .learnbar { display: flex; flex-direction: column; gap: 10px; margin-bottom: 6px; animation: rise 320ms var(--spring) both; }
+    .learnbar .slots { grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr); }
+    .learnbar.proxy .slots { grid-template-columns: 1fr; }
+    .learnbar.proxy #slot-target { display: none; }
+    .lb-foot { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+    .hold-switch { flex: none; }
+    @media (max-width: 560px) { .learnbar .slots { grid-template-columns: 1fr; } }
+    .learn-menu { padding: 6px; display: flex; flex-direction: column; min-width: 220px; position: fixed; }
+    .learn-menu button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 8px 10px; border-radius: 10px; }
+    .learn-menu button:hover, .learn-menu button:focus-visible { background: rgba(0, 0, 0, 0.07); outline: none; }
+    .learn-menu b { font-size: 14px; }
+    .learn-menu small { font-size: 12px; color: rgba(0, 0, 0, 0.55); }
+    .learn-pill[aria-pressed="true"][data-latched="true"] { background: var(--red); color: #fff; }
+    .learn-pill[aria-pressed="true"][data-latched="true"]::before { background: #fff; }
+
+    .slots { display: grid; grid-template-columns: 1fr; gap: 10px; }
+    .slot {
+      position: relative; border-radius: 4px; padding: 12px; min-height: 76px; gap: 8px;
+      background: linear-gradient(var(--card), var(--card)), var(--tape); /* solid: the grid stays behind it */ display: flex; flex-direction: column; justify-content: space-between;
+      transition: background-color 260ms, color 260ms, transform 260ms var(--spring); min-width: 0;
+    }
+    .slot .n { font-size: 12px; font-weight: 700; display: flex; align-items: center; gap: 6px; }
+    .slot .n i { width: 22px; height: 22px; border-radius: 50%; background: rgba(0, 0, 0, 0.09); display: grid; place-items: center; font-style: normal; font-size: 11px; }
+    :root[data-tone="dark"] .slot .n i { background: rgba(255, 255, 255, 0.14); }
+    .slot .what { font-size: 18px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+    .slot .what small { display: block; font-size: 12px; font-weight: 500; opacity: 0.6; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; }
+    .slot.wait .what { opacity: 0.45; }
+    .slot.got { background: var(--ink); color: #fff; animation: pop 420ms var(--spring); }
+    .slot.got .n i { background: rgba(255, 255, 255, 0.17); }
+    .slot.armed::after { content: ""; position: absolute; top: 12px; right: 12px; width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: blink 1s steps(2) infinite; }
+    @keyframes blink { 50% { opacity: 0; } }
+    .src-edit { display: grid; grid-template-columns: auto 1fr auto; grid-template-areas: "type type go" "num ch go"; align-items: center; gap: 8px 8px; }
+    .src-edit .segments { grid-area: type; justify-self: start; }
+    .src-edit .num { grid-area: num; width: 100%; min-width: 0; height: 34px; border: 0; border-radius: 8px; background: var(--well); padding: 0 10px; font-size: 18px; font-weight: 700; color: inherit; outline: none; font-variant-numeric: tabular-nums; }
+    .src-edit .num:focus { box-shadow: inset 0 0 0 2px currentColor; }
+    .src-edit .num:disabled { opacity: 0.35; }
+    .src-edit .ch { grid-area: ch; display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; }
+    .src-edit .ch select { appearance: none; -webkit-appearance: none; border: 0; border-radius: 8px; background: var(--well); height: 34px; padding: 0 10px; font-size: 14px; font-weight: 700; color: inherit; }
+    .src-edit #src-assign { grid-area: go; align-self: stretch; padding: 0 14px; border-radius: 10px; font-size: 13px; }
+    .slot.got .num, .slot.got .ch select { background: rgba(255, 255, 255, 0.16); }
+    .slot.got .segments { background: rgba(255, 255, 255, 0.14); }
+    .slot.got .segments button[aria-pressed="true"], .slot.got #src-assign { background: #fff; color: #000; }
+    .slot.got #src-assign:disabled { opacity: 0.35; }
+    @keyframes pop { from { transform: scale(0.94); } }
+
+    .meter { height: 6px; border-radius: 3px; background: var(--well); overflow: hidden; }
+    .meter i { display: block; height: 100%; width: var(--v, 0%); background: var(--fg); transition: width 60ms linear; }
+
+    /* ---- Buttons -------------------------------------------------------------------- */
+    .pill { font-size: 12px; font-weight: 700; padding: 6px 12px; border-radius: 14px; background: var(--well); white-space: nowrap; transition: background-color 200ms, transform 180ms var(--spring); }
+    .pill:hover { background: var(--rule); }
+    .pill:active { transform: scale(0.95); }
+    .pill.solid { background: var(--solid); color: var(--on-solid); }
+    .pill.danger { color: var(--red); }
+    .x { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: var(--fg-2); flex: none; }
+    .x:hover { background: var(--well); color: var(--fg); }
+    .x svg { width: 12px; height: 12px; }
+    .segments { display: flex; gap: 3px; padding: 3px; background: rgba(0, 0, 0, 0.1); border-radius: 16px; }
+    :root[data-tone="dark"] .segments { background: rgba(255, 255, 255, 0.1); }
+    .segments button { padding: 5px 11px; border-radius: 13px; font-size: 12px; font-weight: 700; white-space: nowrap; transition: background-color 240ms var(--spring), color 240ms; }
+    .segments button[aria-pressed="true"] { background: var(--solid); color: var(--on-solid); }
+    .switch { display: flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 700; }
+    .switch i { width: 36px; height: 22px; border-radius: 11px; background: var(--well); position: relative; transition: background 250ms; flex: none; }
+    .switch i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25); transition: transform 320ms var(--spring); }
+    .switch[aria-pressed="true"] i { background: var(--green); }
+    .switch[aria-pressed="true"] i::after { transform: translateX(14px); }
+
+    /* ---- Channel Focus ---------------------------------------------------------------- */
+    .sect { display: flex; flex-direction: column; gap: 14px; margin-top: 18px; min-width: 0; }
+    .sect.folded > .body { display: none; }
+    .sect.first { margin-top: 0; }
+    /* One gap between every section, open or folded, within a column and between columns. */
+    .board { --section-gap: 26px; row-gap: var(--section-gap); }
+    #col-maps { gap: var(--section-gap); }
+    #col-maps > .sect { margin-top: 0; }
+    .saved-maps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--fg-2); }
+    .saved-maps .map-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 4px 0 11px; border-radius: 14px; background: var(--well); color: var(--fg); font-weight: 700; }
+    .saved-maps .map-chip.on { background: var(--solid); color: var(--on-solid); }
+    .saved-maps .map-chip small { font-weight: 600; opacity: 0.6; }
+    .saved-maps .map-chip .x { width: 22px; height: 22px; color: inherit; }
+    .saved-maps .map-chip .x.confirm { background: var(--red); color: #fff; }
+    .sect.folded #plugin-fb, .sect.folded .plugin-chip { display: none; }
+    /* Folded, a section's header says what it's controlling, in a plain weight so it reads as
+       a status line rather than part of the title. */
+    .fold-sum { flex: 1 1 0; min-width: 0; font-size: 13px; font-weight: 400; color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sect:not(.folded) .fold-sum { display: none; }
+    /* Folded, line everything in the header up on the title's text baseline, so the summary sits
+       on the same line as the title instead of floating above it. */
+    .sect.folded > .head, .col.folded > .head { align-items: baseline; }
+    .sect.folded .fold { margin-right: 0; }
+    .sect.folded .segments, .sect.folded .focus-chip, .sect.folded #focus-fb { display: none; }
+    .focus-chip { max-width: min(220px, 50%); }
+    .swatch-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c, #888); flex: none; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.2); }
+    .learn-pill { display: inline-flex; align-items: center; gap: 6px; }
+    .learn-pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+    .learn-pill[aria-pressed="true"] { background: var(--solid); color: var(--on-solid); }
+    .learn-pill[aria-pressed="true"]::before { animation: blink 1s steps(2) infinite; }
+    .slot .mode-note { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 9px; background: var(--ink); color: var(--tape); margin-left: auto; }
+    .slot.got .mode-note { background: #fff; color: #000; }
+
+    /* ---- Proxy ----------------------------------------------------------------- */
+    .mighty { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "src tgt val" "opts opts opts"; align-items: center; gap: 10px 10px; padding: 12px; border-radius: 4px; background: linear-gradient(var(--card), var(--card)), var(--tape); }
+    .mighty .src { grid-area: src; }
+    .mighty .tgt { grid-area: tgt; min-width: 0; }
+    .mighty .val { grid-area: val; }
+    .mighty .mighty-opts { grid-area: opts; display: flex; align-items: center; gap: 14px; }
+    .mighty .mighty-opts .x { margin-left: auto; }
+    .mighty[data-state="empty"] .val, .mighty[data-state="empty"] .mighty-opts { display: none; }
+    .mighty[data-state="empty"] .tgt b { opacity: 0.45; }
+    .mighty.hit .src { background: var(--hit, var(--yellow)); color: var(--on-hit, #000); transition: none; }
+    .mighty.retarget { animation: pop 420ms var(--spring); }
+
+    /* ---- Mappings ------------------------------------------------------------------- */
+    .maps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+    .map { border-bottom: 1px solid var(--rule); border-radius: 0; transition: box-shadow 200ms ease; }
+    /* An open mapping gets a thin rounded outline, so its settings read as one block. It grows
+       outward (negative margin, matching padding), so nothing inside shifts. */
+    .map.open { border-bottom-color: transparent; border-radius: 12px; box-shadow: inset 0 0 0 1px var(--stroke); margin: 6px -12px; padding: 0 12px 4px; }
+    .map.new { animation: rise 420ms var(--spring) both; } /* only a row that just appeared */
+    @keyframes rise { from { transform: translateY(8px); opacity: 0; } }
+    .map .row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 10px; min-height: 60px; padding: 6px 0; }
+    .src { min-width: 66px; height: 34px; padding: 0 10px; border-radius: 17px; background: var(--ink); color: #fff; display: grid; place-items: center; font-size: 12px; font-weight: 700; white-space: nowrap; font-variant-numeric: tabular-nums; transition: background-color 400ms ease, color 400ms; }
+    :root[data-tone="dark"] .src { background: #fff; color: #000; }
+    .map.hit .src { background: var(--hit, var(--yellow)); color: var(--on-hit, #000); transition: none; }
+    .map.learned .src { background: var(--green); color: #000; }
+    .tgt { min-width: 0; }
+    .tgt b { display: block; font-size: 17px; font-weight: 700; letter-spacing: -0.02em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tgt small { display: block; font-size: 12px; font-weight: 500; color: var(--fg-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .map.missing .tgt b { opacity: 0.45; text-decoration: line-through; text-decoration-thickness: 1.5px; }
+    .val { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; width: 84px; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
+    .val .meter { width: 100%; height: 4px; }
+    .tags { display: flex; align-items: center; gap: 4px; }
+    .tag { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 10px; background: var(--well); white-space: nowrap; }
+    .tag.global { background: var(--ink); color: var(--tape); }
+    :root[data-tone="dark"] .tag.global { background: #fff; color: #000; }
+    .more { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; }
+    .more:hover { background: var(--well); }
+    .more svg { width: 14px; height: 14px; transition: transform 300ms var(--spring); }
+    .map.open .more svg { transform: rotate(180deg); }
+    .edit { display: none; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px 18px; padding: 4px 0 14px; }
+    .map.open .edit { display: grid; }
+    .map.opening .edit { animation: rise 320ms var(--spring) both; } /* only when the user opens it */
+    .edit label, .edit .lbl { display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 600; color: var(--fg-2); }
+    .edit .line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--fg); }
+    .edit select { appearance: none; -webkit-appearance: none; border: 0; border-bottom: 2px solid var(--fg); background: transparent; font-size: 15px; font-weight: 700; padding: 4px 18px 4px 0; border-radius: 0; color: var(--fg); min-width: 0; max-width: 100%; }
+    .src-line select, .src-line input { border: 0; border-radius: 8px; background: var(--well); height: 32px; padding: 0 10px; font-size: 14px; font-weight: 700; color: var(--fg); }
+    .src-line select { appearance: none; -webkit-appearance: none; border-bottom: 0; }
+    .src-line input { width: 64px; outline: none; font-variant-numeric: tabular-nums; }
+    .src-line input:focus { box-shadow: inset 0 0 0 2px var(--fg); }
+    .num.bad, .s-num.bad { box-shadow: inset 0 0 0 2px var(--red) !important; }
+    .edit .lbl { display: flex; flex-direction: column; gap: 6px; font-size: 12px; font-weight: 600; color: var(--fg-2); }
+    /* Range: one solid line, the chosen span drawn solid, two white fader caps. */
+    .range { display: grid; grid-template-columns: 3ch 1fr 3ch; align-items: center; gap: 10px; color: var(--fg); }
+    .range b { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; text-align: center; }
+    .rail { position: relative; height: 30px; cursor: pointer; touch-action: none; }
+    .rail .track { position: absolute; inset: 0 10px; }
+    .rail .track::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--fg); opacity: 0.18; }
+    .rail .fill { position: absolute; top: 50%; height: 2px; margin-top: -1px; border-radius: 1px; background: var(--fg); }
+    .rail .cap {
+      position: absolute; top: 50%; width: 20px; height: 20px; margin: -10px 0 0 -10px; border-radius: 50%; background: #fff;
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.28), 0 0 0 0.5px rgba(0, 0, 0, 0.14); transition: transform 180ms var(--spring); touch-action: none;
+    }
+    .rail .cap.drag, .rail .cap:active { transform: scale(1.18); }
+    .rail .cap:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+    .empty { margin: 0; padding: 20px 0; font-size: 18px; font-weight: 600; letter-spacing: -0.01em; max-width: 34ch; }
+    .empty small { display: block; margin-top: 6px; font-size: 14px; font-weight: 500; color: var(--fg-2); }
+
+    /* ---- Parameters ----------------------------------------------------------------- */
+    .search { width: 100%; height: 38px; border: 0; border-radius: 10px; background: var(--well); padding: 0 12px; font-size: 14px; font-weight: 600; color: var(--fg); outline: none; }
+    .search::placeholder { color: var(--fg-2); }
+    .search:focus { box-shadow: inset 0 0 0 2px var(--fg); }
+    .group { display: flex; flex-direction: column; }
+    .group > button.gh { display: flex; align-items: center; gap: 8px; height: 36px; font-size: 13px; font-weight: 700; text-align: left; border-bottom: 1px solid var(--rule); }
+    .group > button.gh::before { content: ""; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.8px 1.8px 0; transform: rotate(-45deg); transition: transform 240ms var(--spring); flex: none; margin: 0 2px; }
+    .group.open > button.gh::before { transform: rotate(45deg); }
+    .group > button.gh small { color: var(--fg-2); font-weight: 600; margin-left: auto; }
+    .group .items { display: none; flex-direction: column; padding: 4px 0 8px; }
+    .group.open .items { display: flex; }
+    .param { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 36px; padding: 4px 10px; border-radius: 4px; text-align: left; transition: background-color 160ms; }
+    .param:hover { background: var(--card); }
+    .param b { font-size: 14px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+    .param small { font-size: 11px; color: var(--fg-2); font-weight: 500; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .param.hint b { font-weight: 600; }
+    .param.hint small { white-space: normal; }
+    .param .v { font-size: 12px; font-weight: 600; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+    .param.picked { background: var(--ink); color: #fff; }
+    .param.picked small, .param.picked .v { color: rgba(255, 255, 255, 0.6); }
+    .param .mapped { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; margin-left: 6px; vertical-align: middle; }
+    .note { font-size: 12px; font-weight: 500; color: var(--fg-2); margin: 0; }
+    .note.warn { color: var(--fg); font-weight: 600; }
+    .note.banner { background: var(--ink); color: #fff; border-radius: 4px; padding: 12px; font-size: 13px; line-height: 1.35; }
+    .note.banner b { display: block; margin-bottom: 4px; font-size: 14px; }
+    .note.banner code { font: 600 12px Menlo, ui-monospace, monospace; background: rgba(255, 255, 255, 0.16); padding: 1px 5px; border-radius: 4px; -webkit-user-select: text; user-select: text; }
+    :root[data-tone="dark"] .note.banner { background: #fff; color: #000; }
+    :root[data-tone="dark"] .note.banner code { background: rgba(0, 0, 0, 0.08); }
+
+    /* ---- Popovers: background colour, templates -------------------------------------- */
+    .pop { position: fixed; top: 46px; right: 16px; z-index: 40; background: var(--chalk); color: #000; border-radius: 16px; padding: 14px; width: max-content; max-width: calc(100vw - 32px);
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22); animation: rise 260ms var(--spring) both; --fg: #000; --fg-2: rgba(0, 0, 0, 0.5); --well: rgba(0, 0, 0, 0.07); --rule: rgba(0, 0, 0, 0.12); --solid: #000; --on-solid: #fff; }
+    .pop h4 { margin: 0 0 10px; font-size: 13px; }
+    .colors .grid { display: grid; grid-template-columns: repeat(6, 30px); gap: 10px; }
+    .colors .grid button { width: 30px; height: 30px; border-radius: 50%; background: var(--c); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18); transition: transform 160ms var(--spring); }
+    .colors .grid button:hover { transform: scale(1.08); }
+    .colors .grid button[aria-pressed="true"] { box-shadow: 0 0 0 2px var(--chalk), 0 0 0 4px #000; }
+    .colors label { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: 13px; font-weight: 600; }
+    .colors .custom { width: 40px; height: 28px; border-radius: 8px; background: var(--c, #FFB65A); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18); }
+    .colors .custom[aria-expanded="true"] { box-shadow: 0 0 0 2px var(--chalk), 0 0 0 4px #000; }
+    .colors .reset { margin-left: auto; font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 12px; background: rgba(0, 0, 0, 0.08); }
+    .picker { margin-top: 12px; display: grid; gap: 10px; }
+    .picker .sv { position: relative; height: 120px; border-radius: 10px; cursor: crosshair; touch-action: none;
+      background: linear-gradient(to top, #000, transparent), linear-gradient(to right, #fff, hsl(var(--h, 30) 100% 50%)); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12); }
+    .picker .sv i { position: absolute; width: 16px; height: 16px; margin: -8px 0 0 -8px; border-radius: 50%; box-shadow: 0 0 0 2px #fff, 0 0 0 3.5px rgba(0, 0, 0, 0.5); pointer-events: none; }
+    .picker .hue { -webkit-appearance: none; appearance: none; width: 100%; height: 14px; border-radius: 7px; margin: 0; background: linear-gradient(to right, #f00, #ff0, #0f0, #0ff, #00f, #f0f, #f00); box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.12); }
+    .picker .hue::-webkit-slider-thumb { -webkit-appearance: none; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 1.5px rgba(0, 0, 0, 0.45); cursor: pointer; }
+    .picker .hex { width: 100%; height: 30px; border: 0; border-radius: 8px; padding: 0 10px; font: 600 13px Menlo, ui-monospace, monospace; background: rgba(0, 0, 0, 0.06); color: #000; }
+    @media (max-width: 300px) { .colors .grid { grid-template-columns: repeat(4, 30px); } }
+    .templates { width: min(340px, calc(100vw - 32px)); display: flex; flex-direction: column; gap: 12px; }
+    .templates .save { display: flex; gap: 8px; }
+    .templates .save input { flex: 1; min-width: 0; height: 32px; border: 0; border-radius: 8px; padding: 0 10px; background: rgba(0, 0, 0, 0.06); font-size: 13px; font-weight: 600; color: #000; outline: none; }
+    .templates .save input:focus { box-shadow: inset 0 0 0 2px #000; }
+    .templates ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; max-height: 220px; overflow-y: auto; }
+    .templates li { display: flex; align-items: center; gap: 6px; min-height: 40px; border-bottom: 1px solid rgba(0, 0, 0, 0.1); }
+    .templates li b { flex: 1; min-width: 0; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .templates li b small { display: block; font-size: 11px; font-weight: 500; color: rgba(0, 0, 0, 0.5); }
+    .templates .foot { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .toast {
+      position: fixed; left: 16px; right: 16px; bottom: 16px; margin: 0 auto; max-width: 520px; padding: 12px 16px; border-radius: 16px; z-index: 50;
+      background: var(--ink); color: #fff; font-size: 14px; font-weight: 500; box-shadow: 0 12px 30px -12px rgba(0, 0, 0, 0.5);
+      transform: translateY(16px) scale(0.98); opacity: 0; pointer-events: none; transition: transform 420ms var(--spring), opacity 260ms ease;
+    }
+    :root[data-tone="dark"] .toast { background: #fff; color: #000; }
+    .toast.show { transform: none; opacity: 1; }
+    .toast.error { background: var(--red); color: #fff; }
+
+    @container (max-width: 340px) {
+      .slot .what { font-size: 15px; }
+      .head .pill, .head .switch { font-size: 11px; }
+    }
+    /* Short windows (LUNA's bottom tab): a tighter learn bar. */
+    @media (max-height: 460px) {
+      .slot { min-height: 0; padding: 10px; }
+      .slot .what { font-size: 15px; }
+      .col { gap: 10px; }
+    }
+    /* LUNA's side browser: a narrow, tall panel whose width the user sets. */
+    @container (max-width: 380px) {
+      .map .row { gap: 8px; min-height: 52px; }
+      .src { min-width: 52px; height: 30px; padding: 0 8px; font-size: 11px; }
+      .tgt b { font-size: 15px; }
+      .val { width: 52px; font-size: 12px; }
+      .more, .x { width: 24px; height: 24px; }
+    }
+    @media (max-width: 420px) {
+      .map.open { margin: 6px -8px; padding: 0 8px 4px; } /* the board's padding is 12px here */
+      .status { padding: 8px 12px 6px; gap: 6px; }
+      .link { font-size: 0; gap: 0; }
+      .board { padding-left: 12px; padding-right: 12px; }
+      .chip { padding: 0 22px 0 9px; }
+      .chip::after { right: 9px; }
+    }
+    @media (max-width: 520px) {
+      .status .k { display: none; }
+      .val { width: 60px; }
+      .tags .tag.mode { display: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition-duration: 1ms !important; animation-duration: 1ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <div class="status">
+    <div class="session" id="status">Connecting</div>
+    <label class="chip" title="Which MIDI input MIDI Learn listens to">
+      <i class="dot" id="midi-dot"></i><span class="k">MIDI</span><select id="device" aria-label="MIDI input"></select>
+    </label>
+    <div class="link" id="link">LUNA</div>
+    <button class="pill" id="open-templates" aria-haspopup="dialog" title="Save or load your whole controller layout: every section">Templates</button>
+    <button class="help-btn" id="open-help" aria-label="Help" title="Help: what each part does">?</button>
+    <button class="swatch" id="open-colors" aria-label="Background colour" title="Background colour"></button>
+  </div>
+
+  <main class="board" id="board">
+    <section class="col" id="col-maps" aria-label="Mappings">
+      <section class="sect first" id="mighty-sect" aria-label="Proxy">
+        <div class="head">
+          <button class="fold" data-fold="mighty" aria-expanded="true"><h3>Proxy</h3></button>
+          <span class="fold-sum" id="mighty-sum"></span>
+          <button class="pill learn-pill" id="mighty-learn" data-learn="mighty" aria-pressed="false" title="Learn the knob that drives whatever you click (right-click for options)">Learn</button>
+        </div>
+        <div class="body">
+          <div class="mighty" id="mighty" data-state="empty">
+            <span class="src" id="mighty-src">—</span>
+            <span class="tgt"><b id="mighty-label">No knob yet</b><small id="mighty-where"></small></span>
+            <span class="val"><span class="d" id="mighty-display"></span><span class="meter"><i id="mighty-meter"></i></span></span>
+            <span class="line mighty-opts">
+              <button class="switch" id="mighty-hold" aria-pressed="false" title="Pin: stay on this control; clicks elsewhere don't move it"><i></i>Pin</button>
+              <button class="switch" id="mighty-fb" aria-pressed="true" title="Send the value back, so a motorized knob turns to each new control"><i></i>Feedback</button>
+              <button class="x" id="mighty-x" aria-label="Remove Proxy"><svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <section class="sect" id="maps-sect" aria-label="Mappings">
+        <div class="head">
+          <button class="fold" data-fold="maps" aria-expanded="true"><h3>Mappings <small id="map-count"></small></h3></button>
+          <span class="fold-sum" id="maps-sum"></span>
+          <div class="segments" id="filter" role="group" aria-label="Show">
+            <button data-f="all" aria-pressed="true">All</button><button data-f="session" aria-pressed="false">Session</button><button data-f="global" aria-pressed="false">Global</button>
+          </div>
+          <button class="switch hold-switch" id="learn-hold" aria-pressed="false" hidden title="Hold: keep learning after each mapping, so you can map one control after another"><i></i>Hold</button>
+          <button class="pill learn-pill" id="maps-learn" data-learn="map" aria-pressed="false" title="Learn a mapping (L). Shift-click or right-click to Hold and learn several">Learn</button>
+        </div>
+        <div class="body">
+          <div class="learnbar" id="learnbar" hidden>
+            <div class="slots">
+              <div class="slot wait" id="slot-target"><span class="n"><i>1</i>Parameter</span><span class="what">None</span></div>
+              <div class="slot wait" id="slot-source">
+                <span class="n"><i>2</i>MIDI</span>
+                <div class="src-edit">
+                  <div class="segments" id="src-type" role="group" aria-label="Message">
+                    <button data-t="cc" aria-pressed="true">CC</button><button data-t="note" aria-pressed="false">Note</button><button data-t="pitch" aria-pressed="false">Bend</button>
+                  </div>
+                  <input id="src-num" class="num" inputmode="numeric" maxlength="4" placeholder="#" aria-label="Number" spellcheck="false" autocomplete="off">
+                  <label class="ch">Ch<select id="src-ch" aria-label="Channel"></select></label>
+                  <button class="pill solid" id="src-assign" disabled>Assign</button>
+                </div>
+              </div>
+            </div>
+            <div class="lb-foot"><button class="pill" id="learn-done">Done</button></div>
+          </div>
+          <ul class="maps" id="maps"></ul>
+        </div>
+      </section>
+
+      <section class="sect" id="focus-sect" aria-label="Channel Focus">
+        <div class="head">
+          <button class="fold" data-fold="focus" aria-expanded="true"><h3>Channel Focus <small id="focus-count"></small></h3></button>
+          <span class="fold-sum" id="focus-sum"></span>
+          <label class="chip focus-chip" title="The track Channel Focus controls">
+            <i class="swatch-dot" id="focus-color"></i><select id="focus-track" aria-label="Focused track"></select>
+          </label>
+          <button class="switch" id="focus-fb" aria-pressed="false" title="Feedback for every Channel Focus mapping: motorized knobs follow the focused track"><i></i>Feedback</button>
+          <button class="pill learn-pill" id="focus-learn" data-learn="focus" aria-pressed="false" title="Learn a Channel Focus mapping. Shift-click or right-click to Hold and learn several">Learn</button>
+        </div>
+        <div class="body">
+          <ul class="maps" id="focus-maps"></ul>
+        </div>
+      </section>
+
+      <section class="sect" id="plugin-sect" aria-label="Plugins">
+        <div class="head">
+          <button class="fold" data-fold="plugins" aria-expanded="true"><h3>Plugins <small id="plugin-count"></small></h3></button>
+          <span class="fold-sum" id="plugin-sum"></span>
+          <label class="chip focus-chip plugin-chip" title="The plugin instance the maps control">
+            <select id="plugin-focus" aria-label="Focused plugin"></select>
+          </label>
+          <button class="switch" id="plugin-fb" aria-pressed="false" title="Feedback for the focused plugin's map: motorized knobs follow the instance in focus"><i></i>Feedback</button>
+          <button class="pill learn-pill" id="plugin-learn" data-learn="plugin" aria-pressed="false" title="Learn a parameter into this plugin's map: turn a knob in the plugin's window, then on your controller. Shift-click or right-click to Hold">Learn</button>
+        </div>
+        <div class="body">
+          <ul class="maps" id="plugin-maps"></ul>
+          <div class="saved-maps" id="saved-maps"></div>
+        </div>
+      </section>
+    </section>
+
+    <section class="col" id="col-browse" aria-label="Parameters">
+      <div class="head">
+        <button class="fold" data-fold="browse" aria-expanded="true"><h3>Parameters <small id="param-count"></small></h3></button>
+        <button class="pill" id="rescan" title="Read the session's controls again">Rescan</button>
+      </div>
+      <div class="body">
+        <input class="search" id="search" type="search" placeholder="Search" spellcheck="false" autocomplete="off">
+        <p class="note warn" id="skipped" hidden></p>
+        <div id="groups"></div>
+      </div>
+    </section>
+  </main>
+
+  <div class="pop help" id="help" role="dialog" aria-label="Help" hidden>
+    <h4>MIDI Learn</h4>
+    <p>Map any MIDI controller to anything in LUNA. Three sections do the mapping. Each has its own Learn button.</p>
+    <details open><summary>Learning a mapping</summary><div class="doc">
+      <p>Press <b>Learn</b> in a section's header (<kbd>L</kbd> for Mappings). Then, in either order: touch a control in LUNA (or pick one in Parameters), and move a knob, fader or pad. A learn bar opens at the top of that section while it learns.</p>
+      <dl>
+        <dt>Parameter</dt><dd>What will be controlled: the control you touched or picked.</dd>
+        <dt>MIDI</dt><dd>What controls it. Fills in when you move a control on your controller, or type it: choose CC, Note or Bend, a number (a note can be <kbd>60</kbd> or <kbd>C3</kbd>) and a channel (Any listens on all 16), then <b>Assign</b> or <kbd>Enter</kbd>.</dd>
+        <dt>Hold</dt><dd>Turn on <b>Hold</b> (next to <b>Learn</b> while it learns) (or Shift-click / right-click <b>Learn</b>) to keep learning: after each mapping it waits for the next, so you can map one control after another. Click as many parameters as you like before turning a knob; the last one you clicked is the one that gets mapped. The button turns red (<b>Holding</b>). Turn Hold off, press the button, <b>Stop</b> or <kbd>Esc</kbd> to finish.</dd>
+        <dt>Done / Esc</dt><dd>Stops learning.</dd>
+      </dl>
+      <p>One MIDI control drives one thing: learning it again moves it, from any section.</p>
+    </div></details>
+    <details><summary>Proxy</summary><div class="doc">
+      <p>One knob that controls <b>whatever you last clicked or dragged in LUNA</b>: a fader, a pan, a send, a mute or a plugin parameter. Learn it once, then click around. LUNA doesn't report what the mouse hovers over, only what you touch.</p>
+      <dl>
+        <dt>Pin</dt><dd>Stay on the current control; clicks elsewhere don't move it.</dd>
+        <dt>Feedback</dt><dd>On by default. When the Proxy moves to a new control, that control's value is sent to the knob, so a motorized knob (Roto-Control) turns to it.</dd>
+        <dt>×</dt><dd>Removes the Proxy.</dd>
+      </dl>
+    </div></details>
+    <details><summary>Mappings</summary><div class="doc">
+      <p>Fixed mappings: this knob always drives that control on that track, or runs that command.</p>
+      <dl>
+        <dt>All / Session / Global</dt><dd>Filter the list. Session mappings belong to this session and come back when it reopens. Global mappings work in every session.</dd>
+        <dt>Templates</dt><dd>In the top bar: save or load your whole layout, every section (see Templates).</dd>
+      </dl>
+    </div></details>
+    <details><summary>Channel Focus</summary><div class="doc">
+      <p>A dedicated channel strip on your controller. Its mappings remember <i>which control on a track</i> (the fader, pan, a send, insert 1's Input…) and act on <b>the focused track</b>: the one selected in LUNA. Select another track and the same knobs control it.</p>
+      <dl>
+        <dt>Selected / Lock</dt><dd>Follow LUNA's selection, or lock the focus to one track.</dd>
+        <dt>Feedback</dt><dd>On or off for every Channel Focus mapping at once. On: selecting a track sends its values, so motorized knobs jump to it.</dd>
+        <dt>Plugins</dt><dd>A plugin parameter only works on tracks with the same plugin in the same insert slot; elsewhere its row reads "not on …".</dd>
+        <dt>Stepping tracks</dt><dd>Map <b>Select next track</b> and <b>Select previous track</b> (Parameters → Commands) to two buttons.</dd>
+      </dl>
+    </div></details>
+    <details><summary>Plugins</summary><div class="doc">
+      <p>Plugin maps: one map per plugin <i>type</i> (UA 1176, Pro-Q…), used by <b>whichever instance of it is in focus</b>. Map your knobs once and they control any 1176 you open, in any session.</p>
+      <dl>
+        <dt>Focus</dt><dd>Like Channel Focus: <b>select a track</b> and its plugin with a map is in focus. Turning a knob in another plugin's window switches to that instance until you select another track. Opening a plugin window alone can't: LUNA doesn't tell add-ons which plugin windows are open, only what you touch. The menu can <b>lock</b> one instance.</dd>
+        <dt>Learn</dt><dd>Press <b>Learn</b>, turn a knob in the plugin's window, then one on your controller. Turn on <b>Hold</b> (next to <b>Learn</b> while it learns) to map several parameters in a row.</dd>
+        <dt>A layer</dt><dd>While a plugin with a map is in focus, its knobs win; the same knobs fall back to your other mappings when it isn't. So eight knobs can mean different things for every plugin.</dd>
+        <dt>Feedback</dt><dd>On by default: focusing another instance sends its values, so motorized knobs jump to them.</dd>
+        <dt>Saved maps</dt><dd>Every plugin with a map, with how many controls it has. × deletes a map (press twice).</dd>
+      </dl>
+    </div></details>
+    <details><summary>Templates</summary><div class="doc">
+      <p><b>Templates</b> (top bar) save your whole controller layout, every section: this session's mappings, global mappings, Channel Focus, the Proxy and plugin maps. <b>Load</b> merges a template in; <b>Replace</b> clears those sections first. <b>Export</b>/<b>Import</b> move templates and everything global to another machine.</p>
+    </div></details>
+    <details><summary>A mapping's settings (the ⌄ on a row)</summary><div class="doc">
+      <dl>
+        <dt>MIDI</dt><dd>Retype the message, number and channel. Moving it onto another mapping's control replaces that one.</dd>
+        <dt>Mode: Follow</dt><dd>Knobs and faders set the value. Buttons fire on the press (for buttons that send on, then off on release).</dd>
+        <dt>Mode: Toggle</dt><dd>Each press flips a switch, or toggles a control between its range ends. Buttons mapped to commands fire on every press of a <i>latching</i> button (sends on, then off on the next press, like a Roto button set to TOGGLE).</dd>
+        <dt>Range</dt><dd>The lowest and highest MIDI value (0–127) the control can reach. Drag the two caps, or use the arrow keys (Shift for 10).</dd>
+        <dt>Invert</dt><dd>Turning up turns the control down.</dd>
+        <dt>Global</dt><dd>Use this mapping in every session (Mappings only).</dd>
+        <dt>Feedback</dt><dd>Send LUNA's value back to the controller, so motorized knobs and button lights follow. Off unless turned on (on by default in Channel Focus and Proxy). A ↔ on the row shows it's on.</dd>
+        <dt>Device</dt><dd>The MIDI input this mapping listens to, and where its feedback goes (the output of the same name). <b>Any input</b> listens to all; feedback then goes to whichever device it last heard from.</dd>
+        <dt>×</dt><dd>Deletes the mapping.</dd>
+      </dl>
+    </div></details>
+    <details><summary>Parameters</summary><div class="doc">
+      <p>Everything you can map, per track: strip controls (fader, pan, mute, solo), sends, cues, automation modes, plugins, and LUNA commands. Click one while learning to pick it, or click one any time to start learning it. Search filters the list; <b>Rescan</b> reads the session again.</p>
+      <dl>
+        <dt>Plugins</dt><dd>Listed by name; touch a knob in the plugin's window while learning to map it. Their parameters are read one at a time, never all at once (that can hang LUNA).</dd>
+        <dt>Automation</dt><dd>Off / Read / Write / Touch / Latch buttons, Next automation mode (steps through them), and Automation mode (a knob with five zones).</dd>
+        <dt>Commands</dt><dd>Play/Stop, Record, Loop, Undo, Redo, Save, Select next/previous track and more. <b>Reset parameter to default</b> puts the parameter in focus (the one you last touched in LUNA, or last moved with the Proxy or a Channel Focus knob) back to LUNA's default, as one undo step.</dd>
+      </dl>
+    </div></details>
+    <details><summary>Feedback and motorized controllers</summary><div class="doc">
+      <p>Feedback sends plain 7-bit CC (or note on/off for notes) to the output with the same name as the mapping's device. To avoid loops: nothing is sent while you're moving that control; the controller's own motor echo is ignored; and a value is never sent twice.</p>
+      <p><b>Roto-Control:</b> use MIDI mode, set each knob's resolution to <b>COARSE</b> in Roto-Setup (14-bit FINE values make knobs jump), and match the knob's channel and CC to the mapping.</p>
+    </div></details>
+    <details><summary>Top bar</summary><div class="doc">
+      <dl>
+        <dt>MIDI</dt><dd>Which input MIDI Learn listens to: all, or one device. In LUNA on a Mac, MIDI arrives through a small helper (<kbd>npm run bridge:install</kbd>, once).</dd>
+        <dt>LUNA</dt><dd>Green when connected.</dd>
+        <dt>?</dt><dd>This help.</dd>
+        <dt>Colour</dt><dd>The background colour; text turns white on dark ones.</dd>
+      </dl>
+    </div></details>
+    <details><summary>Keys</summary><div class="doc">
+      <dl>
+        <dt><kbd>L</kbd></dt><dd>Learn in Mappings.</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Stop learning, or close a menu.</dd>
+        <dt>Undo, play, record</dt><dd>LUNA's own shortcuts keep working while MIDI Learn has the focus.</dd>
+      </dl>
+    </div></details>
+  </div>
+  <div class="pop learn-menu" id="learn-menu" role="menu" hidden>
+    <button role="menuitem" data-latch="false"><b>Learn once</b><small>One mapping, then stop</small></button>
+    <button role="menuitem" data-latch="true"><b>Hold</b><small>Keep learning, one after another, until you stop</small></button>
+  </div>
+  <div class="toast" id="message" role="status" aria-live="polite"></div>
+  <input type="file" id="import-file" accept="application/json,.json" hidden>
+
+  <script src="vendor/luna.global.js"></script>
+  <script src="logic.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
