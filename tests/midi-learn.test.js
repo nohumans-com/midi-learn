@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { Luna } from '@uaudio/ua-builder-sdk';
+import { Luna } from '@uaudio/luna-builder-sdk';
 
 globalThis.Luna = Luna; // logic.js is a classic script that reads the Luna global
 await import('../logic.js');
@@ -329,6 +329,23 @@ describe('vendored SDK bundle', () => {
     // patches/ua-builder-sdk-load-retry.patch: Node, Collection and Session forget a failed load.
     expect(bundle.match(/if \(this\.loading === loading\) this\.loading = void 0;/g)).toHaveLength(2);
     expect(bundle).toContain('if (this.readyPromise !== ready) return;');
+  });
+
+  it('is kept by npm run pack', () => {
+    // ua-builder pack replaces vendor/luna.global.js with the unpatched bundle unless told not to.
+    expect(JSON.parse(read('package.json')).scripts.pack).toBe('ua-builder pack --no-vendor');
+  });
+});
+
+describe('manifest', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+
+  it('carries name and title, so LUNA builds before and after the rename both show it', () => {
+    expect(manifest).toMatchObject({ name: 'MIDI Learn', title: 'MIDI Learn' });
+  });
+
+  it('names its manufacturer for Settings > Add Ons', () => {
+    expect(manifest.manufacturer).toBe('No Humans');
   });
 });
 

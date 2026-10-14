@@ -13,6 +13,8 @@ again when the session reopens.
 - When **another browser Add On** takes the panel, LUNA reloads MIDI Learn's page, and its
   mappings stop until you show MIDI Learn again.
 - After changing `manifest.json`, restart LUNA: this build doesn't rescan the Add Ons folder.
+  The manifest carries both `name` and the older `title` so LUNA builds from before the rename
+  still show it; `ua-builder pack` warns about `title`, and that's expected.
 
 **Learn:** each section (Proxy, Mappings, Channel Focus) has its own **Learn** button. Press it
 (or `L` for Mappings), touch a control in LUNA or pick one from the Parameters list, then move a
@@ -195,21 +197,22 @@ npx ua-builder install           # link into LUNA's Add Ons folder; appears in t
 
 ## The vendored SDK is patched
 
-`vendor/luna.global.js` is SDK 0.1.0-alpha.5 plus one fix that isn't in the SDK yet. In the
-released SDK, a load that fails is remembered: `Session.ready()`, `Node.load()` and
-`Collection.load()` keep returning the same error. LUNA can time a read out while it's still
-opening a session, so switching sessions could leave the page on "No session open" for good.
-With the patch, the next call tries again.
+`vendor/luna.global.js` is SDK 0.1.0-alpha.7 (`@uaudio/luna-builder-sdk`) plus one fix that
+isn't in the SDK yet. In the released SDK, a load that fails is remembered: `Session.ready()`,
+`Node.load()` and `Collection.load()` keep returning the same error. LUNA can time a read out
+while it's still opening a session, so switching sessions could leave the page on "No session
+open" for good. With the patch, the next call tries again.
 
-Don't refresh the bundle (`ua-builder pack` does) until the SDK includes this fix, or
-session switching breaks again. `npm test` checks that the bundle carries the patch and matches
-the manifest's `sdk_version`. To rebuild the patched bundle:
+Don't refresh the bundle until the SDK includes this fix, or session switching breaks again.
+`npx ua-builder pack` refreshes it unless given `--no-vendor`, so make the `.lunaaddon` with
+`npm run pack`, which passes that flag. `npm test` checks that the bundle carries the patch,
+matches the manifest's `sdk_version`, and that `npm run pack` keeps it. To rebuild the patched bundle:
 
 ```sh
 cd ../ua-builder-sdk && git worktree add --detach /tmp/sdk-patched HEAD && cd /tmp/sdk-patched
 git apply ~/src/midi-learn/patches/ua-builder-sdk-load-retry.patch
 ln -s ~/src/ua-builder-sdk/node_modules node_modules && npm run build
-cp plugins/ua-luna-builder/sdk/luna.global.js ~/src/midi-learn/vendor/luna.global.js
+cp dist/luna.global.js dist/luna.global.js.map ~/src/midi-learn/vendor/
 cd ~/src/ua-builder-sdk && git worktree remove --force /tmp/sdk-patched   # the SDK checkout is untouched
 ```
 
