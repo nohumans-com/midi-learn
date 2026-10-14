@@ -191,9 +191,29 @@ npx ua-builder install           # link into LUNA's Add Ons folder; appears in t
 | `logic.js` | Parsing, the control catalog, learn mode, applying MIDI, storage, templates. No DOM. |
 | `main.js` | MIDI input (Web MIDI or the bridge), the page, the background picker. |
 | `bridge/midi-bridge.mjs` | The local MIDI relay. |
+| `installer/` | Builds the macOS `.pkg` (Add On + self-contained bridge). |
 | `tests/` | Vitest against the mock engine. |
 | `vendor/luna.global.js` | The SDK bundle, **patched** (see below). |
 | `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries. |
+
+## Share it (macOS installer)
+
+```sh
+npm run installer          # -> .build/MIDI Learn <version>.pkg
+```
+
+Send that `.pkg` instead of the `.lunaaddon`: the person installing it gets MIDI too, without
+Node or npm. It puts the Add On in LUNA's Add Ons folder (replacing any earlier MIDI Learn, a
+`npm run install-addon` symlink included) and installs the bridge with its own Node runtime
+(official nodejs.org build, universal) in `/Library/Application Support/MIDI Learn`, started at
+every login by `/Library/LaunchAgents/com.uaudio.midi-learn.bridge.plist`. That agent has the same
+label as `npm run bridge:install`'s, so on a machine with both only one runs. To remove it:
+`sudo "/Library/Application Support/MIDI Learn/uninstall.sh"`.
+
+The package is not signed with a Developer ID, so macOS blocks it on first open: the recipient
+opens it, then clicks **Open Anyway** in System Settings > Privacy & Security. The build checks
+the vendored bundle still carries its patch and starts the packaged bridge on arm64 and x86_64.
+`installer/` holds the sources: `build.sh`, the pkg scripts, the agent and the uninstaller.
 
 ## The vendored SDK is patched
 
