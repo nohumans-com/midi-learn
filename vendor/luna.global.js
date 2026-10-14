@@ -116,6 +116,7 @@ var Luna = (() => {
     bindRange: () => bindRange,
     bindShortcuts: () => bindShortcuts,
     bootWasmEngine: () => bootWasmEngine,
+    canDropPaths: () => canDropPaths,
     clients: () => clients,
     clipAudio: () => clipAudio,
     clipTypeFrom: () => clipTypeFrom,
@@ -143,6 +144,7 @@ var Luna = (() => {
     locationOptions: () => locationOptions,
     midiByte: () => midiByte,
     normalizeChordName: () => normalizeChordName2,
+    onPathDrop: () => onPathDrop,
     pairNotes: () => pairNotes,
     pairNs: () => pairNs,
     pairRange: () => pairRange,
@@ -784,7 +786,7 @@ var Luna = (() => {
     touches = [];
     /** Transaction commands seen: `begin`, `commit`, `abort`. */
     transactions = [];
-    constructor() {
+    constructor(options = {}) {
       this.nodes.set("/", { properties: /* @__PURE__ */ new Map(), readOnly: /* @__PURE__ */ new Set(), commands: /* @__PURE__ */ new Map(), children: [] });
       this.addNode("/status", { properties: { timeout_ms: 0, version: "mock", name: "LUNA" } });
       this.addNode("/sessions", {
@@ -859,7 +861,8 @@ var Luna = (() => {
           /**
            * The chunked import protocol (fact 42): `begin` answers a uid, each `transfer`
            * appends base64 bytes, `end` files the finished source under the package's audio
-           * folder, and `cancel` throws the partial away.
+           * folder, and `cancel` throws the partial away. Bytes identical to an uploaded source
+           * already in the package are not filed again: `end` answers that source's uid.
            */
           import_file: (data, engine) => {
             const body = data ?? {};
@@ -867,7 +870,7 @@ var Luna = (() => {
             switch (body.phase) {
               case "begin": {
                 const uid = `src${engine.imports.size + engine.children(`/workspace/sessions/${pkg}/audio`).length + 1}`;
-                engine.imports.set(uid, { pkg, name: body.name ?? uid, bytes: 0 });
+                engine.imports.set(uid, { pkg, name: body.name ?? uid, bytes: 0, content: "" });
                 return { uid };
               }
               case "transfer": {
@@ -876,6 +879,7 @@ var Luna = (() => {
                 const encoded = body.file_data ?? "";
                 const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
                 pending.bytes += Math.max(0, encoded.length / 4 * 3 - padding);
+                pending.content += encoded;
                 return null;
               }
               case "end": {
@@ -883,6 +887,9 @@ var Luna = (() => {
                 const pending = engine.imports.get(uid);
                 if (!pending) throw new UAError("uasrv.invalid_object", "import_file: no import in progress for that uid", { cmd: "post", path: "/workspace/import_file" });
                 engine.imports.delete(uid);
+                const same = engine.uploaded.get(`${pending.pkg}:${pending.content}`);
+                if (same && engine.has(`/workspace/sessions/${pending.pkg}/audio/${same}`)) return { uid: same };
+                engine.uploaded.set(`${pending.pkg}:${pending.content}`, uid);
                 engine.addNode(`/workspace/sessions/${pending.pkg}/audio/${uid}`, {
                   properties: { uid, name: body.name ?? pending.name, stem_format: "stereo", length: 0, sample_rate: 48e3, created: 0, size: pending.bytes }
                 });
@@ -1020,8 +1027,9 @@ var Luna = (() => {
       });
       this.addNode("/gui/windows/main", { properties: { page: "timeline" } });
       this.addNode("/gui/transport", { properties: { arm_mode: false } });
-      this.addNode("/gui/add_ons/com.example.demo", { properties: { id: "com.example.demo", title: "Demo", target: "window", icon: "", floating: true, show_with_session: false } });
+      this.addNode("/gui/add_ons/com.example.demo", { properties: { id: "com.example.demo", name: "Demo", target: "window", icon: "", floating: true, show_with_session: false, manufacturer: "Example Co" } });
       this.addNode("/gui/file_chooser");
+      if (options.gui === false) this.removeNode("/gui");
     }
     /** What the next mock file dialog "selects"; empty means the user cancelled. */
     nextDialogFiles = [];
@@ -1180,12 +1188,12 @@ var Luna = (() => {
       const rel = tick - sig.tick;
       const inBar = (rel % (beat * sig.n) + beat * sig.n) % (beat * sig.n);
       const seconds = this.secondsAt(sessionPath, tick);
-      const previous = this.nodes.get(sessionPath)?.properties.get("location");
+      const previous2 = this.nodes.get(sessionPath)?.properties.get("location");
       return {
         tick,
         bar_beat: { bar: sig.bar + Math.floor(rel / (beat * sig.n)), beat: 1 + Math.floor(inBar / beat), tick: inBar % beat },
         min_sec: { minutes: Math.floor(seconds / 60), seconds: seconds % 60 },
-        tempo: previous?.tempo ?? 120,
+        tempo: previous2?.tempo ?? 120,
         time_signature: { numerator: sig.n, denominator: sig.d },
         playing: this.nodes.get(sessionPath)?.properties.get("playing") === true
       };
@@ -1311,6 +1319,8 @@ var Luna = (() => {
     }
     /** @internal Uploads between `begin` and `end` (fact 42). */
     imports = /* @__PURE__ */ new Map();
+    /** @internal Uploaded content (package and base64) to the source it was filed as, for fact 42's de-duplication. */
+    uploaded = /* @__PURE__ */ new Map();
     /**
      * Replace the handler of the command at `path` (for example
      * `/sessions/abc/set_marker`), to reproduce a verb that answers without acting (fact 71).
@@ -2065,8 +2075,8 @@ var Luna = (() => {
      * const engine = Luna.MockEngine.demo();
      * const luna = await Luna.connect({ port_: engine.port() });
      */
-    static demo() {
-      const engine = new _MockEngine();
+    static demo(options = {}) {
+      const engine = new _MockEngine(options);
       engine.addSession("demo", { name: "Demo", tracks: ["Vocal", "Guitar", "Bass", "Drums"] });
       return engine;
     }
@@ -6029,7 +6039,7 @@ var Luna = (() => {
       await context.refreshSelection().catch(() => {
       });
       const saved = context.snapshot();
-      const previous = new Set(context.notes.flatMap((s) => s.notes.map((n) => n[3])));
+      const previous2 = new Set(context.notes.flatMap((s) => s.notes.map((n) => n[3])));
       let rowids = [];
       let clip;
       let found = [];
@@ -6037,7 +6047,7 @@ var Luna = (() => {
         await this.wire.post(`/sessions/${this.sessionUid}/contexts/main/commands/create_note`, { session_uid: this.sessionUid, playlist_uid: this.id, notes: body });
         await settle(
           () => {
-            rowids = context.notes.filter((s) => s.playlist_uid === this.id).flatMap((s) => s.notes.map((n) => n[3])).filter((id) => !previous.has(id));
+            rowids = context.notes.filter((s) => s.playlist_uid === this.id).flatMap((s) => s.notes.map((n) => n[3])).filter((id) => !previous2.has(id));
             return rowids.length >= notes.length;
           },
           "create notes (selection)",
@@ -6627,7 +6637,8 @@ var Luna = (() => {
   // src/model/gui.ts
   var AddOn = class extends Node {
     addOnId;
-    title;
+    /** The manifest's `name`: its menu item and panel header. */
+    name;
     target;
     /** Absolute file path of the icon, or `''`. */
     icon;
@@ -6635,15 +6646,18 @@ var Luna = (() => {
     floating;
     /** The manifest's `show_with_session`: `false` unless it says `true`. Meaningful for `'window'` only. */
     showWithSession;
+    /** The manifest's `manufacturer`, or `''` when it has none. */
+    manufacturer;
     /** @internal */
     constructor(client, path) {
       super(client, path);
       this.addOnId = this.prop("id");
-      this.title = this.prop("title");
+      this.name = this.prop("name");
       this.target = this.prop("target");
       this.icon = this.prop("icon");
       this.floating = this.prop("floating");
       this.showWithSession = this.prop("show_with_session");
+      this.manufacturer = this.prop("manufacturer");
     }
     /** Show it in LUNA by target: navigate to an `'app'`, open a `'window'` (toggling it like its
      *  menu item), show a `'browser'` in the secondary browser, or an `'editor'` in the Timeline's
@@ -6669,6 +6683,7 @@ var Luna = (() => {
     /** Record-arm mode of LUNA's transport bar. */
     armMode;
     priorLaunchCount;
+    presence;
     /** @internal */
     constructor(client) {
       super(client, "/gui");
@@ -6683,6 +6698,25 @@ var Luna = (() => {
         set: (v) => client.store.set("/gui/transport", "arm_mode", v)
       };
       this.priorLaunchCount = this.prop("prior_launch_count");
+    }
+    /**
+     * True when the engine has LUNA's `/gui` (fact 103). Read once per connection: the
+     * root's children are listed, because a `get` of a missing `/gui` answers `{}` (fact 10).
+     *
+     * @example
+     * const paths = (await luna.gui.available()) ? await luna.gui.chooseFiles() : [];
+     */
+    available() {
+      this.presence ??= this.client.raw.get("/", { children: true, properties: false, commands: false }).then((reply) => rootChildNames(reply).includes("gui")).catch((err) => {
+        this.presence = void 0;
+        throw err;
+      });
+      return this.presence;
+    }
+    /** Commands go to `/gui`, so refuse at once, not after a timeout, when it is absent. */
+    async post(command, payload) {
+      if (!await this.available()) throw new Unsupported(`luna.gui.${command}: this engine has no /gui (a headless or wasm engine). Check luna.gui.available() first.`);
+      return super.post(command, payload);
     }
     /** The main window. */
     get main() {
@@ -6719,8 +6753,22 @@ var Luna = (() => {
       return this.post("execute", { ...data, command });
     }
     /**
-     * Native open-file dialog. Resolves to the chosen absolute paths, or `[]` if cancelled.
-     * `filters` are wildcards such as `['*.wav', '*.aif;*.aiff']`.
+     * LUNA's native open-file dialog. Resolves to the chosen **absolute paths**, or `[]` if
+     * cancelled. `filters` are wildcards such as `['*.wav', '*.aif;*.aiff']`.
+     *
+     * This is the **path route**, an optimization for getting files into the session: the
+     * engine reads the paths from disk (`session.importPath()`, `session.importFile()`), so the
+     * bytes never pass through the page. The page itself cannot read these paths; `fetch`
+     * and XHR refuse them. Needs `/gui` ({@link Gui.available}) and a native engine that can
+     * see the file.
+     *
+     * Want the audio in the page (decode, audition, slice)? Do not use this: use
+     * `<input type="file">`, which gives `File` objects everywhere, and
+     * `session.uploadFile({ bytes: file })` to put one into the session.
+     *
+     * @example
+     * const [path] = await luna.gui.chooseFiles({ filters: ['*.wav'] });
+     * if (path) await session.importPath(path);
      */
     chooseFiles(options = {}) {
       const payload = {};
@@ -6730,7 +6778,14 @@ var Luna = (() => {
       if (options.defaultPath !== void 0) payload["default_path"] = options.defaultPath;
       return this.dialog("show_open_dialog", payload, "release_file_chooser", options.timeoutMs);
     }
-    /** Native save dialog. Resolves to the chosen path, or `undefined` if cancelled. */
+    /**
+     * LUNA's native save dialog. Resolves to the chosen absolute path, or `undefined` if
+     * cancelled. Like {@link chooseFiles} the path is for the engine (for example a render's
+     * `outputPaths`); the page cannot write to it.
+     *
+     * @example
+     * const path = await luna.gui.chooseSavePath({ extensions: ['wav'] });
+     */
     async chooseSavePath(options = {}) {
       const payload = {};
       if (options.defaultPath !== void 0) payload["default_path"] = options.defaultPath;
@@ -6786,6 +6841,16 @@ var Luna = (() => {
     const g = globalThis;
     const raw = g.crypto?.randomUUID?.() ?? `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
     return raw.replaceAll("-", "");
+  }
+  function rootChildNames(reply) {
+    const children = typeof reply === "object" && reply !== null ? reply.children : void 0;
+    if (!Array.isArray(children)) return [];
+    const out = [];
+    for (const child of children) {
+      const raw = typeof child === "string" ? child : typeof child === "object" && child !== null ? child.path ?? child.name : void 0;
+      if (typeof raw === "string") out.push(raw.slice(raw.lastIndexOf("/") + 1));
+    }
+    return out;
   }
 
   // src/model/plugins.ts
@@ -7873,11 +7938,24 @@ var Luna = (() => {
      * this session's package as a new audio source, and resolve to it once the workspace
      * lists it (fact 42).
      *
+     * This is the **File route**, and the one that works everywhere: in LUNA, in a browser and
+     * on the wasm engine, with no `/gui`. Get the `File` from `<input type="file">` or an HTML
+     * `drop` event; the page can decode and audition the same `File` too. When the page only
+     * needs the file in the session and has an engine-readable path (from
+     * `luna.gui.chooseFiles()` or `Luna.onPathDrop()`), {@link importPath} is the faster path
+     * route: nothing is copied through the page.
+     *
      * The bytes go up base64-encoded in `chunkBytes` pieces through the engine's
      * `begin`/`transfer`/`end` phases, with `onProgress` after each chunk. A failed transfer
      * is cancelled, so a half-written file is not left behind. No clip is made: pass the
-     * returned source's `id` to {@link insertClip} for that. Use {@link importFile} instead
+     * returned source's `id` to {@link insertClip} for that. LUNA files identical bytes only
+     * once: uploading a file already in the session resolves to that source (fact 42). Use
+     * {@link importFile} instead
      * when LUNA can already read the path itself.
+     *
+     * In LUNA 3.1.0.4589 and earlier `<input type="file">` opens nothing (fact 104), so offer an
+     * HTML drop zone as well: `zone.ondrop = (e) => { e.preventDefault(); load(e.dataTransfer.files[0]); }`
+     * with `zone.ondragover = (e) => e.preventDefault()`.
      *
      * @example
      * const source = await session.uploadFile({
@@ -7902,34 +7980,84 @@ var Luna = (() => {
       const begun = await post({ phase: "begin", name });
       const uid = begun?.uid;
       if (typeof uid !== "string") throw new UAError("invalid_response", "uploadFile(): import_file begin answered without a uid", { path: "/workspace/import_file" });
+      let ended;
       try {
         for (let offset = 0; offset < data.length; offset += chunk) {
           await post({ phase: "transfer", uid, file_data: base64(data.subarray(offset, offset + chunk)) });
           options.onProgress?.(Math.min(data.length, offset + chunk), data.length);
         }
-        await post({ phase: "end", uid, name });
+        ended = await post({ phase: "end", uid, name });
       } catch (err) {
         await post({ phase: "cancel", uid, name }).catch(() => void 0);
         throw err;
       }
-      return this.listedSource(uid, options.timeoutMs ?? 3e4);
+      const filed = typeof ended?.uid === "string" && ended.uid ? ended.uid : uid;
+      return this.listedSource(filed, options.timeoutMs ?? 3e4);
     }
     /** Wait for `uid` to appear in the workspace audio folder, re-reading it while waiting. */
     async listedSource(uid, timeoutMs) {
       const sources = this.sources;
-      if (!sources) throw new UAError("unavailable", "uploadFile(): the session package uid went away", { path: this.path });
+      if (!sources) throw new UAError("unavailable", "the session package uid went away during an import", { path: this.path });
       const deadline = Date.now() + timeoutMs;
       for (; ; ) {
         const found = sources.byId(uid);
         if (found) return found;
-        if (Date.now() > deadline) throw new UAError("no_effect", `uploadFile(): the workspace did not list source ${uid} within ${timeoutMs} ms`, { path: sources.path });
+        if (Date.now() > deadline) throw new UAError("no_effect", `the workspace did not list source ${uid} within ${timeoutMs} ms`, { path: sources.path });
         await this.client.store.load(sources.path, { levels: 2, commands: false, flatvalue: true });
         if (sources.refresh().some((s) => s.id === uid)) continue;
         await new Promise((r) => setTimeout(r, 50));
       }
     }
-    /** Import an audio, MIDI or video file at the selection start, onto `trackUid` or a new track. */
-    importFile(path, trackUid) {
+    /**
+     * Copy a file the engine can read from disk into this session's package as a new audio
+     * source, and resolve to it once the workspace lists it (fact 42, `local_copy`). No clip
+     * is made: pass the source's `id` to {@link insertClip}.
+     *
+     * This is the **path route**, an optimization: the engine reads `path` itself, so the bytes
+     * never pass through the page. Take the path from `luna.gui.chooseFiles()` or
+     * `Luna.onPathDrop()`. It needs no `/gui`, but the engine must see the file: a native
+     * engine on the same machine, not the wasm engine. A path the engine cannot open rejects
+     * with LUNA's `device.database_error`. For a browser `File`, use {@link uploadFile}.
+     *
+     * @example
+     * const [path] = await luna.gui.chooseFiles({ filters: ['*.wav'] });
+     * if (path) {
+     *   const source = await session.importPath(path);
+     *   await session.insertClip({ trackUid: track.id, sourceUid: source.id, startTick: 0, stopTick: 4 * Luna.TICKS_PER_BEAT });
+     * }
+     */
+    async importPath(path, options = {}) {
+      await this.ready();
+      const sources = this.sources;
+      if (!sources) throw new UAError("unavailable", "importPath(): the session package uid is not known yet", { path: this.path });
+      const name = options.name ?? path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
+      if (!name) throw new UAError("out_of_range", `importPath(): no file name in ${JSON.stringify(path)}`, { path: this.path });
+      const reply = await this.wire.post("/workspace/import_file", {
+        session_package_uid: this.sessionPackageUid.value,
+        type: "audio",
+        import_id: Math.floor(Math.random() * 2147483647),
+        phase: "local_copy",
+        path,
+        name
+      });
+      const uid = reply?.uid;
+      if (typeof uid !== "string") throw new UAError("invalid_response", "importPath(): import_file local_copy answered without a uid", { path: "/workspace/import_file" });
+      return this.listedSource(uid, options.timeoutMs ?? 3e4);
+    }
+    /**
+     * LUNA's own import: the File > Import action. Imports an audio, MIDI or video file at
+     * the selection start, onto `trackUid` or a new track, making a clip as LUNA does.
+     *
+     * A **path route** command run by LUNA's UI, so it needs `/gui`: without it (a headless or
+     * wasm engine) it rejects with `Luna.Unsupported` (fact 103). To add a source without a
+     * clip, or without `/gui`, use {@link importPath}; for a browser `File`, {@link uploadFile}.
+     *
+     * @example
+     * const [path] = await luna.gui.chooseFiles({ filters: ['*.wav', '*.mid'] });
+     * if (path) await session.importFile(path, track.id);
+     */
+    async importFile(path, trackUid) {
+      if (!await this.client.gui.available()) throw new Unsupported("importFile(): LUNA imports through its UI, and this engine has no /gui. Use session.importPath(), or session.uploadFile() for a File.");
       const payload = { path };
       if (trackUid !== void 0) payload["track_uid"] = trackUid;
       return this.post("import_files", payload);
@@ -8169,11 +8297,9 @@ var Luna = (() => {
     return new Uint8Array(await input.arrayBuffer());
   }
   function fileName(input) {
-    if (typeof Blob !== "undefined" && input instanceof Blob && "name" in input) {
-      const name = input.name;
-      return typeof name === "string" && name ? name : void 0;
-    }
-    return void 0;
+    if (input instanceof ArrayBuffer || ArrayBuffer.isView(input)) return void 0;
+    const name = input.name;
+    return typeof name === "string" && name ? name : void 0;
   }
   function base64(bytes) {
     if (typeof Buffer !== "undefined") return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
@@ -8510,8 +8636,77 @@ var Luna = (() => {
     return new Client(wsPort, engine);
   }
 
+  // src/client/path-drop.ts
+  var registered = [];
+  var installed;
+  var previous;
+  function canDropPaths() {
+    return hasNativeBridge();
+  }
+  function onPathDrop(handlers) {
+    const g = globalThis;
+    const accept = g.lunaAPI?.setAcceptsFileDrops;
+    if (typeof accept !== "function") {
+      throw new Unsupported("onPathDrop(): native path drops exist only inside LUNA. Use an HTML drop listener, which gives File objects.");
+    }
+    const entry = typeof handlers === "function" ? { drop: handlers } : handlers;
+    registered.push(entry);
+    install(g);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      const i = registered.indexOf(entry);
+      if (i >= 0) registered.splice(i, 1);
+      if (registered.length === 0) uninstall(g);
+    };
+  }
+  function install(g) {
+    if (installed && g.lunaHost === installed) return;
+    const each = (run2) => {
+      for (const h of [...registered]) {
+        try {
+          run2(h);
+        } catch (err) {
+          console.warn("Luna.onPathDrop: a handler threw", err);
+        }
+      }
+    };
+    const host = {
+      ...g.lunaHost,
+      fileDragEnter: (info) => each((h) => h.dragOver?.(toDrop(info))),
+      fileDragOver: (info) => each((h) => h.dragOver?.(toDrop(info))),
+      fileDragLeave: () => each((h) => h.dragLeave?.()),
+      filesDropped: (info) => {
+        const drop = toDrop(info);
+        if (drop.paths.length) each((h) => h.drop(drop));
+      }
+    };
+    previous = g.lunaHost;
+    g.lunaHost = host;
+    installed = host;
+    g.lunaAPI?.setAcceptsFileDrops?.(true);
+  }
+  function uninstall(g) {
+    g.lunaAPI?.setAcceptsFileDrops?.(false);
+    if (installed && g.lunaHost === installed) {
+      if (previous) g.lunaHost = previous;
+      else delete g.lunaHost;
+    }
+    installed = void 0;
+    previous = void 0;
+  }
+  function toDrop(info) {
+    const o = typeof info === "object" && info !== null ? info : {};
+    return {
+      paths: Array.isArray(o.paths) ? o.paths.filter((p) => typeof p === "string") : [],
+      x: typeof o.x === "number" ? o.x : 0,
+      y: typeof o.y === "number" ? o.y : 0
+    };
+  }
+
   // src/luna.ts
-  var VERSION = "0.1.0-alpha.5";
+  var VERSION = "0.1.0-alpha.7";
   return __toCommonJS(global_exports);
 })();
 //# sourceMappingURL=luna.global.js.map

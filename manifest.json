@@ -1,9 +1,11 @@
 {
     "package_name": "MIDI Learn",
     "id": "com.uaudio.midi-learn",
+    "name": "MIDI Learn",
     "title": "MIDI Learn",
+    "manufacturer": "No Humans",
     "version": "0.2.0",
-    "sdk_version": "0.1.0-alpha.5",
+    "sdk_version": "0.1.0-alpha.7",
     "min_luna_version": "1.9.0",
     "engines": ["luna"],
     "html": "index.html",
