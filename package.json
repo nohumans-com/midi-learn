@@ -10,6 +10,7 @@
     "serve": "ua-builder serve",
     "install-addon": "ua-builder install",
     "pack": "ua-builder pack --no-vendor",
+    "vendor": "node scripts/vendor-sdk.mjs",
     "bridge": "node bridge/midi-bridge.mjs",
     "bridge:install": "node bridge/agent.mjs install",
     "bridge:uninstall": "node bridge/agent.mjs uninstall",
