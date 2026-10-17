@@ -18,7 +18,7 @@
     "installer": "bash installer/build.sh"
   },
   "devDependencies": {
-    "@uaudio/luna-builder-sdk": "file:../ua-builder-sdk",
+    "@uaudio/luna-builder-sdk": "file:../../Library/Application Support/LUNA Builder SDK/plugins/ua-luna-builder",
     "vite": "8.3.0",
     "vitest": "5.0.1"
   },

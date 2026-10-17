@@ -194,7 +194,8 @@ npx ua-builder install           # link into LUNA's Add Ons folder; appears in t
 | `installer/` | Builds the macOS `.pkg` (Add On + self-contained bridge). |
 | `tests/` | Vitest against the mock engine. |
 | `vendor/luna.global.js` | The SDK bundle, **patched** (see below). |
-| `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries. |
+| `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries, as a source diff. |
+| `scripts/vendor-sdk.mjs` | Vendors the installed SDK's bundle with that change applied. |
 
 ## Share it (macOS installer)
 
@@ -217,7 +218,7 @@ the vendored bundle still carries its patch and starts the packaged bridge on ar
 
 ## The vendored SDK is patched
 
-`vendor/luna.global.js` is SDK 0.1.0-alpha.7 (`@uaudio/luna-builder-sdk`) plus one fix that
+`vendor/luna.global.js` is SDK 0.1.0.15 (`@uaudio/luna-builder-sdk`) plus one fix that
 isn't in the SDK yet. In the released SDK, a load that fails is remembered: `Session.ready()`,
 `Node.load()` and `Collection.load()` keep returning the same error. LUNA can time a read out
 while it's still opening a session, so switching sessions could leave the page on "No session
@@ -226,15 +227,18 @@ open" for good. With the patch, the next call tries again.
 Don't refresh the bundle until the SDK includes this fix, or session switching breaks again.
 `npx ua-builder pack` refreshes it unless given `--no-vendor`, so make the `.lunaaddon` with
 `npm run pack`, which passes that flag. `npm test` checks that the bundle carries the patch,
-matches the manifest's `sdk_version`, and that `npm run pack` keeps it. To rebuild the patched bundle:
+matches the manifest's `sdk_version`, and that `npm run pack` keeps it.
+
+The SDK now ships prebuilt, in `~/Library/Application Support/LUNA Builder SDK` (set
+`LUNA_BUILDER_SDK` to use another folder), so the fix is applied to the built bundle:
 
 ```sh
-cd ../ua-builder-sdk && git worktree add --detach /tmp/sdk-patched HEAD && cd /tmp/sdk-patched
-git apply ~/src/midi-learn/patches/ua-builder-sdk-load-retry.patch
-ln -s ~/src/ua-builder-sdk/node_modules node_modules && npm run build
-cp dist/luna.global.js dist/luna.global.js.map ~/src/midi-learn/vendor/
-cd ~/src/ua-builder-sdk && git worktree remove --force /tmp/sdk-patched   # the SDK checkout is untouched
+node scripts/vendor-sdk.mjs   # vendor/luna.global.js = the installed SDK's bundle + the fix
 ```
+
+It stops without writing if one of its three edits no longer finds its anchor, and says so
+when the SDK already forgets failed loads: then vendor the plain bundle and delete `patches/`
+and the script.
 
 ## How learning finds the control you touched
 

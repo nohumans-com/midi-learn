@@ -60,6 +60,8 @@ var Luna = (() => {
     Job: () => Job,
     Jobs: () => Jobs,
     KeySignature: () => KeySignature,
+    MAX_SECRET_BYTES: () => MAX_SECRET_BYTES,
+    MAX_SECRET_NAME_LENGTH: () => MAX_SECRET_NAME_LENGTH,
     Marker: () => Marker,
     Markers: () => Markers,
     Meter: () => Meter,
@@ -86,6 +88,7 @@ var Luna = (() => {
     SEND_COUNT: () => SEND_COUNT,
     SIXTEENTH_NOTE: () => SIXTEENTH_NOTE,
     Scheduler: () => Scheduler,
+    Secrets: () => Secrets,
     Session: () => Session,
     SessionPackage: () => SessionPackage,
     Sessions: () => Sessions,
@@ -255,7 +258,7 @@ var Luna = (() => {
   };
   var NotRunning = class extends UAError {
     constructor(url) {
-      super("not_running", `No LUNA engine at ${url}. Start LUNA and open a session, or connect with { engine: 'wasm' }.`);
+      super("not_running", `No LUNA engine at ${url}. Start LUNA and open a session.`);
       this.name = "NotRunning";
     }
   };
@@ -631,14 +634,14 @@ var Luna = (() => {
       for (const entry of expandMulti(message)) {
         const id = correlationId(entry, this.idKey);
         if (id !== void 0) {
-          const pending = this.pending.get(id);
-          if (!pending) continue;
+          const pending2 = this.pending.get(id);
+          if (!pending2) continue;
           this.pending.delete(id);
-          clearTimeout(pending.timer);
+          clearTimeout(pending2.timer);
           if (entry.error !== void 0) {
-            pending.reject(new UAError(entry.error, `${pending.verb} ${pending.path}: ${entry.error}`, { cmd: pending.verb, path: pending.path }));
+            pending2.reject(new UAError(entry.error, `${pending2.verb} ${pending2.path}: ${entry.error}`, { cmd: pending2.verb, path: pending2.path }));
           } else {
-            pending.resolve(entry.data);
+            pending2.resolve(entry.data);
           }
           continue;
         }
@@ -874,24 +877,24 @@ var Luna = (() => {
                 return { uid };
               }
               case "transfer": {
-                const pending = engine.imports.get(body.uid ?? "");
-                if (!pending) throw new UAError("uasrv.invalid_object", "import_file: no import in progress for that uid", { cmd: "post", path: "/workspace/import_file" });
+                const pending2 = engine.imports.get(body.uid ?? "");
+                if (!pending2) throw new UAError("uasrv.invalid_object", "import_file: no import in progress for that uid", { cmd: "post", path: "/workspace/import_file" });
                 const encoded = body.file_data ?? "";
                 const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
-                pending.bytes += Math.max(0, encoded.length / 4 * 3 - padding);
-                pending.content += encoded;
+                pending2.bytes += Math.max(0, encoded.length / 4 * 3 - padding);
+                pending2.content += encoded;
                 return null;
               }
               case "end": {
                 const uid = body.uid ?? "";
-                const pending = engine.imports.get(uid);
-                if (!pending) throw new UAError("uasrv.invalid_object", "import_file: no import in progress for that uid", { cmd: "post", path: "/workspace/import_file" });
+                const pending2 = engine.imports.get(uid);
+                if (!pending2) throw new UAError("uasrv.invalid_object", "import_file: no import in progress for that uid", { cmd: "post", path: "/workspace/import_file" });
                 engine.imports.delete(uid);
-                const same = engine.uploaded.get(`${pending.pkg}:${pending.content}`);
-                if (same && engine.has(`/workspace/sessions/${pending.pkg}/audio/${same}`)) return { uid: same };
-                engine.uploaded.set(`${pending.pkg}:${pending.content}`, uid);
-                engine.addNode(`/workspace/sessions/${pending.pkg}/audio/${uid}`, {
-                  properties: { uid, name: body.name ?? pending.name, stem_format: "stereo", length: 0, sample_rate: 48e3, created: 0, size: pending.bytes }
+                const same = engine.uploaded.get(`${pending2.pkg}:${pending2.content}`);
+                if (same && engine.has(`/workspace/sessions/${pending2.pkg}/audio/${same}`)) return { uid: same };
+                engine.uploaded.set(`${pending2.pkg}:${pending2.content}`, uid);
+                engine.addNode(`/workspace/sessions/${pending2.pkg}/audio/${uid}`, {
+                  properties: { uid, name: body.name ?? pending2.name, stem_format: "stereo", length: 0, sample_rate: 48e3, created: 0, size: pending2.bytes }
                 });
                 return { uid };
               }
@@ -1013,6 +1016,32 @@ var Luna = (() => {
             }, 5);
             return { uid };
           },
+          show_folder_dialog: (_data, engine) => {
+            const uid = `fc${engine.nextRow()}`;
+            engine.addNode(`/gui/file_chooser/${uid}`, { properties: { status: "pending", files: [] } });
+            setTimeout(() => {
+              if (!engine.has(`/gui/file_chooser/${uid}`)) return;
+              engine.setValue(`/gui/file_chooser/${uid}`, "files", engine.nextDialogFiles.map((p) => ({ path: p })));
+              engine.setValue(`/gui/file_chooser/${uid}`, "status", engine.nextDialogFiles.length ? "selected" : "cancelled");
+            }, 5);
+            return { uid };
+          },
+          // Fact 106: validation, hidden entries and order (naturalCompare) as LUNA's list_files.
+          list_files: (data, engine) => {
+            const fail = (code, why) => new UAError(code, `list_files: ${why}`, { cmd: "post", path: "/gui/list_files" });
+            const path = typeof data === "object" && data !== null ? data.path : void 0;
+            if (path === void 0 || path === null) throw fail("uasrv.missing_field", "path is required");
+            if (typeof path !== "string" || !/^(\/|[A-Za-z]:[\\/])/.test(path)) throw fail("uasrv.invalid_value", "path must be absolute");
+            const dir = path.length > 1 ? path.replace(/[\\/]+$/, "") : path;
+            const names = engine.folders[dir];
+            if (!names) {
+              const cut = dir.lastIndexOf("/");
+              const isFile = engine.folders[cut > 0 ? dir.slice(0, cut) : "/"]?.includes(dir.slice(cut + 1));
+              throw fail(isFile ? "uasrv.invalid_value" : "uasrv.filesystem_error", isFile ? "path is a file" : "no folder at path");
+            }
+            const files = names.map((raw) => ({ name: raw.replace(/\/$/, ""), is_directory: raw.endsWith("/") })).filter((e) => !e.name.startsWith(".")).sort((a, b) => naturalCompare(a.name, b.name) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).map((e) => ({ name: e.name, path: `${dir === "/" ? "" : dir}/${e.name}`, is_directory: e.is_directory }));
+            return { files };
+          },
           show_save_dialog: (_data, engine) => {
             const uid = `fc${engine.nextRow()}`;
             engine.addNode(`/gui/file_chooser/${uid}`, { properties: { status: "pending", files: [] } });
@@ -1033,6 +1062,14 @@ var Luna = (() => {
     }
     /** What the next mock file dialog "selects"; empty means the user cancelled. */
     nextDialogFiles = [];
+    /**
+     * The disk `/gui/list_files` reads: each folder's absolute path to the names inside it,
+     * a trailing `/` marking a subfolder. A name starting with `.` is hidden, as in LUNA.
+     *
+     * @example
+     * engine.folders['/Samples'] = ['kick.wav', 'Loops/', '.DS_Store'];
+     */
+    folders = {};
     rowCounter = 100;
     /** @internal */
     nextRow() {
@@ -2416,6 +2453,67 @@ var Luna = (() => {
       for (const listener of this.statusListeners) listener(status);
     }
   };
+  function naturalCompare(a, b) {
+    const s1 = [...a].map((c) => c.codePointAt(0)).concat(0);
+    const s2 = [...b].map((c) => c.codePointAt(0)).concat(0);
+    const isSpace = (c) => c === 32 || c >= 9 && c <= 13;
+    const isDigit = (c) => c >= 48 && c <= 57;
+    const isAlnum = (c) => isDigit(c) || c >= 65 && c <= 90 || c >= 97 && c <= 122;
+    const upper = (c) => c >= 97 && c <= 122 ? c - 32 : c;
+    let i = 0;
+    let j = 0;
+    for (let first = true; ; first = false) {
+      const space1 = isSpace(s1[i]);
+      const space2 = isSpace(s2[j]);
+      if (!first && space1 !== space2) {
+        if (s1[i] === 0) return -1;
+        if (s2[j] === 0) return 1;
+        return space2 ? 1 : -1;
+      }
+      while (isSpace(s1[i])) i++;
+      while (isSpace(s2[j])) j++;
+      if (isDigit(s1[i]) && isDigit(s2[j])) {
+        const result = s1[i] === 48 || s2[j] === 48 ? digitsLeft(s1, i, s2, j) : digitsRight(s1, i, s2, j);
+        if (result !== 0) return result;
+      }
+      let c1 = s1[i++];
+      let c2 = s2[j++];
+      if (c1 !== c2) {
+        c1 = upper(c1);
+        c2 = upper(c2);
+      }
+      if (c1 === c2) {
+        if (c1 === 0) return 0;
+        continue;
+      }
+      const alnum1 = isAlnum(c1);
+      const alnum2 = isAlnum(c2);
+      if (alnum2 && !alnum1) return -1;
+      if (alnum1 && !alnum2) return 1;
+      return c1 < c2 ? -1 : 1;
+    }
+    function digitsRight(x, xi, y, yi) {
+      for (let bias = 0; ; xi++, yi++) {
+        const d1 = isDigit(x[xi]);
+        const d2 = isDigit(y[yi]);
+        if (!d1 && !d2) return bias;
+        if (!d1) return -1;
+        if (!d2) return 1;
+        if (x[xi] !== y[yi] && bias === 0) bias = x[xi] < y[yi] ? -1 : 1;
+      }
+    }
+    function digitsLeft(x, xi, y, yi) {
+      for (; ; xi++, yi++) {
+        const d1 = isDigit(x[xi]);
+        const d2 = isDigit(y[yi]);
+        if (!d1 && !d2) return 0;
+        if (!d1) return -1;
+        if (!d2) return 1;
+        if (x[xi] < y[yi]) return -1;
+        if (x[xi] > y[yi]) return 1;
+      }
+    }
+  }
 
   // src/wire/wasm-port.ts
   var METHOD = { get: 0, set: 1, post: 2, subscribe: 3, unsubscribe: 4 };
@@ -2684,13 +2782,13 @@ var Luna = (() => {
       resolveRunning = res;
       rejectRunning = rej;
     });
-    const pending = [];
+    const pending2 = [];
     target.WasmDeviced = {
       onReply: (id, error, json) => engine?.hooks().onReply(id, error, json),
       onUpdate: (path, json) => engine?.hooks().onUpdate(path, json),
       onState: (state, detail) => {
         if (engine) engine.hooks().onState(state, detail);
-        else pending.push({ state, detail });
+        else pending2.push({ state, detail });
         if (state === "running") resolveRunning();
         if (state === "error" || state === "stopped") rejectRunning(new UAError("engine_boot", `wasm engine ${state}${detail ? ": " + detail : ""}`));
       }
@@ -2710,7 +2808,7 @@ var Luna = (() => {
         UAPersistLog: (t) => log(`persist ${t}`, "out")
       });
       engine = new WasmEngine(module, engineUrl);
-      for (const p of pending) engine.setState(p.state, p.detail);
+      for (const p of pending2) engine.setState(p.state, p.detail);
       await running;
       if (engine.state !== "running") engine.setState("running");
       return engine;
@@ -3228,8 +3326,7 @@ var Luna = (() => {
       return this.path.slice(this.path.lastIndexOf("/") + 1);
     }
     /**
-     * Fetch this node's properties (and child names) once. Later calls return the same promise,
-     * unless it failed: then the next call fetches again.
+     * Fetch this node's properties (and child names) once. Later calls return the same promise.
      * Pushes keep the cells current afterwards as long as an ancestor is watched.
      */
     load(options) {
@@ -4232,10 +4329,10 @@ var Luna = (() => {
      */
     dispose() {
       this.disposed = true;
-      const pending = this.pending;
+      const pending2 = this.pending;
       this.pending = void 0;
       this.clear();
-      for (const w of pending?.waiters ?? []) w.resolve();
+      for (const w of pending2?.waiters ?? []) w.resolve();
     }
     start(rebuild) {
       this.running = true;
@@ -4248,12 +4345,12 @@ var Luna = (() => {
       return done;
     }
     flush() {
-      const pending = this.pending;
-      if (!pending || this.busy || this.running) return;
+      const pending2 = this.pending;
+      if (!pending2 || this.busy || this.running) return;
       this.pending = void 0;
-      this.start(pending.run).then(
-        () => pending.waiters.forEach((w) => w.resolve()),
-        (err) => pending.waiters.forEach((w) => w.reject(err))
+      this.start(pending2.run).then(
+        () => pending2.waiters.forEach((w) => w.resolve()),
+        (err) => pending2.waiters.forEach((w) => w.reject(err))
       );
     }
   };
@@ -6300,20 +6397,20 @@ var Luna = (() => {
         this.pages.set(key, hit);
         return Promise.resolve(hit);
       }
-      let pending = this.inFlight.get(key);
-      if (!pending) {
-        pending = source.overview({ index: n * WAVEFORM_PAGE, count: WAVEFORM_PAGE, kind }).then((page) => {
+      let pending2 = this.inFlight.get(key);
+      if (!pending2) {
+        pending2 = source.overview({ index: n * WAVEFORM_PAGE, count: WAVEFORM_PAGE, kind }).then((page) => {
           if (page && page.count === WAVEFORM_PAGE) {
             this.pages.set(key, page);
             while (this.pages.size > this.max) this.pages.delete(this.pages.keys().next().value);
           }
           return page;
         });
-        this.inFlight.set(key, pending);
-        void pending.catch(() => {
+        this.inFlight.set(key, pending2);
+        void pending2.catch(() => {
         }).finally(() => this.inFlight.delete(key));
       }
-      return pending;
+      return pending2;
     }
   };
   function waveformPeak(range) {
@@ -6636,6 +6733,7 @@ var Luna = (() => {
 
   // src/model/gui.ts
   var AddOn = class extends Node {
+    /** The manifest's `id`, in lowercase: LUNA compares ids without case. */
     addOnId;
     /** The manifest's `name`: its menu item and panel header. */
     name;
@@ -6676,7 +6774,7 @@ var Luna = (() => {
     }
   };
   var Gui = class extends Node {
-    /** Installed Add Ons, by manifest id. */
+    /** Installed Add Ons, by manifest id in lowercase (`byId('com.example.foo')`). */
     addOns;
     /** Windows by context type; `main` is the arrangement window. */
     windows;
@@ -6715,7 +6813,7 @@ var Luna = (() => {
     }
     /** Commands go to `/gui`, so refuse at once, not after a timeout, when it is absent. */
     async post(command, payload) {
-      if (!await this.available()) throw new Unsupported(`luna.gui.${command}: this engine has no /gui (a headless or wasm engine). Check luna.gui.available() first.`);
+      if (!await this.available()) throw new Unsupported(`luna.gui.${command}: this engine has no /gui (a headless engine). Check luna.gui.available() first.`);
       return super.post(command, payload);
     }
     /** The main window. */
@@ -6779,6 +6877,42 @@ var Luna = (() => {
       return this.dialog("show_open_dialog", payload, "release_file_chooser", options.timeoutMs);
     }
     /**
+     * LUNA's native folder dialog. Resolves to the chosen folders' **absolute paths**, or `[]`
+     * if cancelled. A path route like {@link chooseFiles}: hand the paths to
+     * {@link listFiles} or the engine, not to `fetch`. Needs `/gui` ({@link Gui.available}) and a
+     * LUNA that has the dialog (fact 106); an older one rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * const [folder] = await luna.gui.chooseFolders({ title: 'Choose a sample folder' });
+     * if (folder) console.log(await luna.gui.listFiles(folder));
+     */
+    chooseFolders(options = {}) {
+      const payload = {};
+      if (options.title !== void 0) payload["title"] = options.title;
+      if (options.allowMultiple !== void 0) payload["allow_multiple"] = options.allowMultiple;
+      if (options.defaultPath !== void 0) payload["default_path"] = options.defaultPath;
+      return this.dialog("show_folder_dialog", payload, "release_file_chooser", options.timeoutMs).catch(olderLuna("chooseFolders", "show_folder_dialog"));
+    }
+    /**
+     * The files and folders directly inside the folder at `path`, as LUNA sees the disk (fact
+     * 106). Hidden entries are left out; the rest are in natural order, as LUNA's own browsers
+     * sort: case ignored, and numbers by value, so `take2` comes before `take10`. `path` must
+     * be absolute.
+     *
+     * Rejects with a `Luna.Error` whose `code` is `uasrv.filesystem_error` when nothing is at
+     * `path` or it cannot be read, and `uasrv.invalid_value` when `path` is relative or names
+     * a file. An older LUNA without the command rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * for (const entry of await luna.gui.listFiles('/Users/me/Samples')) {
+     *   if (!entry.isDirectory && entry.name.endsWith('.wav')) await session.importPath(entry.path);
+     * }
+     */
+    async listFiles(path) {
+      const reply = await this.post("list_files", { path }).catch(olderLuna("listFiles", "list_files"));
+      return (reply?.files ?? []).map((f) => ({ name: f.name, path: f.path, isDirectory: f.is_directory }));
+    }
+    /**
      * LUNA's native save dialog. Resolves to the chosen absolute path, or `undefined` if
      * cancelled. Like {@link chooseFiles} the path is for the engine (for example a render's
      * `outputPaths`); the page cannot write to it.
@@ -6837,6 +6971,14 @@ var Luna = (() => {
       }
     }
   };
+  function olderLuna(method, command) {
+    return (err) => {
+      if (err instanceof UAError && err.code === "uasrv.invalid_object") {
+        throw new Unsupported(`luna.gui.${method}: this LUNA has no /gui/${command}; it needs a newer LUNA.`);
+      }
+      throw err;
+    };
+  }
   function randomUid() {
     const g = globalThis;
     const raw = g.crypto?.randomUUID?.() ?? `${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
@@ -7801,7 +7943,7 @@ var Luna = (() => {
     }
     /**
      * Create an aux bus (`new_track` with `track_type: "bus"`, fact 83) in one undo step, and
-     * resolve to the {@link Bus} once it is listed in {@link buses}.
+     * resolve to the {@link Bus} once it is listed in {@link buses} with its properties loaded.
      *
      * @example
      * const reverb = await session.newBus({ name: 'Reverb' });
@@ -7816,6 +7958,7 @@ var Luna = (() => {
         refresh: () => this.buses.reload(),
         flush: () => this.client.store.scheduler.flush()
       });
+      await this.buses.membersReady();
       return this.buses.byId(uid);
     }
     undo(count = 1) {
@@ -7938,8 +8081,8 @@ var Luna = (() => {
      * this session's package as a new audio source, and resolve to it once the workspace
      * lists it (fact 42).
      *
-     * This is the **File route**, and the one that works everywhere: in LUNA, in a browser and
-     * on the wasm engine, with no `/gui`. Get the `File` from `<input type="file">` or an HTML
+     * This is the **File route**, and the one that works everywhere: in LUNA and in a browser,
+     * with no `/gui`. Get the `File` from `<input type="file">` or an HTML
      * `drop` event; the page can decode and audition the same `File` too. When the page only
      * needs the file in the session and has an engine-readable path (from
      * `luna.gui.chooseFiles()` or `Luna.onPathDrop()`), {@link importPath} is the faster path
@@ -8016,7 +8159,7 @@ var Luna = (() => {
      * This is the **path route**, an optimization: the engine reads `path` itself, so the bytes
      * never pass through the page. Take the path from `luna.gui.chooseFiles()` or
      * `Luna.onPathDrop()`. It needs no `/gui`, but the engine must see the file: a native
-     * engine on the same machine, not the wasm engine. A path the engine cannot open rejects
+     * engine on the same machine. A path the engine cannot open rejects
      * with LUNA's `device.database_error`. For a browser `File`, use {@link uploadFile}.
      *
      * @example
@@ -8048,8 +8191,8 @@ var Luna = (() => {
      * LUNA's own import: the File > Import action. Imports an audio, MIDI or video file at
      * the selection start, onto `trackUid` or a new track, making a clip as LUNA does.
      *
-     * A **path route** command run by LUNA's UI, so it needs `/gui`: without it (a headless or
-     * wasm engine) it rejects with `Luna.Unsupported` (fact 103). To add a source without a
+     * A **path route** command run by LUNA's UI, so it needs `/gui`: without it (a headless
+     * engine) it rejects with `Luna.Unsupported` (fact 103). To add a source without a
      * clip, or without `/gui`, use {@link importPath}; for a browser `File`, {@link uploadFile}.
      *
      * @example
@@ -8391,13 +8534,125 @@ var Luna = (() => {
     }
   };
 
+  // src/client/secrets.ts
+  var MAX_SECRET_NAME_LENGTH = 128;
+  var MAX_SECRET_BYTES = 2560;
+  var NAME = /^[A-Za-z0-9._-]+$/;
+  var TIMEOUT_MS = 3e4;
+  var pending = /* @__PURE__ */ new Map();
+  var memory = /* @__PURE__ */ new Map();
+  var nextId = 1;
+  var warned = false;
+  var Secrets = class {
+    /**
+     * `'keychain'` inside a LUNA that stores secrets; `'memory'` elsewhere, where values last
+     * only until the page reloads. Tell the user when it is `'memory'`.
+     *
+     * @example
+     * if (luna.secrets.storage === 'memory') banner.textContent = 'Keys are kept until you close this page.';
+     */
+    get storage() {
+      return bridge() ? "keychain" : "memory";
+    }
+    /**
+     * The value stored under `name`, or `null` if there is none.
+     *
+     * @example
+     * const key = await luna.secrets.get('openai.api_key');
+     */
+    get(name) {
+      checkName(name);
+      if (!bridge()) return Promise.resolve(memory.get(name) ?? null);
+      return request({ op: "get", name });
+    }
+    /**
+     * Store `value` under `name`, replacing any value already there.
+     *
+     * @example
+     * await luna.secrets.set('openai.api_key', input.value);
+     */
+    async set(name, value) {
+      checkName(name);
+      if (typeof value !== "string") throw new UAError("invalid_request", "luna.secrets.set(): value must be a string");
+      if (new TextEncoder().encode(value).length > MAX_SECRET_BYTES) {
+        throw new UAError("too_large", `luna.secrets.set(): value is over ${MAX_SECRET_BYTES} bytes`);
+      }
+      if (!bridge()) {
+        warnMemory();
+        memory.set(name, value);
+        return;
+      }
+      await request({ op: "set", name, value });
+    }
+    /**
+     * Remove `name`. Removing a name that is not stored succeeds.
+     *
+     * @example
+     * await luna.secrets.delete('openai.api_key');
+     */
+    async delete(name) {
+      checkName(name);
+      if (!bridge()) {
+        memory.delete(name);
+        return;
+      }
+      await request({ op: "delete", name });
+    }
+  };
+  function bridge() {
+    const send = globalThis.lunaAPI?.secretsRequest;
+    return typeof send === "function" ? send : void 0;
+  }
+  function checkName(name) {
+    if (typeof name !== "string" || name.length > MAX_SECRET_NAME_LENGTH || !NAME.test(name)) {
+      throw new UAError("invalid_name", `luna.secrets: "${String(name)}" is not a valid name (1-${MAX_SECRET_NAME_LENGTH} of A-Z a-z 0-9 . _ -)`);
+    }
+  }
+  function warnMemory() {
+    if (warned) return;
+    warned = true;
+    console.warn("luna.secrets: no OS credential store here (not inside LUNA, or LUNA is too old); secrets are kept in page memory until reload.");
+  }
+  function request(body) {
+    const send = bridge();
+    if (!send) return Promise.reject(new UAError("unsupported", "luna.secrets: the LUNA bridge went away"));
+    listen();
+    const id = nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new RequestTimeout(`secrets.${body.op}`, body.name, TIMEOUT_MS));
+      }, TIMEOUT_MS);
+      pending.set(id, { resolve, reject, timer });
+      send({ id, ...body });
+    });
+  }
+  function listen() {
+    const g = globalThis;
+    g.lunaHost ??= {};
+    g.lunaHost.secretsResult = onResult;
+  }
+  function onResult(result) {
+    if (typeof result?.id !== "number") return;
+    const entry = pending.get(result.id);
+    if (!entry) return;
+    pending.delete(result.id);
+    clearTimeout(entry.timer);
+    if (result.ok === true) {
+      entry.resolve(typeof result.value === "string" ? result.value : null);
+      return;
+    }
+    const code = typeof result.error === "string" ? result.error : "store_error";
+    entry.reject(new UAError(code, `luna.secrets: LUNA answered ${code}`));
+  }
+
   // src/client/client.ts
   var Client = class {
     /** The transport. Escape hatch: `luna.raw.get('/sessions')`. */
     raw;
     /** The path-keyed mirror the domain objects read from. */
     store;
-    /** Which engine this client is talking to. */
+    /** Which engine this client is talking to: `'luna'` or `'mock'`. */
     engine;
     /** Connection status as a {@link Prop}. */
     status;
@@ -8416,6 +8671,8 @@ var Luna = (() => {
     jobs;
     /** LUNA's host surface (dialogs, pages, Add Ons). Only present inside LUNA. */
     gui;
+    /** API keys and tokens in the OS credential store, scoped to this Add On (page memory outside LUNA). */
+    secrets;
     statusCell;
     statusUnsub;
     /** @internal Use {@link connect}. */
@@ -8437,6 +8694,7 @@ var Luna = (() => {
       this.renders = new Renders(this);
       this.jobs = new Jobs(this);
       this.gui = new Gui(this);
+      this.secrets = new Secrets();
     }
     /**
      * The focused session (or the first open one), subscribed and loaded.
@@ -8493,7 +8751,11 @@ var Luna = (() => {
     get mock() {
       return this.raw instanceof MockPort ? this.raw.engine : void 0;
     }
-    /** The in-page wasm engine (audio, persistence, health) when `engine === 'wasm'`. */
+    /**
+     * The in-page wasm engine (audio, persistence, health) when `engine === 'wasm'`.
+     *
+     * @hidden
+     */
     get wasm() {
       return this.raw instanceof WasmPort ? this.raw.engine : void 0;
     }
@@ -8706,7 +8968,6 @@ var Luna = (() => {
   }
 
   // src/luna.ts
-  var VERSION = "0.1.0-alpha.7";
+  var VERSION = "0.1.0.15";
   return __toCommonJS(global_exports);
 })();
-//# sourceMappingURL=luna.global.js.map
