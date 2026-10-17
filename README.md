@@ -183,7 +183,7 @@ npm run bridge                   # MIDI for LUNA's macOS webview (and for plain 
 npx ua-builder serve             # http://localhost:8790/ ; LUNA must be running
 open "http://localhost:8790/?demo"   # an in-page mock session, to try the page without LUNA;
                                      # it never reads or writes your saved settings or sends MIDI out
-npx ua-builder install           # link into LUNA's Add Ons folder; appears in the Window menu
+npx ua-builder install           # link into LUNA's Add Ons folder; appears under Add Ons > Browsers
 ```
 
 | File | Purpose |
@@ -233,7 +233,7 @@ The SDK now ships prebuilt, in `~/Library/Application Support/LUNA Builder SDK` 
 `LUNA_BUILDER_SDK` to use another folder), so the fix is applied to the built bundle:
 
 ```sh
-node scripts/vendor-sdk.mjs   # vendor/luna.global.js = the installed SDK's bundle + the fix
+npm run vendor   # vendor/luna.global.js = the installed SDK's bundle + the fix
 ```
 
 It stops without writing if one of its three edits no longer finds its anchor, and says so

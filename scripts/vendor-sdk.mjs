@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Vendor the LUNA Builder SDK's script-tag bundle into vendor/luna.global.js, with the load-retry
-// fix from patches/ua-builder-sdk-load-retry.patch applied (failed loads are retried, not
-// remembered; fact 103). The SDK now ships prebuilt, so the fix is applied to the built bundle:
-// each edit must find its anchor exactly once, or nothing is written.
+// fix from patches/ua-builder-sdk-load-retry.patch applied: failed loads are retried, not
+// remembered, since LUNA can time a read out while it is still opening a session. The SDK now
+// ships prebuilt, so the fix is applied to the built bundle: each edit must find its anchor
+// exactly once, or nothing is written.
 //
 //   node scripts/vendor-sdk.mjs            from the installed SDK
 //   LUNA_BUILDER_SDK=<folder> node ...     from another SDK folder

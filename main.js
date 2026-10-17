@@ -1372,7 +1372,7 @@ async function bindSession() {
     }
     showStatus(`<span>Opening${session.name.value ? ` ${esc(session.name.value)}` : ''}…</span>`);
     try {
-      // Ask for the session's tracks only once LUNA says it has finished opening it (fact 103).
+      // Ask for the session's tracks only once LUNA says it has finished opening it: asked any earlier, LUNA can time the read out.
       await untilLoaded(session, stale);
       if (stale()) return;
       await session.ready();
