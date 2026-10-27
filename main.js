@@ -1,5 +1,5 @@
 // MIDI Learn: DOM wiring. Connects to LUNA, follows the focused session, listens to MIDI
-// (Web MIDI where the browser has it, else the local bridge, `npm run bridge`), and renders
+// (LUNA's own MIDI input and output, through the SDK), and renders
 // what logic.js's Mapper holds. Every listener is released when the session changes.
 
 const $ = (id) => document.getElementById(id);
@@ -9,7 +9,7 @@ const $ = (id) => document.getElementById(id);
 // it doesn't read or write the bridge's disk copy and never sends MIDI out (feedback).
 const DEMO = new URLSearchParams(location.search).has('demo');
 /** Which build of the page is running, reported to the bridge log, so a stale page is obvious. */
-const BUILD = '2026-10-04.5';
+const BUILD = '2026-10-26.1';
 const local = AddOnLogic.localStore();
 const store = {
   get: (key) => local.get(key),
@@ -69,6 +69,8 @@ let picked; // path or command id highlighted in the parameter list
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const X = '<svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
+// Feedback on: a double arrow drawn at the UI's 1.8 line weight, centred in its tag
+const FB_ICON = '<svg viewBox="0 0 16 12" width="16" height="12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 6h12M5 2.8L1.8 6 5 9.2M11 2.8L14.2 6 11 9.2"/></svg>';
 const CHEVRON = '<svg viewBox="0 0 14 14"><path d="M3 5l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
 
 // For `ua-builder probe` and the console: the live objects, read-only.
@@ -78,6 +80,9 @@ globalThis.midiLearn = {
   },
   get mapper() {
     return mapper;
+  },
+  get midi() {
+    return midiIn;
   },
 };
 
@@ -91,28 +96,62 @@ function toast(text, error = false) {
   toastTimer = setTimeout(() => el.classList.remove('show'), error ? 5000 : 2600);
 }
 
-// ---- MIDI input --------------------------------------------------------------------------
-// Web MIDI when the page has it (Chrome, Edge, LUNA on Windows); otherwise the bridge on
-// 127.0.0.1:8797, which LUNA's macOS webview needs. Never both, or every message arrives twice.
+// ---- MIDI in and out ----------------------------------------------------------------------
+// Where MIDI comes from, best first. Only one source is live at a time, or every message would
+// arrive twice:
+//   luna    LUNA publishes MIDI ports (Luna.MidiInput / Luna.SendMidi): every message, in order, and
+//           feedback out of the device. A LUNA release that has them is the way forward.
+//   webmidi the browser's Web MIDI (Chrome, Edge, LUNA on Windows). LUNA's macOS webview has none.
+//   bridge  the local helper on 127.0.0.1:8797 (npm run bridge, or the macOS installer), which
+//           carries every input and the feedback out.
+//   last    LUNA's per-device "last controller / last note" values, which every LUNA publishes. They
+//           are coalesced and a repeat of the same value is not a change, so a knob works but a
+//           repeated identical message can be missed. Input only: no feedback.
 const BRIDGE_URL = 'ws://127.0.0.1:8797';
-const midiIn = { via: 'none', inputs: [], lastHit: 0, ws: undefined, access: undefined };
+const midiIn = { via: 'none', inputs: [], lastHit: 0, ws: undefined, bridgeInputs: [], access: undefined, ready: false, stops: [], listeningTo: '', lastStops: [] };
+
+/** A message from `source` counts only while that source is the live one. */
+const from = (source) => (data, device) => {
+  if (midiIn.via === source) onMidi(data, device);
+};
+
+/** Devices LUNA publishes an input port for (a LUNA with MIDI ports), and every real device. */
+const portDevices = () => luna.midiDevices.items.filter((d) => d.isPhysical && d.inputPort && d.name.value);
+const realDevices = () => luna.midiDevices.items.filter((d) => d.isPhysical && d.name.value);
+
+/** The device with this name and an output port, for MIDI out through LUNA. */
+function outputDevice(name) {
+  const outs = luna.midiDevices.items.filter((d) => d.isPhysical && d.outputPort && d.name.value);
+  return outs.find((d) => d.name.value === name) ?? outs.find((d) => d.name.value.startsWith(name)) ?? outs.find((d) => d.name.value.includes(name));
+}
 
 /**
- * MIDI out, for feedback to motorized controllers: Web MIDI's output of the same name, or the
- * bridge, which finds the output named like the input. Returns whether it went anywhere.
+ * MIDI out, for feedback to motorized controllers: out of the device LUNA lists with the input's
+ * name (when LUNA has MIDI ports), else Web MIDI's output of that name, else the bridge, which finds
+ * the output named like the input. Returns whether it went anywhere. LUNA answers a send to a port
+ * that has gone with success, so the device is looked up on every send.
  */
 function sendMidi(device, bytes) {
   if (DEMO) return false;
   try {
-    if (midiIn.via === 'webmidi' && midiIn.access) {
-      const outs = [...midiIn.access.outputs.values()];
-      const out = outs.find((o) => o.name === device) ?? outs.find((o) => o.name?.startsWith(device)) ?? outs.find((o) => o.name?.includes(device));
-      if (!out) return false;
-      out.send(bytes);
+    const out = luna && outputDevice(device);
+    if (out) {
+      const [status, data1 = 0, data2 = 0] = bytes;
+      new Luna.SendMidi(luna).sendMidiToOutput(out, status, data1, data2).catch((e) => report(`feedback to ${device} failed: ${e.code ?? ''} ${e.message}`));
       return true;
     }
+    // Web MIDI and the helper name the hardware without LUNA's " (2)" suffix.
+    const plain = String(device).replace(/\s*\(\d+\)$/, '');
+    if (midiIn.access) {
+      const outs = [...midiIn.access.outputs.values()];
+      const o = outs.find((x) => x.name === plain) ?? outs.find((x) => x.name?.startsWith(plain)) ?? outs.find((x) => x.name?.includes(plain));
+      if (o) {
+        o.send(bytes);
+        return true;
+      }
+    }
     if (midiIn.ws?.readyState === 1) {
-      midiIn.ws.send(JSON.stringify({ type: 'send', device, data: bytes }));
+      midiIn.ws.send(JSON.stringify({ type: 'send', device: plain, data: bytes }));
       return true;
     }
   } catch (e) {
@@ -121,7 +160,7 @@ function sendMidi(device, bytes) {
   return false;
 }
 
-/** Send a line to the bridge's log (~/Library/Logs/midi-learn-bridge.log): LUNA's window has no console. */
+/** Send a line to the helper's log (~/Library/Logs/midi-learn-bridge.log), when it runs: LUNA's window has no console. */
 function report(text) {
   console.log(text);
   try {
@@ -132,66 +171,129 @@ window.addEventListener('error', (e) => report(`error: ${e.message} at ${e.filen
 window.addEventListener('unhandledrejection', (e) => report(`unhandled: ${e.reason?.code ?? ''} ${e.reason?.message ?? e.reason}`));
 
 function onMidi(data, device) {
-  if (prefs.device && device !== prefs.device) return;
+  if (prefs.device && !AddOnLogic.sameDevice(device, prefs.device)) return;
   const msg = AddOnLogic.parseMidi(data);
   if (!msg) return;
   midiIn.lastHit = performance.now();
   if (mapper) {
     const hits = mapper.learning ? -1 : mapper.all().filter((m) => mapper.matches(m.source, { device, type: msg.type, channel: msg.channel, number: msg.number })).length;
     mapper.midi(msg, device);
-    // LUNA's window has no console: say what arrived and what it did, at most a few lines a second.
+    // Say what arrived and what it did, at most a few lines a second.
     const now = performance.now();
     if (now - (onMidi.said ?? 0) > 300) {
       onMidi.said = now;
-      report(`midi ${AddOnLogic.sourceLabel(msg)} = ${msg.raw} ch ${msg.channel} from ${device}: ${hits < 0 ? 'learning' : hits ? `${hits} mapping(s)` : 'no mapping'}`);
+      report(`midi ${AddOnLogic.sourceLabel(msg)} = ${msg.raw} ch ${msg.channel} from ${device} (${midiIn.via}): ${hits < 0 ? 'learning' : hits ? `${hits} mapping(s)` : 'no mapping'}`);
     }
   }
+}
+
+/** Pick the live source and list its inputs. Called whenever any source's devices change. */
+function chooseVia() {
+  const was = midiIn.via;
+  let via = 'none';
+  let names = [];
+  if (midiIn.ready && portDevices().length) [via, names] = ['luna', portDevices().map((d) => d.name.value)];
+  else if (midiIn.access?.inputs.size > 0) [via, names] = ['webmidi', [...midiIn.access.inputs.values()].map((i) => i.name)];
+  else if (midiIn.bridgeInputs.length) [via, names] = ['bridge', midiIn.bridgeInputs];
+  else if (midiIn.ready && realDevices().length) [via, names] = ['last', realDevices().map((d) => d.name.value)];
+  midiIn.via = via;
+  midiIn.inputs = [...new Set(names)];
+  renderDevices();
+  if (via !== was) {
+    report(`MIDI via ${via}: ${midiIn.inputs.length} input(s)`);
+    mapper?.syncFeedback();
+  }
+}
+
+/** luna: listen to each port on its own, so every message says which device sent it. */
+function listenToPorts() {
+  const devices = portDevices();
+  const key = devices.map((d) => `${d.name.value}@${d.inputPort.path}`).join('|');
+  if (key !== midiIn.listeningTo || midiIn.stops.length !== devices.length) {
+    midiIn.listeningTo = key;
+    for (const stop of midiIn.stops) stop();
+    const input = new Luna.MidiInput(luna);
+    midiIn.stops = devices.map((d) => {
+      const name = d.name.value;
+      return input.listen(d, (m) => from('luna')([m.status, m.data1, m.data2], name), {
+        onGap: ({ missed, dropped }) => report(`midi gap from ${name}: ${missed} batch(es) missed, ${dropped} dropped`),
+      });
+    });
+  }
+}
+
+/**
+ * last: follow each device's last controller and last note. LUNA pushes `last_midi_control` and
+ * `last_midi_note` ([status, data1, data2]) to whoever subscribes to the device by path (the SDK's
+ * props alone are not kept live), so one recursive subscription on the MIDI folder hears them all.
+ */
+function watchLast() {
+  if (midiIn.lastStops.length) return;
+  midiIn.lastStops = [
+    luna.raw.subscribe(
+      luna.midiDevices.path,
+      (e) => {
+        const m = /\/midi\/([^/]+)\/last_midi_(control|note)$/.exec(e.path ?? '');
+        if (!m || !Array.isArray(e.data) || e.data[0] === 255 || e.data[0] === undefined) return;
+        const device = luna.midiDevices.items.find((d) => d.id === m[1]);
+        if (device?.isPhysical && device.name.value) from('last')(e.data, device.name.value);
+      },
+      { recursive: true },
+    ),
+  ];
+}
+
+function devicesChanged() {
+  if (!midiIn.ready) return;
+  listenToPorts();
+  watchLast();
+  chooseVia();
 }
 
 async function startMidi() {
-  // WebKit (LUNA's window on macOS) has no requestMIDIAccess. Where it exists it can still
-  // refuse, hang, or see no devices, so any of those falls back to the bridge too.
-  if (navigator.requestMIDIAccess) {
-    try {
-      const access = await Promise.race([
-        navigator.requestMIDIAccess({ sysex: false }),
-        new Promise((_, no) => setTimeout(() => no(new Error('Web MIDI did not answer')), 3000)),
-      ]);
-      if (access.inputs.size > 0) {
-        midiIn.via = 'webmidi';
+  // Web MIDI, where the page has it. WebKit (LUNA's window on macOS) has none; where it exists it
+  // can still refuse, hang, or see no devices, and then LUNA's own list or the bridge is used.
+  if (navigator.requestMIDIAccess && !DEMO) {
+    Promise.race([navigator.requestMIDIAccess({ sysex: false }), new Promise((_, no) => setTimeout(() => no(new Error('Web MIDI did not answer')), 3000))])
+      .then((access) => {
         midiIn.access = access;
         const wire = () => {
-          midiIn.inputs = [];
-          for (const input of access.inputs.values()) {
-            midiIn.inputs.push(input.name);
-            input.onmidimessage = (e) => onMidi(e.data, input.name);
-          }
-          renderDevices();
+          for (const input of access.inputs.values()) input.onmidimessage = (e) => from('webmidi')(e.data, input.name);
+          chooseVia();
         };
         access.onstatechange = wire;
         wire();
-        return;
-      }
-    } catch (e) {
-      console.warn('Web MIDI unavailable, using the bridge', e);
-    }
+      })
+      .catch((e) => console.warn('Web MIDI unavailable', e));
   }
-  connectBridge();
+  try {
+    const watcher = luna.midiDevices.watch();
+    await watcher.ready;
+    midiIn.ready = true;
+    luna.midiDevices.onChange(devicesChanged);
+    luna.status.onChange(() => {
+      // After LUNA reconnects the SDK restores its subscriptions; make sure ours exist.
+      if (luna.status.value === 'connected') {
+        midiIn.listeningTo = '';
+        devicesChanged();
+      }
+    });
+  } catch (e) {
+    report(`MIDI devices unavailable: ${e.code ?? ''} ${e.message}`);
+  }
+  devicesChanged();
 }
 
+/** The local helper (npm run bridge): carries MIDI when LUNA doesn't publish it, and keeps a log and a disk copy of the settings. */
 function connectBridge() {
-  if (midiIn.via !== 'nobridge') midiIn.via = 'connecting';
-  renderDevices();
   let ws;
   try {
     ws = new WebSocket(BRIDGE_URL);
   } catch {
-    midiIn.via = 'nobridge';
-    renderDevices();
-    return setTimeout(connectBridge, 3000);
+    return setTimeout(connectBridge, 5000);
   }
-  midiIn.ws = ws;
   ws.onopen = () => {
+    midiIn.ws = ws;
     ws.send(JSON.stringify({ type: 'hello', build: BUILD, ua: navigator.userAgent, webmidi: !!navigator.requestMIDIAccess, inLuna: Luna.isEmbeddedInLuna(), url: location.href }));
   };
   ws.onmessage = (e) => {
@@ -199,33 +301,66 @@ function connectBridge() {
     if (msg.type === 'state') mergeState(msg.items);
     else if (msg.type === 'diag') report(`diag ${JSON.stringify(healthSnapshot())}`);
     else if (msg.type === 'inputs') {
-      midiIn.via = 'bridge';
-      midiIn.inputs = msg.inputs;
-      renderDevices();
-      mapper?.syncFeedback();
-    } else if (msg.type === 'midi') onMidi(msg.data, msg.device);
+      midiIn.bridgeInputs = msg.inputs;
+      chooseVia();
+    } else if (msg.type === 'midi') from('bridge')(msg.data, msg.device);
   };
   ws.onclose = () => {
-    midiIn.via = 'nobridge';
-    midiIn.inputs = [];
-    renderDevices();
-    setTimeout(connectBridge, 3000);
+    if (midiIn.ws === ws) midiIn.ws = undefined;
+    midiIn.bridgeInputs = [];
+    chooseVia();
+    setTimeout(connectBridge, 5000);
   };
 }
 
 function renderDevices() {
   const sel = $('device');
-  const names = [...new Set([...midiIn.inputs, ...(prefs.device ? [prefs.device] : [])])];
-  const none = midiIn.via === 'nobridge' ? 'No MIDI: bridge not running' : midiIn.via === 'connecting' ? 'Looking for MIDI…' : 'No MIDI inputs found';
+  const known = (n) => midiIn.inputs.some((i) => AddOnLogic.sameDevice(i, n));
+  const names = [...new Set([...midiIn.inputs, ...(prefs.device && !known(prefs.device) ? [prefs.device] : [])])];
+  const none = midiIn.ready ? 'No MIDI inputs found' : 'Looking for MIDI…';
   sel.innerHTML =
     (midiIn.inputs.length ? `<option value="">All inputs (${midiIn.inputs.length})</option>` : `<option value="">${none}</option>`) +
-    names.map((n) => `<option value="${esc(n)}">${esc(n)}${midiIn.inputs.includes(n) ? '' : ' (offline)'}</option>`).join('');
-  sel.value = prefs.device;
+    names.map((n) => `<option value="${esc(n)}">${esc(n)}${known(n) ? '' : ' (offline)'}</option>`).join('');
+  sel.value = names.find((n) => AddOnLogic.sameDevice(n, prefs.device)) ?? '';
   $('midi-dot').classList.toggle('live', midiIn.inputs.length > 0);
+  $('midi-chip').title = { luna: 'MIDI from LUNA', webmidi: 'MIDI from the browser (Web MIDI)', bridge: 'MIDI from the MIDI Learn helper', last: "MIDI from LUNA's last-controller values: knobs work; no feedback, and an identical repeat can be missed. Run the helper (npm run bridge) for full MIDI.", none: 'Which MIDI input MIDI Learn listens to' }[midiIn.via];
 }
 $('device').onchange = () => {
   prefs.device = $('device').value;
   savePrefs();
+};
+
+// The input list is our own menu, not the native <select> popup: macOS opens that one over the
+// selected item, so with many devices and the last one chosen it runs off the top of the screen.
+function openDeviceMenu() {
+  const menu = $('device-menu');
+  const sel = $('device');
+  menu.innerHTML = [...sel.options].map((o) => `<button role="option" data-v="${esc(o.value)}" aria-selected="${o.value === sel.value}">${esc(o.textContent)}</button>`).join('');
+  menu.hidden = false;
+  const chip = $('midi-chip').getBoundingClientRect();
+  menu.style.maxHeight = `${Math.max(120, innerHeight - chip.bottom - 14)}px`;
+  menu.style.top = `${chip.bottom + 6}px`;
+  menu.style.left = `${Math.max(8, Math.min(chip.left, innerWidth - menu.offsetWidth - 8))}px`;
+  (menu.querySelector('[aria-selected="true"]') ?? menu.querySelector('button'))?.focus({ preventScroll: true });
+  menu.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest' });
+}
+function closeDeviceMenu() {
+  $('device-menu').hidden = true;
+}
+$('midi-chip').onclick = () => ($('device-menu').hidden ? openDeviceMenu() : closeDeviceMenu());
+$('midi-chip').onkeydown = (e) => {
+  if (e.key === 'Enter' || e.key === ' ' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    openDeviceMenu();
+  }
+};
+$('device-menu').onclick = (e) => {
+  const b = e.target.closest('button[data-v]');
+  if (!b) return;
+  $('device').value = b.dataset.v;
+  $('device').onchange();
+  closeDeviceMenu();
+  $('midi-chip').focus();
 };
 
 // ---- Rendering ----------------------------------------------------------------------------
@@ -240,6 +375,7 @@ function schedule() {
 }
 
 function paint() {
+  paintSessionSwitches();
   paintLearn();
   paintMonitor();
   paintMaps();
@@ -266,7 +402,7 @@ function paintLearn() {
   if (mapper?.lastLearned && mapper.lastLearned !== announced) {
     announced = mapper.lastLearned;
     const r = mapper.rows().find((x) => x.mapping.id === announced);
-    if (r) toast(r.plugin ? `Plugins: ${r.source} → ${r.target} (${r.mapping.target.pluginName}, any instance)` : r.mighty ? `Proxy: ${r.source}. Click any control in LUNA` : r.focus ? `Channel Focus: ${r.source} → ${r.target} (${r.where})` : `Mapped ${r.source} → ${r.target} (${r.where})`);
+    if (r) toast(r.plugin ? `Plugins: ${r.source} → ${r.target} (${r.mapping.target.pluginName}, any instance)` : r.mighty ? `Click & Turn: ${r.source}. Click any control in LUNA` : r.focus ? `Channel Focus: ${r.source} → ${r.target} (${r.where})` : `Mapped ${r.source} → ${r.target} (${r.where})`);
     setTimeout(() => {
       if (mapper?.lastLearned === announced) {
         mapper.lastLearned = undefined;
@@ -300,13 +436,42 @@ function paintLearn() {
 const LEARN_SECTIONS = { map: 'maps-sect', focus: 'focus-sect', mighty: 'mighty-sect', plugin: 'plugin-sect' };
 const LEARN_FOLDS = { map: 'maps', focus: 'focus', mighty: 'mighty', plugin: 'plugins' };
 
+// The Commands list inside the learn bar: play, record, undo… to pick without scrolling to Parameters.
+function buildCmdList() {
+  const box = $('cmd-list');
+  box.innerHTML = '';
+  for (const c of AddOnLogic.COMMANDS) {
+    const b = document.createElement('button');
+    b.className = 'param';
+    b.dataset.key = c.id;
+    b.innerHTML = `<span><b>${esc(c.label)}<i class="mapped" hidden></i></b><small>Command</small></span><span class="v"></span>`;
+    b.onclick = () => {
+      mapper?.pick(AddOnLogic.commandTarget(c.id));
+      setCmdList(false);
+    };
+    box.appendChild(b);
+  }
+}
+function setCmdList(open) {
+  $('cmd-list').hidden = !open;
+  $('cmd-toggle').setAttribute('aria-expanded', String(open));
+  if (open) {
+    if (!$('cmd-list').childElementCount) buildCmdList();
+    paintBrowseMarks();
+    paintPicked();
+  }
+}
+$('cmd-toggle').onclick = () => setCmdList($('cmd-list').hidden);
+
 function paintLearnBar(on) {
   const bar = $('learnbar');
   const mode = mapper?.learnMode ?? 'map';
   bar.hidden = !on;
   bar.classList.toggle('proxy', mode === 'mighty');
+  bar.classList.toggle('no-cmd', mode !== 'map');
+  if (!on || mode !== 'map') setCmdList(false);
   const done = on && mapper?.latch ? 'Stop' : 'Done';
-  // Hold sits just right of the learning section's Learn button, only while it learns. The Proxy
+  // Hold sits just right of the learning section's Learn button, only while it learns. Click & Turn
   // is one knob, so it has no Hold.
   const hold = $('learn-hold');
   const pill = document.querySelector(`.learn-pill[data-learn="${mode}"]`);
@@ -447,11 +612,17 @@ function paintFolds() {
     const folded = !!prefs.fold[key];
     b.setAttribute('aria-expanded', String(!folded));
     b.closest('.sect, .col').classList.toggle('folded', folded);
-    // The Learn column narrows only when everything in it is folded: Proxy lives there too.
+    // The Learn column narrows only when everything in it is folded: Click & Turn lives there too.
     const narrow = key === 'learn' ? folded && !!prefs.fold.mighty : folded;
     $('board').classList.toggle(`fold-${key}`, narrow);
   }
 }
+// Clicks made before this script ran were handled by the page's early handler: adopt them.
+document.removeEventListener('click', globalThis.__earlyFold);
+for (const [key, flipped] of Object.entries(globalThis.__earlyFolds ?? {})) {
+  if (flipped) prefs.fold = { ...prefs.fold, [key]: !prefs.fold[key] };
+}
+if (Object.values(globalThis.__earlyFolds ?? {}).some(Boolean)) savePrefs();
 for (const b of document.querySelectorAll('.fold')) {
   b.onclick = () => {
     prefs.fold = { ...prefs.fold, [b.dataset.fold]: !prefs.fold[b.dataset.fold] };
@@ -557,7 +728,31 @@ function paintSummaries(all, regular) {
   put('focus-sum', focus.length ? `${track ?? 'No track'}${mapper.focusLock ? ' (locked)' : ''} · ${focus.length} control${focus.length === 1 ? '' : 's'}` : '');
 }
 
-// ---- Proxy card ------------------------------------------------------------------------
+// ---- Saved with the session ----------------------------------------------------------------
+// Session mappings always live in the session. Click & Turn, Channel Focus and the plugin maps are
+// one layout for every session until their "Save with this session" switch is on.
+function paintSessionSwitches() {
+  for (const b of document.querySelectorAll('[data-session]')) {
+    const on = !!mapper?.savedWithSession(b.dataset.session);
+    b.setAttribute('aria-pressed', String(on));
+    b.disabled = !mapper?.sessionStore?.available;
+    if (b.disabled) b.title = "This LUNA doesn't keep Add On settings in the session, so this layout is shared by every session";
+  }
+}
+for (const b of document.querySelectorAll('[data-session]')) {
+  b.onclick = () => {
+    if (!mapper) return;
+    const kind = b.dataset.session;
+    const on = !mapper.savedWithSession(kind);
+    if (!mapper.setSavedWithSession(kind, on)) return;
+    const name = { mighty: 'Click & Turn', focus: 'Channel Focus', plugins: 'Plugin maps' }[kind];
+    toast(on ? `${name} now saved with this session` : `${name} back to the layout shared by every session`);
+    report(`${kind} saved with session: ${on}`);
+    schedule();
+  };
+}
+
+// ---- Click & Turn card ------------------------------------------------------------------------
 const mightyBind = new Luna.Bindings();
 let mightyBound; // the control path the card's live value follows
 function paintMighty(r, now) {
@@ -613,7 +808,7 @@ $('mighty-fb').onclick = () => {
 $('mighty-x').onclick = () => {
   if (!mapper?.mighty) return;
   mapper.remove(mapper.mighty.id);
-  toast('Proxy removed');
+  toast('Click & Turn removed');
 };
 
 /** The Plugins header (which instance the maps control) and the saved-maps chips. */
@@ -694,7 +889,7 @@ $('focus-fb').onclick = () => {
   const on = !(able.length > 0 && able.every((m) => m.feedback));
   $('focus-fb').setAttribute('aria-pressed', String(on));
   mapper.setFocusFeedback(on);
-  report(`channel focus feedback ${on ? 'on' : 'off'} for ${able.length} mapping(s); saved: ${JSON.stringify((store.get('midilearn.focus') ?? []).map((m) => m.feedback))}`);
+  report(`channel focus feedback ${on ? 'on' : 'off'} for ${able.length} mapping(s)`);
 };
 $('focus-track').onchange = () => mapper?.setFocusLock($('focus-track').value || undefined);
 
@@ -830,7 +1025,7 @@ function buildList(state, list, total) {
         <span class="src" title="${esc(`${r.source}, channel ${r.channel}${r.device ? `, ${r.device}` : ', any input'}`)}">${esc(r.source)}</span>
         <span class="tgt"><b>${esc(r.target)}</b><small>${esc(r.missing ? `${r.where} · ${r.missingWhy}` : r.where)}</small></span>
         <span class="val">${isControl ? `<span class="d">${esc(r.display)}</span>${continuous ? '<span class="meter"><i></i></span>' : ''}` : r.automation ? `<span class="d">${esc(r.display)}</span>` : ''}</span>
-        <span class="tags"><span class="tag fb" title="Feedback on: the controller follows LUNA"${m.feedback ? '' : ' hidden'}>↔</span><span class="tag global"${r.global ? '' : ' hidden'}>Global</span><span class="tag mode">${MODES[m.mode] ?? m.mode}</span><button class="more" aria-label="Edit mapping" aria-expanded="${openRows.has(m.id)}">${CHEVRON}</button><button class="x" aria-label="Delete mapping">${X}</button></span>
+        <span class="tags"><span class="tag fb" title="Feedback on: the controller follows LUNA"${m.feedback ? '' : ' hidden'}>${FB_ICON}</span><span class="tag global"${r.global ? '' : ' hidden'}>Global</span><span class="tag mode">${MODES[m.mode] ?? m.mode}</span><button class="more" aria-label="Edit mapping" aria-expanded="${openRows.has(m.id)}">${CHEVRON}</button><button class="x" aria-label="Delete mapping">${X}</button></span>
       </div>
       <div class="edit">
         <div class="lbl">MIDI<span class="line src-line"><select class="s-type" aria-label="Message">${[['cc', 'CC'], ['note', 'Note'], ['pitch', 'Bend'], ['program', 'Program']].map(([k, v]) => `<option value="${k}"${m.source.type === k ? ' selected' : ''}>${v}</option>`).join('')}</select><input class="s-num" inputmode="numeric" maxlength="4" aria-label="Number" value="${esc(m.source.type === 'pitch' ? '' : m.source.type === 'note' ? AddOnLogic.noteName(m.source.number) : m.source.type === 'program' ? m.source.number + 1 : m.source.number)}"${m.source.type === 'pitch' ? ' disabled' : ''}><select class="s-ch" aria-label="Channel"><option value="">Any ch</option>${Array.from({ length: 16 }, (_, i) => `<option value="${i + 1}"${m.source.channel === i + 1 ? ' selected' : ''}>Ch ${i + 1}</option>`).join('')}</select></span></label>
@@ -863,9 +1058,7 @@ function buildList(state, list, total) {
     if (q('.fb'))
       q('.fb').onclick = () => {
         flip(q('.fb'), () => ({ feedback: !m.feedback }));
-        const key = m.scope === 'focus' ? 'midilearn.focus' : m.scope === 'global' ? 'midilearn.globals' : mapper.sessionKey;
-        const saved = (store.get(key) ?? []).find?.((x) => x.id === m.id)?.feedback;
-        report(`feedback ${m.feedback ? 'on' : 'off'} for ${r.source} → ${r.target} (${m.scope}${m.scope === 'focus' ? `, focus on ${mapper.focusTrack()?.name.value ?? 'no track'}` : ''}); saved: ${saved}`);
+        report(`feedback ${m.feedback ? 'on' : 'off'} for ${r.source} → ${r.target} (${m.scope}${m.scope === 'focus' ? `, focus on ${mapper.focusTrack()?.name.value ?? 'no track'}` : ''})`);
       };
     if (q('.glob')) q('.glob').onclick = () => {
       const global = m.scope !== 'global';
@@ -976,7 +1169,7 @@ function buildBrowse() {
           if (!mapper.learning) mapper.setLearning(true);
           return;
         }
-        if (mapper.pick(it.target) === false) toast(mapper.learnMode === 'mighty' ? 'The Proxy follows what you click in LUNA; just move a knob' : mapper.learnMode === 'plugin' ? 'Plugin maps take plugin parameters: turn a knob in the plugin’s window' : 'Commands aren’t per track, so they can’t be Channel Focus mappings', true);
+        if (mapper.pick(it.target) === false) toast(mapper.learnMode === 'mighty' ? 'Click & Turn follows what you click in LUNA; just move a knob' : mapper.learnMode === 'plugin' ? 'Plugin maps take plugin parameters: turn a knob in the plugin’s window' : 'Commands aren’t per track, so they can’t be Channel Focus mappings', true);
       };
       if (it.entry) {
         const v = b.querySelector('.v');
@@ -1051,6 +1244,7 @@ window.addEventListener(
   (e) => {
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) return;
     if (e.key === 'Escape') {
+      if (!$('device-menu').hidden) return closeDeviceMenu();
       if (!$('learn-menu').hidden) return closeLearnMenu();
       if (!$('help').hidden) return toggleHelp(false);
       if (colorsEl) return closeColors();
@@ -1095,13 +1289,13 @@ function paintTemplates() {
       [t.mappings?.length ?? 0, 'mapping'],
       [t.globals?.length ?? 0, 'global'],
       [t.focus?.length ?? 0, 'Channel Focus'],
-      [t.mighty ? 1 : 0, 'Proxy'],
+      [t.mighty ? 1 : 0, 'Click & Turn'],
       [t.plugins?.length ?? 0, 'plugin'],
     ].filter(([c]) => c);
-    return parts.map(([c, w]) => (w === 'Proxy' ? 'Proxy' : `${c} ${w}${c === 1 || w === 'Channel Focus' ? '' : 's'}`)).join(' · ') || 'empty';
+    return parts.map(([c, w]) => (w === 'Click & Turn' ? 'Click & Turn' : `${c} ${w}${c === 1 || w === 'Channel Focus' ? '' : 's'}`)).join(' · ') || 'empty';
   };
   templatesEl.innerHTML = `
-    <div><h4>Templates</h4><p class="note">A template saves your whole controller layout, every section: this session's mappings, global mappings, Channel Focus, the Proxy and plugin maps. Load merges it in; Replace clears those sections first.</p></div>
+    <div><h4>Templates</h4><p class="note">A template saves your whole controller layout, every section: this session's mappings, global mappings, Channel Focus, Click &amp; Turn and plugin maps. Load merges it in; Replace clears those sections first.</p></div>
     <div class="save"><input placeholder="Template name" maxlength="60" aria-label="Template name"><button class="pill solid" ${total ? '' : 'disabled'}>Save</button></div>
     ${list.length ? `<ul>${list.map((t, i) => `<li><b>${esc(t.name)}<small>${esc(summary(t))}</small></b><button class="pill" data-apply="${i}">Load</button><button class="pill" data-replace="${i}" title="Clear the sections this template holds, then load it">Replace</button><button class="x" data-del="${i}" aria-label="Delete template">${X}</button></li>`).join('')}</ul>` : '<p class="note">No templates yet.</p>'}
     <div class="foot"><button class="pill" id="t-export">Export…</button><button class="pill" id="t-import">Import…</button><button class="pill danger" id="t-clear" ${n ? '' : 'disabled'}>Clear session</button></div>`;
@@ -1186,9 +1380,17 @@ function hitColors(hex) {
   return { hit, onHit: luminance(hit) > 0.4 ? '#000' : '#fff' };
 }
 
+/** `hex` moved `amount` (0 to 1) of the way toward `to` (a 0-255 channel value). */
+function shade(hex, to, amount) {
+  return `#${[1, 3, 5].map((i) => Math.round(parseInt(hex.slice(i, i + 2), 16) * (1 - amount) + to * amount).toString(16).padStart(2, '0')).join('')}`;
+}
+
 function setColor(hex, remember = true) {
   if (!/^#[0-9a-f]{6}$/i.test(hex)) return false;
   document.documentElement.style.setProperty('--tape', hex);
+  // The slightest gradient: a touch lighter at the top, a touch darker at the bottom.
+  document.documentElement.style.setProperty('--tape-hi', shade(hex, 255, 0.1));
+  document.documentElement.style.setProperty('--tape-lo', shade(hex, 0, 0.12));
   const { hit, onHit } = hitColors(hex);
   document.documentElement.style.setProperty('--hit', hit);
   document.documentElement.style.setProperty('--on-hit', onHit);
@@ -1319,6 +1521,7 @@ $('open-colors').onclick = (e) => {
 };
 document.addEventListener('pointerdown', (e) => {
   if (!$('learn-menu').hidden && !$('learn-menu').contains(e.target)) closeLearnMenu();
+  if (!$('device-menu').hidden && !$('device-menu').contains(e.target) && !$('midi-chip').contains(e.target)) closeDeviceMenu();
   if (!$('help').hidden && !$('help').contains(e.target) && e.target !== $('open-help')) toggleHelp(false);
   if (colorsEl && !colorsEl.contains(e.target) && e.target !== $('open-colors')) closeColors();
   if (templatesEl && !templatesEl.contains(e.target) && e.target !== $('open-templates')) closeTemplates();
@@ -1333,13 +1536,26 @@ setColor(store.get('midilearn.color') ?? DEFAULT_COLOR, false);
 let boundId; // the session the page is fully bound to
 let bindingId; // the session a bindSession in progress is opening
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const showStatus = (html) => ($('status').innerHTML = html);
+const showStatus = (html) => {
+  $('status').innerHTML = html;
+  paintLink();
+};
+// The dot after the session name: green once LUNA is connected and the session is bound, yellow
+// while connecting or opening, red when the connection is down.
+function paintLink() {
+  const up = luna?.status.value;
+  const state = up === 'disconnected' || up === 'closed' ? 'off' : up === 'connected' && mapper ? 'ok' : 'wait';
+  const dot = $('link');
+  dot.className = `ldot ${state}`;
+  dot.title = { ok: 'Connected to LUNA', wait: 'Connecting to LUNA', off: 'LUNA is not connected' }[state];
+}
 
 function unbind() {
   for (const u of releases) u();
   releases = [];
   const old = mapper;
   mapper = undefined;
+  paintLink();
   boundId = undefined;
   rows.clear();
   for (const l of Object.values(lists)) l.bind.clear();
@@ -1426,12 +1642,17 @@ function waitFor(prop, ok, stale) {
 
 async function bindReady(s, gen) {
   const stale = () => gen !== sessionGen;
-  const paintName = () => showStatus(`<b>${esc(s.name.value ?? s.uid)}</b>`);
+  const paintName = () => showStatus(`<span class="lbl">SESSION:</span><b>${esc(s.name.value ?? s.uid)}</b>`);
   paintName();
   keep(s.name.onChange(paintName));
   const pluginName = (id) => luna.plugins.byId(id)?.name.value;
+  // Mappings saved with the session are read from LUNA first; without them the page falls back to this machine's storage.
+  const sessionStore = new AddOnLogic.SessionSettings(s, { onError: (e) => report(`session settings: ${e.code ?? ''} ${e.message}`) });
+  await sessionStore.load();
+  if (stale()) return;
   const m = new AddOnLogic.Mapper(s, {
     storage: store,
+    sessionStore,
     pluginName,
     send: sendMidi,
     subscribe: (p, fn) => luna.raw.subscribe(p, fn, { recursive: true }),
@@ -1441,6 +1662,7 @@ async function bindReady(s, gen) {
   m.onLearnNote = (text) => report(text);
   m.onFocusMoved = (track) => report(`focus → ${track?.name.value ?? 'no track'}; feedback to ${m.focusMappings.filter((x) => x.feedback).length} focus mapping(s)`);
   mapper = m;
+  paintLink();
   boundId = s.id;
   keep(m.onChange(schedule));
   let lastCount = -1;
@@ -1516,7 +1738,7 @@ async function connect() {
     }
   }
   Luna.bindShortcuts(luna);
-  const paintLink = () => $('link').classList.toggle('live', luna.status.value === 'connected');
+  startMidi();
   paintLink();
   luna.status.onChange(paintLink);
   await luna.sessions.ready();
@@ -1550,6 +1772,8 @@ function healthSnapshot() {
     focus: document.activeElement ? `${document.activeElement.tagName.toLowerCase()}#${document.activeElement.id}` : null,
     luna: luna?.status.value,
     bridge: midiIn.ws?.readyState,
+    midi: midiIn.via,
+    midiInputs: midiIn.inputs.length,
     session: session?.name.value,
     mapper: !!mapper,
     learning: mapper?.learning ?? false,
@@ -1584,6 +1808,6 @@ function healthCheck() {
 setInterval(healthCheck, 30000);
 
 renderDevices();
-startMidi();
+if (!new URLSearchParams(location.search).has('nobridge')) connectBridge(); // ?nobridge: try the page without the helper
 connect();
 

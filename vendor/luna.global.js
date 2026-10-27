@@ -23,6 +23,7 @@ var Luna = (() => {
   __export(global_exports, {
     AUTOMATION_MODES: () => AUTOMATION_MODES,
     AddOn: () => AddOn,
+    Assistant: () => Assistant,
     AudioSource: () => AudioSource,
     Automation: () => Automation,
     Bindings: () => Bindings,
@@ -38,6 +39,8 @@ var Luna = (() => {
     Client: () => Client,
     Clip: () => Clip,
     Collection: () => Collection,
+    CompiledClip: () => CompiledClip,
+    CompiledClips: () => CompiledClips,
     ConnectionLost: () => ConnectionLost,
     Context: () => Context,
     Control: () => Control,
@@ -60,12 +63,17 @@ var Luna = (() => {
     Job: () => Job,
     Jobs: () => Jobs,
     KeySignature: () => KeySignature,
+    LUNA_DEVICE_UID: () => LUNA_DEVICE_UID2,
     MAX_SECRET_BYTES: () => MAX_SECRET_BYTES,
     MAX_SECRET_NAME_LENGTH: () => MAX_SECRET_NAME_LENGTH,
     Marker: () => Marker,
     Markers: () => Markers,
     Meter: () => Meter,
     MidiClip: () => MidiClip,
+    MidiDevice: () => MidiDevice,
+    MidiDevices: () => MidiDevices,
+    MidiInput: () => MidiInput,
+    MidiPort: () => MidiPort,
     MockEngine: () => MockEngine,
     MockPort: () => MockPort,
     Musical: () => Musical,
@@ -78,9 +86,12 @@ var Luna = (() => {
     Playlist: () => Playlist,
     Plugin: () => Plugin,
     Plugins: () => Plugins,
+    PreferenceContext: () => PreferenceContext,
     Preferences: () => Preferences,
+    PresetSelection: () => PresetSelection,
     Presets: () => Presets,
     QUARTER_NOTE: () => QUARTER_NOTE,
+    QwertyMidi: () => QwertyMidi,
     RECORD_LOOP_MARGIN_TICKS: () => RECORD_LOOP_MARGIN_TICKS,
     Render: () => Render,
     Renders: () => Renders,
@@ -89,8 +100,10 @@ var Luna = (() => {
     SIXTEENTH_NOTE: () => SIXTEENTH_NOTE,
     Scheduler: () => Scheduler,
     Secrets: () => Secrets,
+    SendMidi: () => SendMidi,
     Session: () => Session,
     SessionPackage: () => SessionPackage,
+    SessionPreferences: () => SessionPreferences,
     Sessions: () => Sessions,
     Shortcuts: () => Shortcuts,
     Store: () => Store,
@@ -123,10 +136,12 @@ var Luna = (() => {
     clients: () => clients,
     clipAudio: () => clipAudio,
     clipTypeFrom: () => clipTypeFrom,
+    compiledClipAudio: () => compiledClipAudio,
     connect: () => connect,
     consoleLog: () => consoleLog,
     decodeMessage: () => decodeMessage,
     decodeMidiData: () => decodeMidiData,
+    decodeMidiEvents: () => decodeMidiEvents,
     derived: () => derived,
     encodeMidiData: () => encodeMidiData,
     encodePayload: () => encodePayload,
@@ -716,6 +731,7 @@ var Luna = (() => {
   };
 
   // src/wire/mock-port.ts
+  var LUNA_DEVICE_UID = "d37e009d693549a0b6ab1da3fad05443";
   var EMPTY_MIDI_TABLE = () => ({ operation: "update", row_ids: [], enabled: [], midi_data: [], tick: [] });
   function encodeMidiTable(operation, rows) {
     return {
@@ -789,7 +805,13 @@ var Luna = (() => {
     touches = [];
     /** Transaction commands seen: `begin`, `commit`, `abort`. */
     transactions = [];
+    /** Live MIDI LUNA delivered through `/sessions/send_midi` and `send_midi_all_notes_off`, oldest first. */
+    midiSent = [];
+    compiledClipFades;
+    /** Per playlist path: published compiled-clip node names by start tick, and the next name. */
+    compiled = /* @__PURE__ */ new Map();
     constructor(options = {}) {
+      this.compiledClipFades = options.compiledClipFades ?? true;
       this.nodes.set("/", { properties: /* @__PURE__ */ new Map(), readOnly: /* @__PURE__ */ new Set(), commands: /* @__PURE__ */ new Map(), children: [] });
       this.addNode("/status", { properties: { timeout_ms: 0, version: "mock", name: "LUNA" } });
       this.addNode("/sessions", {
@@ -825,6 +847,38 @@ var Luna = (() => {
           close_session: (data, engine) => {
             const body = data ?? {};
             if (body.session_uid) engine.removeNode(`/sessions/${body.session_uid}`);
+            return null;
+          },
+          // Facts 108 and 109, after deviced's Edit_SendMidi.
+          send_midi: (data, engine) => {
+            const body = data ?? {};
+            const invalid = () => new UAError("uasrv.invalid_property", "post /sessions/send_midi: uasrv.invalid_property", { cmd: "post", path: "/sessions/send_midi" });
+            const { byte_0, byte_1, byte_2 } = body;
+            if (typeof byte_0 !== "number" || typeof byte_1 !== "number" || typeof byte_2 !== "number") throw invalid();
+            const bytes = [byte_0, byte_1, byte_2];
+            const live = (uid) => !!uid && engine.has(`/sessions/${uid}`);
+            if (body.session_uid !== void 0 && body.track_uid !== void 0) {
+              if (!live(body.session_uid) || !body.track_uid) throw invalid();
+              engine.midiSent.push({ sessionUid: body.session_uid, trackUid: body.track_uid, bytes, recordEnabled: body.record_enabled === true });
+              return null;
+            }
+            if (body.session_uid !== void 0 && Array.isArray(body.tracks)) {
+              if (live(body.session_uid)) {
+                for (const t of body.tracks) {
+                  if (t.track_uid && typeof t.record_enabled === "boolean") engine.midiSent.push({ sessionUid: body.session_uid, trackUid: t.track_uid, bytes, recordEnabled: t.record_enabled });
+                }
+              }
+              throw invalid();
+            }
+            if (body.midi_input_source !== void 0) {
+              if (engine.isMidiOutputPortUid(body.midi_input_source)) engine.midiSent.push({ outputPortUid: body.midi_input_source, bytes, recordEnabled: false });
+              else engine.midiSent.push({ midiInputSource: body.midi_input_source, bytes, recordEnabled: false });
+              return null;
+            }
+            throw invalid();
+          },
+          send_midi_all_notes_off: (_data, engine) => {
+            engine.midiSent.push({ allNotesOff: true, bytes: [176, 123, 0], recordEnabled: false });
             return null;
           }
         }
@@ -927,17 +981,32 @@ var Luna = (() => {
               version: Number(engine.value(`${root}/${uid}`, "version") ?? 1),
               favorite: engine.value(`${root}/${uid}`, "favorite") ? 1 : 0,
               factory: engine.value(`${root}/${uid}`, "factory") ? 1 : 0,
-              path: String(engine.value(`${root}/${uid}`, "path") ?? "")
+              path: String(engine.value(`${root}/${uid}`, "path") ?? ""),
+              tags: engine.presetTags(body.plugin_id ?? "", uid)
             }));
+            const wanted = (Array.isArray(body.tag) ? body.tag : body.tag !== void 0 ? [body.tag] : []).filter((t) => t !== "");
+            const any = Array.isArray(body.tag) && body.union === true;
+            if (wanted.length > 0) rows = rows.filter((r) => any ? wanted.some((t) => r.tags.includes(t)) : wanted.every((t) => r.tags.includes(t)));
             if (body.search) rows = rows.filter((r) => r.name.toLowerCase().includes(body.search.toLowerCase()));
             if (body.favorite) rows = rows.filter((r) => r.favorite === 1);
-            if (body.limit !== void 0) rows = rows.slice(0, body.limit);
+            if (body.limit !== void 0 && body.limit > 0) rows = rows.slice(0, body.limit);
             const results = { num_rows: rows.length };
-            for (const k of Object.keys(rows[0] ?? { uid: 0 })) results[k] = rows.map((r) => r[k]);
+            for (const k of ["uid", "name", "version", "favorite", "factory", "path"]) results[k] = rows.map((r) => r[k]);
+            if (body.tags) results["tags"] = rows.map((r) => r.tags);
             return { results, folders: [] };
+          },
+          // Fact 121: deviced forwards to UA Assistant's hybrid search; with the assistant not
+          // connected it answers `ua.unknown`, and the assistant refuses empty text.
+          preset_recommendations: (data, engine) => {
+            const body = data ?? {};
+            const where = { cmd: "post", path: "/presets/preset_recommendations" };
+            if (!body.plugin_id || body.query === void 0 || engine.value("/assistant", "enabled") !== true) throw new UAError("ua.unknown", "post /presets/preset_recommendations: ua.unknown", where);
+            if (body.query.trim() === "") throw new UAError("assistant.input_classifier_rejected", "post /presets/preset_recommendations: assistant.input_classifier_rejected", where);
+            return { results: engine.recommendPresets(body.plugin_id, body.query) };
           }
         }
       });
+      this.addNode("/assistant", { properties: { enabled: false }, readOnly: ["enabled"] });
       this.addNode("/drivers", { properties: { connected: [{ id: "mock", name: "Mock Device", type: "built_in", num_inputs: 2, num_outputs: 2 }], unsupported: [], sample_rates: [44100, 48e3] } });
       this.addNode("/preferences", { properties: { io_buffer_size: 256, play_from_stop_location: false, record_mute: false, metronome_sound: "click", metronome_sounds: ["click", "beep"] } });
       this.addNode("/renders", {
@@ -1021,6 +1090,7 @@ var Luna = (() => {
             engine.addNode(`/gui/file_chooser/${uid}`, { properties: { status: "pending", files: [] } });
             setTimeout(() => {
               if (!engine.has(`/gui/file_chooser/${uid}`)) return;
+              for (const p of engine.nextDialogFiles) engine.grantFolder(p);
               engine.setValue(`/gui/file_chooser/${uid}`, "files", engine.nextDialogFiles.map((p) => ({ path: p })));
               engine.setValue(`/gui/file_chooser/${uid}`, "status", engine.nextDialogFiles.length ? "selected" : "cancelled");
             }, 5);
@@ -1032,7 +1102,10 @@ var Luna = (() => {
             const path = typeof data === "object" && data !== null ? data.path : void 0;
             if (path === void 0 || path === null) throw fail("uasrv.missing_field", "path is required");
             if (typeof path !== "string" || !/^(\/|[A-Za-z]:[\\/])/.test(path)) throw fail("uasrv.invalid_value", "path must be absolute");
-            const dir = path.length > 1 ? path.replace(/[\\/]+$/, "") : path;
+            const dir = normalizeFolder(path);
+            if (!engine.grantedFolders.some((root) => dir === root || dir.startsWith(root === "/" ? "/" : `${root}/`))) {
+              throw fail("uasrv.not_permitted", "path is not in a folder the user granted");
+            }
             const names = engine.folders[dir];
             if (!names) {
               const cut = dir.lastIndexOf("/");
@@ -1041,6 +1114,23 @@ var Luna = (() => {
             }
             const files = names.map((raw) => ({ name: raw.replace(/\/$/, ""), is_directory: raw.endsWith("/") })).filter((e) => !e.name.startsWith(".")).sort((a, b) => naturalCompare(a.name, b.name) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)).map((e) => ({ name: e.name, path: `${dir === "/" ? "" : dir}/${e.name}`, is_directory: e.is_directory }));
             return { files };
+          },
+          // Fact 114: serve_media_file's checks, codes and URL as LUNA's (macOS form).
+          serve_media_file: (data, engine) => {
+            const fail = (code, why) => new UAError(code, `serve_media_file: ${why}`, { cmd: "post", path: "/gui/serve_media_file" });
+            const body = typeof data === "object" && data !== null ? data : {};
+            if (body.add_on_id === void 0 || body.add_on_id === null || body.path === void 0 || body.path === null) throw fail("uasrv.missing_field", "add_on_id and path are required");
+            if (typeof body.add_on_id !== "string" || typeof body.path !== "string") throw fail("uasrv.invalid_type", "add_on_id and path must be strings");
+            const path = body.path;
+            if (!/^(\/|[A-Za-z]:[\\/])/.test(path)) throw fail("uasrv.invalid_value", "path must be absolute");
+            const file = engine.mediaFiles[path];
+            if (file === void 0) throw fail("uasrv.filesystem_error", "no file at path");
+            if (file === null) throw fail("uasrv.invalid_value", "not an audio or video file");
+            const id = body.add_on_id.toLowerCase();
+            if (!engine.has(`/gui/add_ons/${id}`)) throw fail("uasrv.not_installed", `no Add On ${id}`);
+            const target = file === true ? path : file;
+            engine.mediaServed.push({ addOnId: id, path: target });
+            return { url: `ua-content://${localContentHost(id)}${encodeMediaPath(target)}` };
           },
           show_save_dialog: (_data, engine) => {
             const uid = `fc${engine.nextRow()}`;
@@ -1056,12 +1146,25 @@ var Luna = (() => {
       });
       this.addNode("/gui/windows/main", { properties: { page: "timeline" } });
       this.addNode("/gui/transport", { properties: { arm_mode: false } });
-      this.addNode("/gui/add_ons/com.example.demo", { properties: { id: "com.example.demo", name: "Demo", target: "window", icon: "", floating: true, show_with_session: false, manufacturer: "Example Co" } });
+      this.addNode("/gui/add_ons/com.example.demo", { properties: { id: "com.example.demo", name: "Demo", target: "window", icon: "", floating: true, show_with_session: false, manufacturer: "Example Co", description: "A demo Add On." } });
       this.addNode("/gui/file_chooser");
       if (options.gui === false) this.removeNode("/gui");
     }
     /** What the next mock file dialog "selects"; empty means the user cancelled. */
     nextDialogFiles = [];
+    /**
+     * The files `/gui/serve_media_file` finds, by absolute path: `true` for an audio or video
+     * file it serves, `null` for one it refuses (not media, or media in name only), or the
+     * path a link leads to, which is served under that path. A path not listed is missing.
+     *
+     * @example
+     * engine.mediaFiles['/Movies/cut.mov'] = true;
+     * engine.mediaFiles['/Movies/notes.mp4'] = null;
+     * engine.mediaFiles['/Movies/latest.mov'] = '/Movies/cut.mov';
+     */
+    mediaFiles = {};
+    /** Every file `/gui/serve_media_file` served, in order, by lowercase Add On id. */
+    mediaServed = [];
     /**
      * The disk `/gui/list_files` reads: each folder's absolute path to the names inside it,
      * a trailing `/` marking a subfolder. A name starting with `.` is hidden, as in LUNA.
@@ -1070,6 +1173,23 @@ var Luna = (() => {
      * engine.folders['/Samples'] = ['kick.wav', 'Loops/', '.DS_Store'];
      */
     folders = {};
+    /**
+     * The folders `/gui/list_files` may read, it and every folder inside them (fact 106). LUNA
+     * grants a folder the user picks in `show_folder_dialog` (the mock does too, for each of
+     * `nextDialogFiles`) or drops on an Add On; set this, or call {@link grantFolder}, to model
+     * a drop or a grant saved from an earlier run. Anything else is `uasrv.not_permitted`.
+     * The mock does not model links or LUNA's cap on how many folders it keeps.
+     *
+     * @example
+     * engine.folders['/Samples'] = ['kick.wav'];
+     * engine.grantFolder('/Samples');
+     */
+    grantedFolders = [];
+    /** Let `/gui/list_files` read the folder at `path` and the folders inside it. */
+    grantFolder(path) {
+      const dir = normalizeFolder(path);
+      if (!this.grantedFolders.includes(dir)) this.grantedFolders.push(dir);
+    }
     rowCounter = 100;
     /** @internal */
     nextRow() {
@@ -1146,14 +1266,110 @@ var Luna = (() => {
         }
       });
     }
-    /** Add a preset for a plugin to the library (fact 98). Returns its uid. */
+    /**
+     * Add a preset for a plugin to the library (fact 98), with any `tags` (fact 120). Returns
+     * its uid.
+     */
     addPreset(pluginId, name, options = {}) {
+      this.ensurePresetPlugin(pluginId);
       const root = `/presets/plugins/${pluginId}/presets`;
       const uid = options.uid ?? `preset_${this.children(root).length + 1}_${pluginId}`;
       this.addNode(`${root}/${uid}`, {
         properties: { uid, preset_name: name, version: options.version ?? 1, favorite: options.favorite ?? false, factory: options.factory ?? false, path: "" }
       });
+      this.addNode(`${root}/${uid}/tags`, { properties: { type: "tags" } });
+      for (const tag of options.tags ?? []) {
+        const rowid = this.nextRow();
+        this.addNode(`${root}/${uid}/tags/${rowid}`, { properties: { type: "tag", rowid, tag } });
+      }
       return uid;
+    }
+    /**
+     * Add a group of preset tags for a plugin, as LUNA keeps them: a sub-category named `name`
+     * under the category `category` (default `Default`) holding the tags (fact 120). Returns
+     * the sub-category uid.
+     */
+    addPresetTagGroup(pluginId, name, tags, options = {}) {
+      this.ensurePresetPlugin(pluginId);
+      const categories = `/presets/plugins/${pluginId}/categories`;
+      const categoryName = options.category ?? "Default";
+      let categoryUid = this.children(categories).find((c) => this.value(`${categories}/${c}`, "name") === categoryName);
+      if (!categoryUid) {
+        categoryUid = `cat_${this.nextRow()}`;
+        this.addNode(`${categories}/${categoryUid}`, { properties: { type: "category", rowid: this.nextRow(), uid: categoryUid, name: categoryName } });
+        this.addNode(`${categories}/${categoryUid}/sub_categories`, { properties: { type: "sub_categories" } });
+      }
+      const subUid = `sub_${this.nextRow()}`;
+      const sub = `${categories}/${categoryUid}/sub_categories/${subUid}`;
+      this.addNode(sub, { properties: { type: "sub_category", rowid: this.nextRow(), uid: subUid, name } });
+      this.addNode(`${sub}/tags`, { properties: { type: "tags" } });
+      for (const tag of tags) {
+        const rowid = this.nextRow();
+        this.addNode(`${sub}/tags/${rowid}`, { properties: { type: "tag", rowid, tag } });
+      }
+      return subUid;
+    }
+    /** Connect or disconnect UA Assistant, which preset recommendations need (fact 121). */
+    setAssistantEnabled(enabled) {
+      this.setValue("/assistant", "enabled", enabled);
+    }
+    /**
+     * Script what UA Assistant recommends for a plugin. Without one the mock ranks the plugin's
+     * presets by how many words of the query appear in their name or tags.
+     */
+    setPresetRecommendations(pluginId, recommend) {
+      this.recommenders.set(pluginId, recommend);
+    }
+    /** @internal */
+    presetTags(pluginId, uid) {
+      const folder = `/presets/plugins/${pluginId}/presets/${uid}/tags`;
+      return this.children(folder).map((t) => String(this.value(`${folder}/${t}`, "tag") ?? "")).filter((t) => t !== "");
+    }
+    /** @internal */
+    recommendPresets(pluginId, query) {
+      const scripted = this.recommenders.get(pluginId);
+      if (scripted) return scripted(query);
+      const words = query.toLowerCase().split(/\s+/).filter((w) => w !== "");
+      const root = `/presets/plugins/${pluginId}/presets`;
+      return this.children(root).map((uid) => {
+        const name = String(this.value(`${root}/${uid}`, "preset_name") ?? uid);
+        const haystack = [name, ...this.presetTags(pluginId, uid)].join(" ").toLowerCase();
+        const hits = words.filter((w) => haystack.includes(w)).length;
+        return { preset_name: name, preset_uuid: uid, rrf_score: hits / 60 };
+      }).filter((r) => r.rrf_score > 0).sort((a, b) => b.rrf_score - a.rrf_score).slice(0, 5);
+    }
+    /**
+     * `/presets/plugins/<id>` with its `load` command: put a preset's identity on the effect
+     * whose `uid` is given (fact 122).
+     */
+    ensurePresetPlugin(pluginId) {
+      const path = `/presets/plugins/${pluginId}`;
+      if (this.has(path)) return;
+      this.addNode(path, {
+        properties: { plugin_id: pluginId },
+        commands: {
+          load: (data, engine) => {
+            const body = data ?? {};
+            const preset = `${path}/presets/${body.preset_uid ?? ""}`;
+            const effect = engine.effectPathByUid(body.session_uid ?? "", body.uid ?? "");
+            if (!effect || !body.preset_uid || !engine.has(preset)) throw new UAError("uasrv.invalid_property", "load: no such effect or preset", { cmd: "post", path: `${path}/load` });
+            engine.setValue(effect, "preset_uid", body.preset_uid);
+            engine.setValue(effect, "preset_name", engine.value(preset, "preset_name"));
+            engine.setValue(effect, "preset_uid_dirty", false);
+            return null;
+          }
+        }
+      });
+      this.addNode(`${path}/presets`, { properties: { type: "presets" } });
+      this.addNode(`${path}/categories`, { properties: { type: "categories" } });
+    }
+    /** @internal The effect slot under `session` whose `uid` is `uid`. */
+    effectPathByUid(session, uid) {
+      const prefix = `/sessions/${session}/`;
+      for (const [path, node] of this.nodes) {
+        if (path.startsWith(prefix) && /\/effects\/[^/]+$/.test(path) && node.properties.get("uid") === uid) return path;
+      }
+      return void 0;
     }
     /** Register a session package in the workspace. */
     addPackage(uid, options = {}) {
@@ -1188,6 +1404,7 @@ var Luna = (() => {
         if (parent && !parent.children.includes(name)) parent.children.push(name);
       }
       if (!existed && clean !== "/") this.push({ path: clean, operation: "added" }, void 0);
+      this.clipChanged(clean);
     }
     /** Remove a node and its subtree. Pushes `removed` to subscribers. */
     removeNode(path) {
@@ -1200,6 +1417,11 @@ var Luna = (() => {
       const name = splitPath(clean).name;
       if (parent) parent.children = parent.children.filter((c) => c !== name);
       this.push({ path: clean, operation: "removed" }, void 0);
+      this.clipChanged(clean);
+    }
+    /** @internal Drop a property; LUNA pushes nothing for it (fact 110). */
+    deleteValue(nodePath, property) {
+      this.nodes.get(normalize(nodePath))?.properties.delete(property);
     }
     /** Engine-side property change: updates the tree and pushes to every subscribed port. */
     setValue(nodePath, property, value) {
@@ -1208,6 +1430,7 @@ var Luna = (() => {
       if (!node) throw new Error(`MockEngine: no node ${nodePath}`);
       node.properties.set(property, value);
       this.push({ path: `${clean}/${property}/value`, data: value }, void 0);
+      this.clipChanged(clean);
       if (property === "play_start" && /^\/sessions\/[^/]+$/.test(clean) && node.properties.get("playing") !== true) {
         this.setValue(clean, "location", this.locationAt(clean, Number(value)));
       }
@@ -1235,6 +1458,372 @@ var Luna = (() => {
         playing: this.nodes.get(sessionPath)?.properties.get("playing") === true
       };
     }
+    /**
+     * What a playlist plays (fact 116): every clip cut at every clip edge, each piece given to
+     * the highest layer (then the narrower clip, then the larger uid), neighbouring pieces of one
+     * clip joined. Time order.
+     */
+    segmentsOf(playlistPath) {
+      const clips = this.children(`${playlistPath}/clips`).map((uid) => {
+        const p = this.nodes.get(`${playlistPath}/clips/${uid}`).properties;
+        return { uid, path: `${playlistPath}/clips/${uid}`, name: p.get("name"), start: Number(p.get("start") ?? 0), stop: Number(p.get("stop") ?? 0), layer: Number(p.get("layer") ?? 0), sourceStart: Number(p.get("source_start") ?? 0), sourceStop: Number(p.get("source_stop") ?? 0) };
+      }).filter((c) => c.stop > c.start);
+      const edges = [...new Set(clips.flatMap((c) => [c.start, c.stop]))].sort((a, b) => a - b);
+      const segments = [];
+      for (let i = 0; i + 1 < edges.length; i++) {
+        const [from, to] = [edges[i], edges[i + 1]];
+        const winner = clips.filter((c) => c.start <= from && c.stop >= to).sort((a, b) => b.layer - a.layer || a.stop - a.start - (b.stop - b.start) || (a.uid < b.uid ? 1 : a.uid > b.uid ? -1 : 0))[0];
+        if (!winner) continue;
+        const last = segments.at(-1);
+        if (last && last.clip === winner && last.stop === from) last.stop = to;
+        else segments.push({ clip: winner, start: from, stop: to });
+      }
+      return segments;
+    }
+    /**
+     * One segment's fades as LUNA compiles them (fact 117): a crossfade with the segment it
+     * adjoins, measured from the edit between them, whether the clips are butted or overlap;
+     * otherwise the clip's plain fade-in on its first segment and fade-out on its last.
+     */
+    segmentFades(segments, i, playlistPath) {
+      const seg = segments[i];
+      const prev = segments[i - 1]?.stop === seg.start ? segments[i - 1] : void 0;
+      const next = segments[i + 1]?.start === seg.stop ? segments[i + 1] : void 0;
+      const rows = this.fadeRows(`${playlistPath}/clips/${seg.clip.uid}`);
+      const abs = (r, edge) => r ? { ...r, start: edge + r.startOffset, stop: edge + r.stopOffset, clipPath: seg.clip.path } : void 0;
+      const crossIn = prev && rows.find((r) => r.type === "fade_in" && r.contributor === prev.clip.uid);
+      const crossOut = next && rows.find((r) => r.type === "fade_out" && r.contributor === next.clip.uid);
+      const plainIn = seg.start === seg.clip.start ? rows.find((r) => r.type === "fade_in" && !r.contributor) : void 0;
+      const plainOut = seg.stop === seg.clip.stop ? rows.find((r) => r.type === "fade_out" && !r.contributor) : void 0;
+      return { fin: crossIn ? abs(crossIn, seg.start) : abs(plainIn, seg.clip.start), fout: crossOut ? abs(crossOut, seg.stop) : abs(plainOut, seg.clip.stop) };
+    }
+    /** A clip node or one of its properties changed: recompile its playlist if a client enabled that. */
+    clipChanged(path) {
+      const m = /^(\/sessions\/[^/]+\/playlists\/[^/]+)\/clips\/[^/]+(?:\/fades(?:\/[^/]+)?)?$/.exec(path);
+      if (m && this.nodes.get(m[1])?.properties.get("enable_compiled_clips") === true) this.compilePlaylist(m[1]);
+    }
+    /**
+     * Publish a playlist's compiled clips the way deviced's clip compiler and
+     * `Sesn_CompiledClips` do (fact 116): cut every clip at every clip edge, give each piece to
+     * the highest layer (then the narrower clip, then the larger uid), join neighbouring pieces
+     * of one clip, and cut each segment's source range out through the tempo map. Nodes are
+     * named by a running counter and updated in place while their start stays put. The mock
+     * keeps no fades, so they publish as null and the full range equals the segment.
+     */
+    compilePlaylist(playlistPath) {
+      const sessionPath = playlistPath.slice(0, playlistPath.indexOf("/playlists/"));
+      const folder = `${playlistPath}/compiled_clips`;
+      if (!this.nodes.has(folder)) this.addNode(folder);
+      const segments = this.segmentsOf(playlistPath);
+      const clips = segments.map((s) => s.clip);
+      const state = this.compiled.get(playlistPath) ?? { byStart: /* @__PURE__ */ new Map(), next: 0 };
+      this.compiled.set(playlistPath, state);
+      const sourceAt = (clip, tick) => Math.round(clip.sourceStart + (this.secondsAt(sessionPath, tick) - this.secondsAt(sessionPath, clip.start)) * 1e9);
+      const kept = /* @__PURE__ */ new Set();
+      for (const seg of segments) {
+        kept.add(seg.start);
+        const props = { clip_uid: seg.clip.uid, name: seg.clip.name, start: seg.start, stop: seg.stop, source_start: sourceAt(seg.clip, seg.start), source_stop: sourceAt(seg.clip, seg.stop) };
+        if (this.compiledClipFades) {
+          const { fin, fout } = this.segmentFades(segments, segments.indexOf(seg), playlistPath);
+          Object.assign(props, { full_start: fin?.contributor ? Math.min(seg.start, fin.start) : seg.start, full_stop: fout?.contributor ? Math.max(seg.stop, fout.stop) : seg.stop });
+          const clipProps = this.nodes.get(`${playlistPath}/clips/${seg.clip.uid}`).properties;
+          const clipRender = clipProps.get("render_state") === "current" ? clipProps.get("render_source_uid") : void 0;
+          if (typeof clipRender === "string" && clipRender) {
+            const piece = segments.filter((s) => s.clip === seg.clip).indexOf(seg);
+            Object.assign(props, { render_source_uid: piece === 0 ? clipRender : `${clipRender}_${piece}`, render_source_start: 0, render_source_stop: Math.round((this.secondsAt(sessionPath, seg.stop) - this.secondsAt(sessionPath, seg.start)) * 1e9), needs_render: true });
+          } else Object.assign(props, { render_source_uid: null, render_source_start: null, render_source_stop: null, needs_render: false });
+          for (const [side, f] of [["fade_in", fin], ["fade_out", fout]]) {
+            props[`${side}_uid`] = f?.uid ?? null;
+            props[`${side}_start`] = f?.start ?? null;
+            props[`${side}_stop`] = f?.stop ?? null;
+            props[`${side}_shape`] = f?.shape ?? null;
+            props[`${side}_curvature`] = f ? f.curvature : null;
+            props[`${side}_crossfade`] = f ? f.contributor !== void 0 : null;
+            props[`${side}_contributor_clip_uid`] = f?.contributor ?? null;
+          }
+        }
+        const name = state.byStart.get(seg.start);
+        if (name === void 0 || !this.nodes.has(`${folder}/${name}`)) {
+          const fresh = String(state.next++);
+          state.byStart.set(seg.start, fresh);
+          this.addNode(`${folder}/${fresh}`, { properties: props, readOnly: Object.keys(props) });
+          continue;
+        }
+        const node = this.nodes.get(`${folder}/${name}`);
+        for (const [k, v] of Object.entries(props)) if (node.properties.get(k) !== v) this.setValue(`${folder}/${name}`, k, v);
+      }
+      for (const [start, name] of [...state.byStart]) {
+        if (kept.has(start)) continue;
+        state.byStart.delete(start);
+        this.removeNode(`${folder}/${name}`);
+      }
+    }
+    fadeCounter = 0;
+    /** @internal A clip uid free on the playlist: `clip<n>`, counting on from the clips there. */
+    nextClipId(base, playlist) {
+      const taken = new Set(this.children(`${base}/playlists/${playlist}/clips`));
+      let n = taken.size + 1;
+      while (taken.has(`clip${n}`)) n++;
+      return `clip${n}`;
+    }
+    /** A clip's stored fade rows (`<clip>/fades/<uid>`), offsets relative to the clip edge. */
+    fadeRows(clipPath) {
+      return this.children(`${clipPath}/fades`).map((uid) => {
+        const p = this.nodes.get(`${clipPath}/fades/${uid}`).properties;
+        const contributor = p.get("contributor_clip_uid");
+        return {
+          uid,
+          type: String(p.get("fade_type")),
+          shape: String(p.get("fade_shape") ?? "log"),
+          curvature: Number(p.get("fade_curvature") ?? 0),
+          startOffset: Number(p.get("start_offset") ?? 0),
+          stopOffset: Number(p.get("stop_offset") ?? 0),
+          contributor: typeof contributor === "string" && contributor ? contributor : void 0
+        };
+      });
+    }
+    /** Create or update a fade row the way `set_fade` does: shape only for a new one (fact 117). */
+    putFade(clipPath, type, contributor, startOffset, stopOffset, shape, results) {
+      const existing = this.fadeRows(clipPath).find((r) => r.type === type && r.contributor === contributor);
+      if (existing) {
+        if (existing.startOffset === startOffset && existing.stopOffset === stopOffset) return;
+        this.setValue(`${clipPath}/fades/${existing.uid}`, "start_offset", startOffset);
+        this.setValue(`${clipPath}/fades/${existing.uid}`, "stop_offset", stopOffset);
+        results.changed.push({ fade_uid: existing.uid, properties: { start_offset: startOffset, stop_offset: stopOffset } });
+        return;
+      }
+      const uid = `fade${++this.fadeCounter}`;
+      const clipUid = splitPath(clipPath).name;
+      const properties = { uid, clip_uid: clipUid, contributor_clip_uid: contributor ?? null, fade_type: type, fade_shape: shape, start_offset: startOffset, stop_offset: stopOffset, fade_curvature: 0, fade_reference_edge: false };
+      this.addNode(`${clipPath}/fades/${uid}`, { properties, readOnly: ["uid", "clip_uid", "contributor_clip_uid"] });
+      results.added.push({ clip_uid: clipUid, fade_uid: uid, properties });
+    }
+    /** The tick `seconds` after `tick` through the tempo map. */
+    tickAfter(sessionPath, tick, seconds) {
+      const target = this.secondsAt(sessionPath, tick) + seconds;
+      let lo = tick, hi = tick + 96e9;
+      while (this.secondsAt(sessionPath, hi) < target) hi += hi - tick;
+      for (let i = 0; i < 64; i++) {
+        const mid = (lo + hi) / 2;
+        if (this.secondsAt(sessionPath, mid) < target) lo = mid;
+        else hi = mid;
+      }
+      return Math.round(hi);
+    }
+    /** The playlists a context edit names: `playlist_uid`, else `track_uid` (active playlists), else the selection. */
+    editPlaylists(base, body, tracksOnly = false) {
+      const list = (v) => v === void 0 || v === null ? void 0 : (Array.isArray(v) ? v : [v]).map(String);
+      const tracks = list(body["track_uid"]);
+      if (tracks) return tracks.map((t) => String(this.value(`${base}/tracks/${t}`, "playlist_uid")));
+      const playlists = tracksOnly ? void 0 : list(body["playlist_uid"]);
+      return playlists ?? list(this.value(`${base}/contexts/main`, "selection_playlists")) ?? [];
+    }
+    /**
+     * @internal The clip and fade edits of the edit context, as measured on LUNA (fact 117):
+     * explicit ranges where LUNA takes them, the selection where it reads one.
+     */
+    clipEdit(base, command, data) {
+      const body = data ?? {};
+      const ctx = `${base}/contexts/main`;
+      const clipsOf = (pl) => this.children(`${base}/playlists/${pl}/clips`).map((uid) => {
+        const path = `${base}/playlists/${pl}/clips/${uid}`;
+        const p = this.nodes.get(path).properties;
+        return { uid, path, start: Number(p.get("start")), stop: Number(p.get("stop")), sourceUid: p.get("source_uid"), sourceStart: Number(p.get("source_start") ?? 0), sourceStop: Number(p.get("source_stop") ?? 0) };
+      });
+      const nsBetween = (a, b) => Math.round((this.secondsAt(base, b) - this.secondsAt(base, a)) * 1e9);
+      const newClipFrom = (pl, fromPath, props) => {
+        const id = this.nextClipId(base, pl);
+        const source = Object.fromEntries(this.nodes.get(fromPath).properties);
+        this.addNode(`${base}/playlists/${pl}/clips/${id}`, { properties: { ...source, uid: id, ...props } });
+        return id;
+      };
+      switch (command) {
+        case "move_clips": {
+          const start = Number(body["start"] ?? this.value(ctx, "selection_start"));
+          const stop = Number(body["stop"] ?? this.value(ctx, "selection_stop"));
+          const location = Number(body["location"]);
+          if (!Number.isFinite(location)) throw new UAError("uasrv.invalid_property", "move_clips: location is required", { cmd: "post", path: `${ctx}/commands/move_clips` });
+          for (const pl of this.editPlaylists(base, body)) {
+            const segments = this.segmentsOf(`${base}/playlists/${pl}`);
+            const inside = segments.filter((s) => s.start >= start && s.stop <= stop);
+            for (const clip of [...new Set(inside.map((s) => s.clip))]) {
+              const from = Math.max(clip.start, start), to = Math.min(clip.stop, stop);
+              const at = (tick) => clip.sourceStart + nsBetween(clip.start, tick);
+              const dest = location + (from - start);
+              const moved = { start: dest, stop: dest + (to - from), source_start: at(from), source_stop: at(to) };
+              const before = segments.some((s) => s.clip === clip && s.stop <= start);
+              const after = segments.some((s) => s.clip === clip && s.start >= stop);
+              if (body["copy"] === true) {
+                newClipFrom(pl, clip.path, moved);
+                continue;
+              }
+              if (!before && !after) {
+                for (const [k, v] of Object.entries(moved)) this.setValue(clip.path, k, v);
+                continue;
+              }
+              newClipFrom(pl, clip.path, moved);
+              if (before && after) newClipFrom(pl, clip.path, { start: to, stop: clip.stop, source_start: at(to), source_stop: clip.sourceStop });
+              if (before) {
+                this.setValue(clip.path, "stop", from);
+                this.setValue(clip.path, "source_stop", at(from));
+              } else {
+                this.setValue(clip.path, "start", to);
+                this.setValue(clip.path, "source_start", at(to));
+              }
+            }
+          }
+          this.setValue(ctx, "selection_start", location);
+          this.setValue(ctx, "selection_stop", location + (stop - start));
+          return null;
+        }
+        case "separate_clips": {
+          const locations = [...new Set((Array.isArray(body["location"]) ? body["location"] : [body["location"]]).map(Number))].sort((a, b) => a - b);
+          for (const pl of this.editPlaylists(base, body)) {
+            for (const c of clipsOf(pl)) {
+              const cuts = locations.filter((l) => l > c.start && l < c.stop);
+              if (!cuts.length) continue;
+              const edges = [c.start, ...cuts, c.stop];
+              const at = (tick) => c.sourceStart + nsBetween(c.start, tick);
+              const rows = this.fadeRows(c.path);
+              for (const r of rows.filter((r2) => r2.contributor)) this.removeNode(`${c.path}/fades/${r.uid}`);
+              const fadeOut = rows.find((r) => r.type === "fade_out" && !r.contributor);
+              let last = "";
+              for (let i = 1; i + 1 < edges.length; i++) last = newClipFrom(pl, c.path, { start: edges[i], stop: edges[i + 1], source_start: at(edges[i]), source_stop: at(edges[i + 1]) });
+              this.setValue(c.path, "stop", cuts[0]);
+              this.setValue(c.path, "source_stop", at(cuts[0]));
+              if (fadeOut) {
+                this.removeNode(`${c.path}/fades/${fadeOut.uid}`);
+                this.putFade(`${base}/playlists/${pl}/clips/${last}`, "fade_out", void 0, fadeOut.startOffset, fadeOut.stopOffset, fadeOut.shape, { added: [], changed: [] });
+              }
+            }
+          }
+          return null;
+        }
+        case "heal_separation": {
+          const selStart = Number(this.value(ctx, "selection_start"));
+          const selStop = Number(this.value(ctx, "selection_stop"));
+          for (const pl of this.editPlaylists(base, {})) {
+            const set = clipsOf(pl).filter((c) => c.start > selStart && c.start <= selStop || c.start <= selStart && c.stop > selStart).sort((a, b) => a.start - b.start);
+            let left = set[0];
+            for (const right of set.slice(1)) {
+              const continues = left.sourceUid === right.sourceUid && right.start >= left.stop && Math.abs(right.sourceStart - nsBetween(left.stop, right.start) - left.sourceStop) <= 1024;
+              if (!continues) {
+                left = right;
+                continue;
+              }
+              this.removeNode(right.path);
+              this.setValue(left.path, "stop", right.stop);
+              this.setValue(left.path, "source_stop", right.sourceStop);
+              left = { ...left, stop: right.stop, sourceStop: right.sourceStop };
+            }
+          }
+          return null;
+        }
+        case "set_fade": {
+          const shape = typeof body["fade_shape"] === "string" && ["linear", "equal_power", "log"].includes(body["fade_shape"]) ? body["fade_shape"] : "log";
+          const entries = Array.isArray(body["clips"]) ? body["clips"] : [body];
+          const results = { added: [], changed: [] };
+          for (const f of entries) {
+            const clipPath = this.findClip(base, String(f["clip_uid"] ?? ""));
+            if (!clipPath || ![0, "audio", void 0].includes(this.value(clipPath, "clip_type"))) continue;
+            const so = Number(f["start_offset"] ?? 0);
+            const eo = Number(f["stop_offset"] ?? 0);
+            const contributor = typeof f["contributor_clip_uid"] === "string" && f["contributor_clip_uid"] ? f["contributor_clip_uid"] : void 0;
+            if (f["fade_type"] === "fade_in") this.putFade(clipPath, "fade_in", void 0, 0, eo, shape, results);
+            else if (f["fade_type"] === "fade_out") this.putFade(clipPath, "fade_out", void 0, so, 0, shape, results);
+            else if (f["fade_type"] === "cross_fade" && contributor) {
+              const right = this.findClip(base, contributor);
+              if (!right) continue;
+              this.putFade(clipPath, "fade_out", contributor, so, eo, shape, results);
+              this.putFade(right, "fade_in", splitPath(clipPath).name, so, eo, shape, results);
+            } else throw new UAError("uasrv.invalid_object", "set_fade: unknown fade_type", { cmd: "post", path: `${ctx}/commands/set_fade` });
+          }
+          const out = {};
+          if (results.added.length) out["added"] = { fades: results.added };
+          if (results.changed.length) out["changed"] = { fades: results.changed };
+          return Object.keys(out).length ? { edit_results: out } : null;
+        }
+        case "delete_fades": {
+          const start = Number(body["start"] ?? this.value(ctx, "selection_start"));
+          const stop = Number(body["stop"] ?? this.value(ctx, "selection_stop"));
+          for (const pl of this.editPlaylists(base, body)) {
+            const playlistPath = `${base}/playlists/${pl}`;
+            const segments = this.segmentsOf(playlistPath);
+            const doomed = segments.flatMap((s, i) => {
+              if (!(s.start < stop && s.stop > start)) return [];
+              const { fin, fout } = this.segmentFades(segments, i, playlistPath);
+              return [fin, fout].filter((f) => f !== void 0 && f.start >= start && f.stop <= stop).map((f) => `${f.clipPath}/fades/${f.uid}`);
+            });
+            for (const path of new Set(doomed)) this.removeNode(path);
+          }
+          return null;
+        }
+        case "batch_fades": {
+          const start = Number(body["start"] ?? this.value(ctx, "selection_start"));
+          const stop = Number(body["stop"] ?? this.value(ctx, "selection_stop"));
+          const seconds = Number(body["length"] ?? 0) / 1e9;
+          const shape = typeof body["fade_shape"] === "string" ? body["fade_shape"] : "log";
+          const results = { added: [], changed: [] };
+          for (const pl of this.editPlaylists(base, body, true)) {
+            const clips = clipsOf(pl).filter((c) => c.start < stop && c.stop > start).sort((a, b) => a.start - b.start);
+            for (const [i, c] of clips.entries()) {
+              const len = (from) => this.tickAfter(base, from, seconds) - from;
+              const next = clips[i + 1];
+              if (next && next.start === c.stop) {
+                const half = Math.round(len(c.stop) / 2);
+                this.putFade(c.path, "fade_out", next.uid, -half, half, shape, results);
+                this.putFade(next.path, "fade_in", c.uid, -half, half, shape, results);
+              } else this.putFade(c.path, "fade_out", void 0, -len(c.stop - 1), 0, shape, results);
+              if (!this.fadeRows(c.path).some((r) => r.type === "fade_in")) this.putFade(c.path, "fade_in", void 0, 0, len(c.start), shape, results);
+            }
+          }
+          return null;
+        }
+        case "change_fade_curvature": {
+          const uids = Array.isArray(body["fades"]) ? body["fades"].map(String) : [];
+          if (!uids.length) throw new UAError("uasrv.missing_field", "change_fade_curvature: fades", { cmd: "post", path: `${ctx}/commands/change_fade_curvature` });
+          const initial = Array.isArray(body["initial_curvature_values"]) ? body["initial_curvature_values"].map(Number) : [];
+          for (const pl of this.children(`${base}/playlists`)) {
+            for (const c of clipsOf(pl)) {
+              for (const r of this.fadeRows(c.path)) {
+                const i = uids.indexOf(r.uid);
+                if (i < 0) continue;
+                const path = `${c.path}/fades/${r.uid}`;
+                if (body["default"] === true) {
+                  this.setValue(path, "fade_shape", "log");
+                  this.setValue(path, "fade_curvature", 0);
+                  continue;
+                }
+                if (typeof body["fade_shape"] === "string") this.setValue(path, "fade_shape", body["fade_shape"]);
+                if (typeof body["fade_curvature"] === "number") this.setValue(path, "fade_curvature", Math.max(-1, Math.min(1, (initial[i] ?? 0) + body["fade_curvature"] - (initial[0] ?? 0))));
+              }
+            }
+          }
+          return null;
+        }
+        case "nudge": {
+          if (body["nudge_settings"] === void 0) return null;
+          const settings = JSON.parse(String(body["nudge_settings"]));
+          const op = settings.operation ?? "";
+          if (!op) throw new UAError("uasrv.invalid_type", "nudge: nudge_settings.operation", { cmd: "post", path: `${ctx}/commands/nudge` });
+          if (!op.startsWith("content_") || settings.mode !== "samples") return null;
+          const ns = (settings.samples ?? 0) * 1e9 / 48e3 * (op.startsWith("content_right") ? -1 : 1);
+          const selStart = Number(this.value(ctx, "selection_start"));
+          const selStop = Number(this.value(ctx, "selection_stop"));
+          const tracks = this.value(ctx, "selection_tracks") ?? [];
+          for (const t of tracks) {
+            const pl = String(this.value(`${base}/tracks/${t}`, "playlist_uid"));
+            for (const c of clipsOf(pl).filter((c2) => c2.start >= selStart && c2.stop <= selStop)) {
+              if (c.sourceStart + ns < 0) continue;
+              this.setValue(c.path, "source_start", Math.round(c.sourceStart + ns));
+              this.setValue(c.path, "source_stop", Math.round(c.sourceStop + ns));
+            }
+          }
+          return null;
+        }
+      }
+      return null;
+    }
     /** Seconds at `tick`, integrating the session's tempo map (constant tempo between events). */
     secondsAt(sessionPath, tick) {
       const beatTicks = 96e9;
@@ -1259,7 +1848,7 @@ var Luna = (() => {
      * while subscribers see only the delta.
      *
      * `added` and `changed` carry rows; `deleted` needs only their `rowid`s. Rows given
-     * without a `rowid` get the next free one. Ticks are table ticks.
+     * without a `rowid` get the next id free across the session's clips, as in LUNA. Ticks are table ticks.
      *
      * @example
      * engine.midiEdit(clipPath, 'added', [{ tick: 0, status: 0x90, data1: 60, data2: 100 }]);
@@ -1269,7 +1858,9 @@ var Luna = (() => {
       const table = `${normalize(clipPath)}/midi/table`;
       if (!this.nodes.has(table)) this.addNode(table, { properties: { row_data: EMPTY_MIDI_TABLE() } });
       const stored = decodeMidiTable(this.value(table, "row_data"));
-      let next = stored.length ? Math.max(...stored.map((r) => r.rowid)) + 1 : 1;
+      const session = table.split("/").slice(0, 3).join("/");
+      const used = [...this.nodes.keys()].filter((k) => k.startsWith(`${session}/`) && k.endsWith("/midi/table")).flatMap((k) => decodeMidiTable(this.value(k, "row_data")).map((r) => r.rowid));
+      let next = used.length ? Math.max(...used) + 1 : 1;
       const applied = [];
       for (const row of rows) {
         const rowid = row.rowid ?? next++;
@@ -1354,10 +1945,15 @@ var Luna = (() => {
     children(nodePath) {
       return [...this.nodes.get(normalize(nodePath))?.children ?? []];
     }
+    /** Names of a node's properties. */
+    propertyNames(nodePath) {
+      return [...this.nodes.get(normalize(nodePath))?.properties.keys() ?? []];
+    }
     /** @internal Uploads between `begin` and `end` (fact 42). */
     imports = /* @__PURE__ */ new Map();
     /** @internal Uploaded content (package and base64) to the source it was filed as, for fact 42's de-duplication. */
     uploaded = /* @__PURE__ */ new Map();
+    recommenders = /* @__PURE__ */ new Map();
     /**
      * Replace the handler of the command at `path` (for example
      * `/sessions/abc/set_marker`), to reproduce a verb that answers without acting (fact 71).
@@ -1464,7 +2060,8 @@ var Luna = (() => {
           const body = data ?? {};
           const playlist = body.playlist_uid ?? (body.track_uid ? String(engine.value(`${base}/tracks/${body.track_uid}`, "playlist_uid")) : void 0);
           if (!playlist) throw new UAError("uasrv.invalid_object", "insert_clip: no playlist", { cmd: "post", path: `${base}/insert_clip` });
-          const id = `clip${engine.children(`${base}/playlists/${playlist}/clips`).length + 1}`;
+          if (!body.source_uid) throw new UAError("uasrv.invalid_property", "insert_clip: source_uid is required", { cmd: "post", path: `${base}/insert_clip` });
+          const id = engine.nextClipId(base, playlist);
           engine.addNode(`${base}/playlists/${playlist}/clips/${id}`, {
             properties: { uid: id, name: body.name ?? "Clip", start: body.start ?? 0, stop: body.stop ?? 0, source_uid: body.source_uid ?? "", source_start: body.source_start ?? 0, source_stop: body.source_stop ?? 0, clip_type: body.clip_type ?? 0, gain: 0, bypass: false, midi_source_start: 0, layer: 0, mute: false }
           });
@@ -1484,7 +2081,7 @@ var Luna = (() => {
           const body = data ?? {};
           for (const t of body.track_uid ?? []) {
             const n = engine.children(`${base}/playlists`).filter((p) => engine.value(`${base}/playlists/${p}`, "track_uid") === t).length + 1;
-            engine.addNode(`${base}/playlists/pl_${t}_${n}`, { properties: { uid: `pl_${t}_${n}`, name: `V${n}`, track_uid: t, version: n, stem_format: "mono", frozen: false } });
+            engine.addNode(`${base}/playlists/pl_${t}_${n}`, { properties: { uid: `pl_${t}_${n}`, name: `V${n}`, track_uid: t, version: n, stem_format: "mono", frozen: false, enable_compiled_clips: false } });
             engine.addNode(`${base}/playlists/pl_${t}_${n}/clips`);
           }
           return null;
@@ -1543,7 +2140,22 @@ var Luna = (() => {
           engine.addNode(`${base}/time_signatures/${id}`, { properties: { tick: 0, bar: body.bar ?? 1, partial: false, numerator: body.numerator ?? 4, denominator: body.denominator ?? 4 } });
           return null;
         },
-        set_key_signature: () => null,
+        /** One key signature per tick: setting one where a row already sits rewrites that row (fact 113). */
+        set_key_signature: (data, engine) => {
+          const body = data ?? {};
+          if (typeof body.tick !== "number" || typeof body.sharps_and_flats !== "number" || typeof body.is_minor !== "boolean") {
+            throw new UAError("uasrv.invalid_property", "set_key_signature: tick, sharps_and_flats and is_minor are required", { cmd: "post", path: `${base}/set_key_signature` });
+          }
+          const existing = engine.children(`${base}/key_signatures`).find((row) => engine.value(`${base}/key_signatures/${row}`, "tick") === body.tick);
+          if (existing !== void 0) {
+            engine.setValue(`${base}/key_signatures/${existing}`, "sharps_and_flats", body.sharps_and_flats);
+            engine.setValue(`${base}/key_signatures/${existing}`, "is_minor", body.is_minor);
+            return null;
+          }
+          const rowid = engine.nextRow();
+          engine.addNode(`${base}/key_signatures/${rowid}`, { properties: { rowid, tick: body.tick, sharps_and_flats: body.sharps_and_flats, is_minor: body.is_minor } });
+          return null;
+        },
         set_automode_on_tracks: (data, engine) => {
           const body = data ?? {};
           const names = ["off", "read", "write", "touch", "latch"];
@@ -1670,7 +2282,12 @@ var Luna = (() => {
           }
           return null;
         },
-        move_clips: () => null,
+        move_clips: (data, engine) => engine.clipEdit(base, "move_clips", data),
+        get_clip_info: (data, engine) => {
+          const uid2 = String(data?.clip_uid ?? "");
+          if (!engine.findClip(base, uid2)) throw new UAError("uasrv.invalid_object", "get_clip_info: no such clip", { cmd: "post", path: `${base}/get_clip_info` });
+          return { sample_rate: 48e3, compiled_clips: [] };
+        },
         set_bar_one: () => null,
         set_marker: (data, engine) => {
           const body = data ?? {};
@@ -1804,9 +2421,11 @@ var Luna = (() => {
             return null;
           },
           /**
-           * Writes notes onto a playlist, making the MIDI clip to hold them if there is none
-           * there, and then **selects** what it made: that is where the caller reads the new
-           * row ids from (fact 74).
+           * Writes notes onto a playlist, as deviced's `Edit_CreateNote` does (fact 111): ticks
+           * are session ticks; each note goes into the clip under its note-on, else into one new
+           * MIDI clip spanning the bars the notes cover. Then LUNA **selects** what it made,
+           * which is where the caller reads the new row ids from (fact 74). No channel field:
+           * every note is on channel 0.
            */
           create_note: (data, engine) => {
             const body = data ?? {};
@@ -1814,34 +2433,48 @@ var Luna = (() => {
             if (!playlist || !engine.has(`${base}/playlists/${playlist}`)) throw new UAError("uasrv.invalid_object", "create_note: no such playlist", { cmd: "post", path: `${base}/create_note` });
             const notes = body.notes ?? (body.note !== void 0 ? [{ note: body.note, start: body.start, stop: body.stop, velocity: body.velocity }] : []);
             if (!notes.length) return null;
+            const clipsPath = `${base}/playlists/${playlist}/clips`;
+            const clips = () => engine.children(clipsPath).map((uid2) => ({ uid: uid2, start: Number(engine.value(`${clipsPath}/${uid2}`, "start") ?? 0), stop: Number(engine.value(`${clipsPath}/${uid2}`, "stop") ?? 0) })).sort((a, b) => a.start - b.start);
+            const firstClip = (from, to) => clips().find((c) => from === to ? from >= c.start && from < c.stop : c.start < to && c.stop > from);
             const span = { start: Math.min(...notes.map((n) => n.start ?? 0)), stop: Math.max(...notes.map((n) => n.stop ?? 0)) };
-            let clipUid = engine.children(`${base}/playlists/${playlist}/clips`).find((uid2) => engine.value(`${base}/playlists/${playlist}/clips/${uid2}`, "clip_type") === 2);
+            const onsets = { start: Math.min(...notes.map((n) => n.start ?? 0)), stop: Math.max(...notes.map((n) => n.start ?? 0)) };
+            let clipUid = firstClip(onsets.start, onsets.stop)?.uid;
             if (!clipUid) {
-              clipUid = `midi${engine.children(`${base}/playlists/${playlist}/clips`).length + 1}`;
-              engine.addNode(`${base}/playlists/${playlist}/clips/${clipUid}`, {
-                properties: { uid: clipUid, name: "MIDI", start: span.start, stop: span.stop, source_uid: "", source_start: 0, source_stop: 0, clip_type: 2, gain: 0, bypass: false, render_source_uid: null, render_state: "none", midi_source_start: 0 }
-              });
-              engine.addNode(`${base}/playlists/${playlist}/clips/${clipUid}/midi/table`, { properties: { row_data: EMPTY_MIDI_TABLE() } });
+              let start = engine.barLines(base, span.start).floor;
+              let stop = engine.barLines(base, span.stop).ceil;
+              for (const c of clips()) {
+                if (c.start < span.start && c.stop > start) start = Math.max(start, c.stop);
+                if (c.start < stop && c.stop > span.stop) stop = Math.min(stop, c.start);
+              }
+              const trackUid = String(engine.value(`${base}/playlists/${playlist}`, "track_uid") ?? "");
+              const name = engine.value(`${base}/tracks/${trackUid}`, "name");
+              clipUid = engine.addMidiClipToPlaylist(base, playlist, { startTick: start, stopTick: stop, name: typeof name === "string" ? name : "MIDI", midiSourceStart: start });
             }
-            const clipPath = `${base}/playlists/${playlist}/clips/${clipUid}`;
-            const origin = Number(engine.value(clipPath, "midi_source_start") ?? 0);
-            const before = new Set(engine.midiRows(clipPath).map((r) => r.rowid));
-            engine.midiEdit(
-              clipPath,
-              "added",
-              notes.flatMap((n) => [
-                { tick: (n.start ?? 0) + origin, status: 144, data1: n.note ?? 60, data2: n.velocity_on ?? n.velocity ?? 100 },
-                { tick: (n.stop ?? 0) + origin, status: 128, data1: n.note ?? 60, data2: n.velocity_off ?? 0 }
-              ])
-            );
-            const added = engine.midiRows(clipPath).filter((r) => !before.has(r.rowid) && (r.status & 240) === 144 && r.data2 > 0);
+            const offsetOf = (uid2) => Number(engine.value(`${clipsPath}/${uid2}`, "midi_source_start") ?? 0) - Number(engine.value(`${clipsPath}/${uid2}`, "start") ?? 0);
+            let offset = offsetOf(clipUid);
+            const selected = [];
+            for (const n of notes) {
+              const start = n.start ?? 0;
+              const stop = n.stop ?? 0;
+              const hit = firstClip(start, start);
+              if (hit) {
+                clipUid = hit.uid;
+                offset = offsetOf(clipUid);
+              }
+              const clipPath = `${clipsPath}/${clipUid}`;
+              const before = new Set(engine.midiRows(clipPath).map((r) => r.rowid));
+              engine.midiEdit(clipPath, "added", [
+                { tick: start + offset, status: 144, data1: n.note ?? 60, data2: n.velocity_on ?? n.velocity ?? 100 },
+                { tick: stop + offset, status: 128, data1: n.note ?? 60, data2: n.velocity_off ?? n.velocity ?? 100 }
+              ]);
+              const on = engine.midiRows(clipPath).find((r) => !before.has(r.rowid) && (r.status & 240) === 144);
+              if (on) selected.push([on.data1, start, stop, on.rowid]);
+            }
             engine.setValue(`${base}/contexts/main`, "focus", "notes");
             engine.setValue(`${base}/contexts/main`, "selection_playlists", [playlist]);
             engine.setValue(`${base}/contexts/main`, "selection_start", span.start);
             engine.setValue(`${base}/contexts/main`, "selection_stop", span.stop);
-            engine.setValue(`${base}/contexts/main`, "selection_notes", [
-              { playlist_uid: playlist, notes: added.map((r) => [r.data1, r.tick - origin, r.tick - origin, r.rowid]) }
-            ]);
+            engine.setValue(`${base}/contexts/main`, "selection_notes", [{ playlist_uid: playlist, notes: selected }]);
             return null;
           },
           /** Addresses rows by rowid, unlike the other two (fact 74). */
@@ -1858,8 +2491,14 @@ var Luna = (() => {
             }
             return null;
           },
-          nudge: () => null,
-          separate_clips: () => null,
+          nudge: (data, engine) => engine.clipEdit(base, "nudge", data),
+          separate_clips: (data, engine) => engine.clipEdit(base, "separate_clips", data),
+          heal_separation: (data, engine) => engine.clipEdit(base, "heal_separation", data),
+          move_clips: (data, engine) => engine.clipEdit(base, "move_clips", data),
+          set_fade: (data, engine) => engine.clipEdit(base, "set_fade", data),
+          delete_fades: (data, engine) => engine.clipEdit(base, "delete_fades", data),
+          batch_fades: (data, engine) => engine.clipEdit(base, "batch_fades", data),
+          change_fade_curvature: (data, engine) => engine.clipEdit(base, "change_fade_curvature", data),
           consolidate: () => null,
           mute_clips: () => null
         }
@@ -1869,6 +2508,7 @@ var Luna = (() => {
       this.addNode(`${base}/key_signatures`);
       this.addNode(`${base}/markers`);
       this.addNode(`${base}/chords`);
+      this.addNode(`${base}/preferences`, { commands: preferenceCommands(`${base}/preferences`) });
       this.addPackage(pkg, { name: options.name ?? uid, lastOpened: Date.now() });
       for (let i = 0; i < 4; i++) this.addBus(uid, `cue${i + 1}_${uid}`, { name: `CUE ${i + 1}`, busType: `cue_${i}`, stemFormat: "stereo" });
       this.addBus(uid, `master_${uid}`, { name: "Main Output", busType: "master", stemFormat: "stereo", color: 4294948970 });
@@ -1909,7 +2549,7 @@ var Luna = (() => {
         options.stemFormat === "stereo"
       );
       this.routeCues(sessionUid, `${base}/tracks/${id}`);
-      this.addNode(`${base}/playlists/${playlist}`, { properties: { uid: playlist, name: "V1", track_uid: id, version: 1, stem_format: options.stemFormat ?? "mono", frozen: false } });
+      this.addNode(`${base}/playlists/${playlist}`, { properties: { uid: playlist, name: "V1", track_uid: id, version: 1, stem_format: options.stemFormat ?? "mono", frozen: false, enable_compiled_clips: false } });
       this.addNode(`${base}/playlists/${playlist}/clips`);
     }
     /**
@@ -1950,6 +2590,93 @@ var Luna = (() => {
       });
     }
     /**
+     * Add a MIDI device under LUNA's device (`/devices/<LUNA_DEVICE_UID>/midi`, fact 123). The
+     * first call also adds LUNA's device, the `midi` folder, and the `All` and `None` entries
+     * LUNA lists beside the real devices, each with an input port only. The device gets an input
+     * and an output port unless `input` or `output` is false. Returns the device's uid.
+     *
+     * @example
+     * engine.addMidiDevice('Volt 876');
+     * engine.addMidiDevice('IAC Driver Bus 1', { uid: 'iac1' });
+     */
+    addMidiDevice(name, options = {}) {
+      const folder = `/devices/${LUNA_DEVICE_UID}/midi`;
+      if (!this.has(folder)) {
+        if (!this.has(`/devices/${LUNA_DEVICE_UID}`)) this.addNode(`/devices/${LUNA_DEVICE_UID}`, { properties: { name: "LUNA", online: true } });
+        this.addNode(folder, { properties: { type: "folder" } });
+        for (const [uid2, pseudo] of [["midi_all", "All"], ["midi_none", "None"]]) this.addMidiDeviceNode(`${folder}/${uid2}`, pseudo, null, true, false);
+      }
+      const uid = options.uid ?? `midi_${this.children(folder).length + 1}`;
+      this.addMidiDeviceNode(`${folder}/${uid}`, name, options.deviceType ?? "normal", options.input ?? true, options.output ?? true);
+      return uid;
+    }
+    /**
+     * MIDI arriving from a device, as LUNA publishes it (fact 125): one batch on the device's
+     * input port `midi_events`, and the same batch on `All`'s. Like LUNA, nothing is published
+     * on a port no one subscribes to by its `midi_events` path, and a `get` reads no events.
+     * `device` is a uid from {@link addMidiDevice} or a device name; each message is
+     * `[status, data1, data2]`, stamped `timeMs` (default 0) apart by `stepMs` (default 1).
+     * Returns how many ports published.
+     *
+     * @example
+     * engine.addMidiDevice('Volt 876', { uid: 'volt' });
+     * engine.receiveMidi('volt', [[0x90, 60, 100], [0x80, 60, 0]]);
+     */
+    receiveMidi(device, messages, options = {}) {
+      const folder = `/devices/${LUNA_DEVICE_UID}/midi`;
+      if (!this.has(folder)) throw new Error("MockEngine.receiveMidi: no MIDI devices; call addMidiDevice first");
+      const uid = this.children(folder).find((d) => d === device || this.value(`${folder}/${d}`, "name") === device);
+      if (!uid || !this.has(`${folder}/${uid}/input_ports/0`)) throw new Error(`MockEngine.receiveMidi: no MIDI device ${device} with an input port`);
+      const start = options.timeMs ?? 0;
+      const step = options.stepMs ?? 1;
+      const events = messages.map(([status, data1, data2], i) => [start + i * step, status, data1, data2]);
+      const all = this.children(folder).find((d) => this.value(`${folder}/${d}`, "name") === "All");
+      let published = 0;
+      for (const id of all && all !== uid ? [uid, all] : [uid]) {
+        const port = `${folder}/${id}/input_ports/0`;
+        const path = `${port}/midi_events`;
+        if (![...this.ports].some((p) => p.subscribesTo(path))) continue;
+        const current = this.value(port, "midi_events");
+        const seq = current.seq + 1;
+        this.nodes.get(port)?.properties.set("midi_events", { seq, dropped: current.dropped, events: [] });
+        this.push({ path: `${path}/value`, data: { seq, dropped: current.dropped, events } }, void 0);
+        published++;
+      }
+      return published;
+    }
+    /** True when `uid` is a mock MIDI device's output port uid. */
+    isMidiOutputPortUid(uid) {
+      const folder = `/devices/${LUNA_DEVICE_UID}/midi`;
+      if (!this.has(folder)) return false;
+      return this.children(folder).some((d) => this.has(`${folder}/${d}/output_ports/0`) && this.value(`${folder}/${d}/output_ports/0`, "uid") === uid);
+    }
+    addMidiDeviceNode(path, name, deviceType, input, output) {
+      const real = deviceType !== null;
+      this.addNode(path, {
+        properties: {
+          type: "midi-device",
+          name,
+          last_midi_note: [255, 255, 255],
+          last_midi_control: [255, 255, 255],
+          midi_device_type: deviceType,
+          midi_device_mode: null,
+          output_lateness: real ? 0 : null,
+          midi_clock_generation_enabled: real ? false : null,
+          midi_clock_generation_mode: real ? "song1" : null,
+          midi_clock_generation_offset_ms: real ? 0 : null
+        }
+      });
+      const id = path.slice(path.lastIndexOf("/") + 1);
+      if (input) {
+        this.addNode(`${path}/input_ports`, { properties: { type: "folder" } });
+        this.addNode(`${path}/input_ports/0`, { properties: { type: "midi-input", uid: `${id}_in`, midi_events: { seq: 0, dropped: 0, events: [] } } });
+      }
+      if (output) {
+        this.addNode(`${path}/output_ports`, { properties: { type: "folder" } });
+        this.addNode(`${path}/output_ports/0`, { properties: { type: "midi-output", uid: `${id}_out` } });
+      }
+    }
+    /**
      * Finish a record pass the way LUNA does: punch in, then on the caller's stop drop a
      * finalized take clip on the track's active playlist with a source to match (fact 75).
      *
@@ -1984,6 +2711,44 @@ var Luna = (() => {
         }
       });
       return clipUid;
+    }
+    /**
+     * Add an empty MIDI clip to a track's current playlist, the way LUNA makes one for notes
+     * drawn in place. `midiSourceStart` is the table tick at the clip's start (fact 41): 0 by
+     * default. `insert_clip` cannot make one: it needs a source (fact 112). Returns the clip uid.
+     *
+     * @example
+     * const clipUid = engine.addMidiClip('abc', 'Keys', { startTick: 0, stopTick: Luna.WHOLE_NOTE });
+     */
+    addMidiClip(sessionUid, trackUid, options = {}) {
+      const base = `/sessions/${sessionUid}`;
+      return this.addMidiClipToPlaylist(base, String(this.value(`${base}/tracks/${trackUid}`, "playlist_uid")), options);
+    }
+    /** @internal */
+    addMidiClipToPlaylist(sessionPath, playlistUid, options) {
+      const clips = `${sessionPath}/playlists/${playlistUid}/clips`;
+      let n = this.children(clips).length + 1;
+      while (this.has(`${clips}/midi${n}`)) n++;
+      const clipUid = `midi${n}`;
+      const start = options.startTick ?? 0;
+      const stop = options.stopTick ?? start + 96e9 * 4;
+      this.addNode(`${clips}/${clipUid}`, {
+        properties: { uid: clipUid, name: options.name ?? "MIDI", start, stop, source_uid: "", source_start: start, source_stop: stop, clip_type: 2, gain: 0, bypass: false, render_source_uid: null, render_state: "none", midi_source_start: options.midiSourceStart ?? 0, layer: 0, mute: false }
+      });
+      this.addNode(`${clips}/${clipUid}/midi/table`, { properties: { row_data: EMPTY_MIDI_TABLE() } });
+      return clipUid;
+    }
+    /**
+     * @internal The bar lines either side of `tick`: the one at or before it and the one at or
+     * after it, from the time signature in effect (deviced's `GetBarRangeForNoteEvents`).
+     */
+    barLines(sessionPath, tick) {
+      const beatTicks = 96e9;
+      const sigs = this.children(`${sessionPath}/time_signatures`).map((id) => this.nodes.get(`${sessionPath}/time_signatures/${id}`).properties).map((p) => ({ tick: Number(p.get("tick") ?? 0), n: Number(p.get("numerator") ?? 4), d: Number(p.get("denominator") ?? 4) })).sort((a, b) => a.tick - b.tick);
+      const sig = sigs.filter((x) => x.tick <= tick).at(-1) ?? sigs[0] ?? { tick: 0, n: 4, d: 4 };
+      const bar = beatTicks * 4 / sig.d * sig.n;
+      const floor = sig.tick + Math.floor((tick - sig.tick) / bar) * bar;
+      return { floor, ceil: floor === tick ? tick : floor + bar };
     }
     /**
      * Put a chord on a session's Chord ruler, as a user typing one in LUNA would: it replaces
@@ -2251,6 +3016,8 @@ var Luna = (() => {
       }
       node.properties.set(name, data);
       this.push({ path: `${nodePath}/${name}/value`, data }, from);
+      this.clipChanged(nodePath);
+      if (name === "enable_compiled_clips" && /^\/sessions\/[^/]+\/playlists\/[^/]+$/.test(nodePath)) this.compilePlaylist(nodePath);
       if (name === "record_enabled" && /^\/sessions\/[^/]+$/.test(nodePath)) this.runRecord(nodePath, data === true || data === 1);
       if (name === "play_start" && /^\/sessions\/[^/]+$/.test(nodePath) && node.properties.get("playing") !== true) this.setValue(nodePath, "location", this.locationAt(nodePath, Number(data)));
       if (isTrack && name === "input_monitor") this.setValue(nodePath, "input_monitor_state", data === true);
@@ -2427,6 +3194,10 @@ var Luna = (() => {
       await new Promise((r) => setTimeout(r, 0));
       this.setStatus("connected");
     }
+    /** @internal True when this port subscribed to exactly `path`. */
+    subscribesTo(path) {
+      return this.status === "connected" && this.subscriptions.has(path);
+    }
     /** @internal */
     wantsEvent(path) {
       if (this.status !== "connected") return false;
@@ -2453,6 +3224,34 @@ var Luna = (() => {
       for (const listener of this.statusListeners) listener(status);
     }
   };
+  function localContentHost(id) {
+    let host = "";
+    for (const byte of new TextEncoder().encode(id)) {
+      const c = String.fromCharCode(byte);
+      if (/[a-z0-9.-]/.test(c)) host += c;
+      else if (c === "_") host += "__";
+      else host += `_${byte.toString(16).padStart(2, "0")}`;
+    }
+    return host || "_";
+  }
+  function encodeMediaPath(path) {
+    let out = "";
+    for (const byte of new TextEncoder().encode(path.replaceAll("\\", "/"))) {
+      const c = String.fromCharCode(byte);
+      out += /[A-Za-z0-9\-._~/]/.test(c) ? c : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+    return out.startsWith("/") ? out : `/${out}`;
+  }
+  function normalizeFolder(path) {
+    const drive = /^[A-Za-z]:/.exec(path)?.[0] ?? "";
+    const parts = [];
+    for (const part of path.slice(drive.length).split(/[\\/]+/).slice(1)) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") parts.pop();
+      else parts.push(part);
+    }
+    return `${drive}/${parts.join("/")}`;
+  }
   function naturalCompare(a, b) {
     const s1 = [...a].map((c) => c.codePointAt(0)).concat(0);
     const s2 = [...b].map((c) => c.codePointAt(0)).concat(0);
@@ -2513,6 +3312,60 @@ var Luna = (() => {
         if (x[xi] > y[yi]) return 1;
       }
     }
+  }
+  function preferenceCommands(root) {
+    const validName = (v) => typeof v === "string" && v !== "" && !v.includes("/");
+    const target = (body, verb) => {
+      if (body.context === void 0 || body.preference === void 0 || body.property === void 0) {
+        throw new UAError("uasrv.missing_field", `${verb}: uasrv.missing_field`, { cmd: "post", path: `${root}/${verb}` });
+      }
+      if (!validName(body.context) || !validName(body.preference) || !validName(body.property)) {
+        throw new UAError("uasrv.invalid_value", `${verb}: uasrv.invalid_value`, { cmd: "post", path: `${root}/${verb}` });
+      }
+      return { node: `${root}/${body.context}/${body.preference}`, property: body.property };
+    };
+    const prune = (engine, context) => {
+      for (const pref of engine.children(`${root}/${context}`)) {
+        const path = `${root}/${context}/${pref}`;
+        if (engine.propertyNames(path).length === 0) engine.removeNode(path);
+      }
+      if (engine.children(`${root}/${context}`).length === 0) engine.removeNode(`${root}/${context}`);
+    };
+    return {
+      add_preference: (data, engine) => {
+        const body = data ?? {};
+        const { node, property } = target(body, "add_preference");
+        if (engine.has(node) && engine.propertyNames(node).includes(property)) return null;
+        if (!engine.has(node)) engine.addNode(node, { properties: { [property]: body.value ?? null } });
+        else engine.setValue(node, property, body.value ?? null);
+        return null;
+      },
+      set_preference: (data, engine) => {
+        const body = data ?? {};
+        if (body.value === void 0) throw new UAError("uasrv.missing_field", "set_preference: uasrv.missing_field", { cmd: "post", path: `${root}/set_preference` });
+        const { node, property } = target(body, "set_preference");
+        if (!engine.has(node) || !engine.propertyNames(node).includes(property)) {
+          throw new UAError("uasrv.invalid_property", "set_preference: uasrv.invalid_property", { cmd: "post", path: `${root}/set_preference` });
+        }
+        engine.setValue(node, property, body.value);
+        return null;
+      },
+      remove_preference: (data, engine) => {
+        const body = data ?? {};
+        const path = `${root}/remove_preference`;
+        if (body.context === void 0) throw new UAError("uasrv.missing_field", "remove_preference: uasrv.missing_field", { cmd: "post", path });
+        const pref = body.preference ?? "";
+        const prop = body.property ?? "";
+        if (!validName(body.context) || pref === "" && prop !== "") throw new UAError("uasrv.invalid_value", "remove_preference: uasrv.invalid_value", { cmd: "post", path });
+        const contextPath = `${root}/${body.context}`;
+        if (!engine.has(contextPath)) return null;
+        if (pref === "") engine.removeNode(contextPath);
+        else if (prop === "") engine.removeNode(`${contextPath}/${String(pref)}`);
+        else engine.deleteValue(`${contextPath}/${String(pref)}`, String(prop));
+        prune(engine, body.context);
+        return null;
+      }
+    };
   }
 
   // src/wire/wasm-port.ts
@@ -4366,6 +5219,37 @@ var Luna = (() => {
     }
   }
 
+  // src/client/detect.ts
+  function search() {
+    const loc = globalThis.location;
+    return typeof loc?.search === "string" ? loc.search : void 0;
+  }
+  function locationOptions() {
+    const s = search();
+    if (!s) return {};
+    const params = new URLSearchParams(s);
+    const out = {};
+    const host = params.get("host");
+    const port = params.get("port");
+    if (host) out.host = host;
+    if (port && Number.isFinite(Number(port))) out.port = Number(port);
+    const engine = params.get("engine");
+    if (engine === "wasm" || engine === "luna" || engine === "mock") out.engine = engine;
+    const engineUrl = params.get("engine_url");
+    if (engineUrl) out.engineUrl = engineUrl;
+    return out;
+  }
+  function isEmbeddedInLuna() {
+    return locationOptions().port !== void 0;
+  }
+  function isLunaEnginePort(port) {
+    return port === DEFAULT_LUNA_PORT;
+  }
+  function hasNativeBridge() {
+    const w = globalThis;
+    return typeof w.lunaAPI?.setAcceptsFileDrops === "function";
+  }
+
   // src/model/shortcuts.ts
   var DEFAULT_SHORTCUTS = Object.freeze({
     undo: ["Mod+Z"],
@@ -4494,6 +5378,8 @@ var Luna = (() => {
   }
   function bindShortcuts(client, options = {}) {
     const shortcuts = new Shortcuts(client, options);
+    if (hasNativeBridge()) return { shortcuts, installed: false, dispose: () => {
+    } };
     const target = options.target ?? globalThis.window;
     const onDown = (e) => {
       shortcuts.handle(e);
@@ -4503,6 +5389,7 @@ var Luna = (() => {
     target?.addEventListener("keyup", onUp);
     return {
       shortcuts,
+      installed: true,
       dispose: () => {
         target?.removeEventListener("keydown", onDown);
         target?.removeEventListener("keyup", onUp);
@@ -5010,6 +5897,24 @@ var Luna = (() => {
         value: on
       });
     }
+    /**
+     * Load a preset onto the plugin in this slot: its state and its identity, so `presetUid`
+     * and `presetName` follow (fact 122). The preset must belong to the slot's plugin; take its
+     * uid from {@link Presets.query}, {@link Presets.recommend} or a {@link PresetSelection}.
+     * Rejects with code `unavailable` when the slot is empty.
+     *
+     * @example
+     * const [row] = await luna.presets.query({ pluginId: slot.pluginId.value!, search: 'Clean' });
+     * await slot.loadPreset(row.uid);
+     * slot.presetName.value; // row.name
+     */
+    async loadPreset(presetUid) {
+      this.assertLive();
+      if (this.pluginId.value === void 0 || this.uid.value === void 0) await this.load();
+      const pluginId = this.pluginId.value;
+      if (!pluginId) throw new UAError("unavailable", `loadPreset(): ${this.id} holds no plugin`, { path: this.path });
+      await this.wire.post(`/presets/plugins/${pluginId}/load`, { session_uid: this.sessionUid, uid: this.uid.value, preset_uid: presetUid });
+    }
     /** Step through the plugin's presets. */
     nextPreset() {
       return this.post("commands/preset_browser_increment");
@@ -5456,14 +6361,22 @@ var Luna = (() => {
      * const gain = session.context.waveformZoom.value * 10 ** ((clip.gain.value ?? 0) / 20);
      */
     waveformZoom;
-    /** Set range and/or tracks in one go; omitted parts are left alone. */
+    /**
+     * Set range, tracks, playlists and/or focus in one go; omitted parts are left alone. `focus`
+     * is what LUNA's selection commands act on: `timeline` for clips (fact 117).
+     *
+     * @example
+     * await ctx.select({ startTick: 0, stopTick: Luna.WHOLE_NOTE, playlistUids: [lane.id], focus: 'timeline' });
+     */
     async select(options) {
       const writes = [];
+      if (options.focus !== void 0) writes.push(this.client.store.set(this.path, "focus", options.focus));
       if (options.startTick !== void 0) writes.push(this.selectionStart.set(options.startTick));
       if (options.stopTick !== void 0) writes.push(this.selectionStop.set(options.stopTick));
       if (options.trackUids !== void 0) writes.push(this.selectionTracks.set(options.trackUids));
+      if (options.playlistUids !== void 0) writes.push(this.client.store.set(this.path, "selection_playlists", options.playlistUids));
       await Promise.all(writes);
-      if (writes.length) await this.wire.get(this.path, { children: false, commands: false, flatvalue: true, propfilter: ["selection_start", "selection_stop", "selection_tracks"] });
+      if (writes.length) await this.wire.get(this.path, { children: false, commands: false, flatvalue: true, propfilter: ["focus", "selection_start", "selection_stop", "selection_tracks", "selection_playlists"] });
     }
     /** The selected notes, decoded. Empty when nothing is selected. */
     get notes() {
@@ -5743,7 +6656,7 @@ var Luna = (() => {
         expected.push({ rowid: note.rowid, velocity });
       }
       await this.wire.post(`${this.host.sessionPath}/contexts/main/commands/change_velocity`, { session_uid: this.host.sessionUid, velocity_on: options.off !== true, notes: rows });
-      await settle(() => expected.every((e) => (options.off ? this.notes.byId(String(e.rowid))?.offVelocity : this.notes.byId(String(e.rowid))?.velocity) === e.velocity), "change velocities", this.settleOptions());
+      await this.settleEdit(() => expected.every((e) => (options.off ? this.notes.byId(String(e.rowid))?.offVelocity : this.notes.byId(String(e.rowid))?.velocity) === e.velocity), "change velocities");
     }
     /** Set one note's velocity. `off` targets the note-off row. One "Change Velocities" undo entry. */
     setVelocity(note, velocity, options = {}) {
@@ -5753,6 +6666,8 @@ var Luna = (() => {
      * Mute or unmute notes. LUNA's `mute_notes` is a toggle over the selection (fact 74), so
      * this selects only the notes whose state must change, posts once, and restores the user's
      * selection. Nothing is posted — and no undo entry made — when nothing needs changing.
+     * Which notes need changing is read from {@link notes}, which a batch transaction does not
+     * update until its commit: mute a note once per batch.
      *
      * @example
      * // Mute everything quieter than 40, as one undo entry.
@@ -5763,12 +6678,14 @@ var Luna = (() => {
       if (!targets.length) return;
       await this.withSelection(targets, async () => {
         await this.wire.post(`${this.host.sessionPath}/contexts/main/commands/mute_notes`, { session_uid: this.host.sessionUid });
-        await settle(() => targets.every((t) => this.notes.byId(String(t.rowid))?.muted === muted), "mute notes", this.settleOptions());
+        await this.settleEdit(() => targets.every((t) => this.notes.byId(String(t.rowid))?.muted === muted), "mute notes");
       });
     }
     /**
      * Delete notes: `clear` over a selection of exactly these notes, one undo entry, with the
-     * user's selection restored afterwards.
+     * user's selection restored afterwards. Inside a `session.transaction()` batch it joins the
+     * batch's undo step, so deleting notes and writing their replacements with
+     * {@link Clip.addNotes} undoes as one.
      *
      * @example
      * await clip.midi.deleteNotes([clip.midi.notes.items[0]!]);
@@ -5778,7 +6695,7 @@ var Luna = (() => {
       if (!targets.length) return;
       await this.withSelection(targets, async () => {
         await this.wire.post(`${this.host.sessionPath}/contexts/main/commands/clear`, { session_uid: this.host.sessionUid });
-        await settle(() => targets.every((t) => this.notes.byId(String(t.rowid)) === void 0), "delete notes", this.settleOptions());
+        await this.settleEdit(() => targets.every((t) => this.notes.byId(String(t.rowid)) === void 0), "delete notes");
       });
     }
     resolveOne(note) {
@@ -5792,13 +6709,6 @@ var Luna = (() => {
     }
     /** Save the user's selection, select `targets` (absolute ticks), run `fn`, restore. */
     async withSelection(targets, fn) {
-      if (this.host.batching?.()) {
-        throw new UAError(
-          "busy",
-          "setMuted()/deleteNotes() select the notes through LUNA's edit context, which a transaction() batch holds until its commit (the verb would then act on nothing): call them outside the batch",
-          { path: this.path }
-        );
-      }
       const base = this.host.startTick();
       if (base === void 0) throw new UAError("unavailable", "the clip has no start tick yet", { path: this.path });
       const context = this.context;
@@ -5815,6 +6725,15 @@ var Luna = (() => {
         await context.restore(saved).catch(() => {
         });
       }
+    }
+    /**
+     * Wait for an edit to show in the lists. Inside a batch transaction LUNA holds the deltas,
+     * and answers reads of the table from before the batch, until the commit (fact 74): there
+     * is nothing to wait for yet.
+     */
+    async settleEdit(done, what) {
+      if (this.host.transactionMode?.() === "batch") return;
+      await settle(done, what, this.settleOptions());
     }
     settleOptions() {
       return { path: this.path, disposed: () => this.disposed, refresh: () => this.refresh(), flush: () => this.client.store.scheduler.flush() };
@@ -5841,12 +6760,19 @@ var Luna = (() => {
     if (raw === "audio" || raw === "video" || raw === "midi") return raw;
     return void 0;
   }
+  var FADE_SHAPES = ["linear", "equal_power", "log"];
+  function requireFadeShape(shape, what) {
+    if (shape === void 0) return void 0;
+    if (typeof shape !== "string" || !FADE_SHAPES.includes(shape)) throw new UAError("out_of_range", `${what}: shape must be one of ${FADE_SHAPES.join(", ")}`);
+    return shape;
+  }
   var Clip = class extends Node {
     /** @internal */
-    constructor(client, path, sessionUid, batching) {
+    constructor(client, path, sessionUid, transactionMode, siblings) {
       super(client, path);
       this.sessionUid = sessionUid;
-      this.batching = batching;
+      this.transactionMode = transactionMode;
+      this.siblings = siblings;
       this.uid = this.prop("uid");
       this.name = this.writableProp("name");
       this.start = this.prop("start");
@@ -5866,9 +6792,11 @@ var Luna = (() => {
       this.midiSourceStart = this.prop("midi_source_start");
     }
     sessionUid;
-    batching;
+    transactionMode;
+    siblings;
     midiClip;
     deleting = false;
+    contextView;
     uid;
     name;
     /** Timeline start, ticks. */
@@ -5916,7 +6844,7 @@ var Luna = (() => {
         playlistUid: this.playlistUid,
         clipUid: this.id,
         startTick: () => this.start.value,
-        batching: this.batching
+        transactionMode: this.transactionMode
       });
       return this.midiClip;
     }
@@ -6010,6 +6938,190 @@ var Luna = (() => {
       }
       return reply;
     }
+    /**
+     * Move the clip so it starts at `toTick`, keeping its length, on its own playlist. One undo
+     * step. Resolves to this clip, or with `copy` to the new copy once it is listed. LUNA's
+     * `move_clips` moves a range (fact 117): this is the clip's whole span, so a clip lying
+     * wholly on top of this one moves with it. To move what shows of a clip that others overlap,
+     * the way dragging it in LUNA does, move its pieces from {@link Playlist.compiledClips} with
+     * {@link CompiledClip.move}. The user's selection is put back afterwards.
+     *
+     * @example
+     * await clip.move(clip.start.value! + Luna.WHOLE_NOTE);
+     * const copy = await clip.move(clip.stop.value!, { copy: true });
+     */
+    async move(toTick, options = {}) {
+      const [start, stop] = this.bounds("move");
+      requireTick(toTick, "toTick");
+      if (toTick < 0) throw new UAError("out_of_range", "move(): toTick must not be negative", { path: this.path });
+      const before = new Set(this.siblingList().items.map((c) => c.id));
+      await this.keepingSelection(
+        () => this.contextPost("move_clips", { context_type: "main", playlist_uid: [this.playlistUid], start, stop, location: toTick, ...options.copy ? { copy: true } : {} })
+      );
+      if (!options.copy) {
+        await settle(() => this.start.value === toTick, "move clip", this.settleOptions());
+        return this;
+      }
+      const length = stop - start;
+      const found = () => this.siblingList().items.find((c) => !before.has(c.id) && c.start.value === toTick && c.stop.value === toTick + length);
+      await settle(() => found() !== void 0, "copy clip", this.settleOptions());
+      return found();
+    }
+    /**
+     * Copy the clip to start where it ends. One undo step; resolves to the copy.
+     *
+     * @example
+     * const again = await clip.duplicate();
+     */
+    async duplicate() {
+      const [, stop] = this.bounds("duplicate");
+      return this.move(stop, { copy: true });
+    }
+    /**
+     * Cut the clip at one or more ticks inside it (LUNA's `separate_clips`). One undo step.
+     * Resolves to the pieces in time order; this clip keeps the first. A fade-out moves to the
+     * last piece, and a crossfade at a cut is not kept (fact 117).
+     *
+     * @example
+     * const [left, right] = await clip.split(clip.start.value! + Luna.WHOLE_NOTE);
+     */
+    async split(at) {
+      const [start, stop] = this.bounds("split");
+      const ticks = [...new Set((typeof at === "number" ? [at] : at).map((t) => requireTick(t, "at")))].sort((a, b) => a - b);
+      if (!ticks.length || ticks.some((t) => t <= start || t >= stop)) throw new UAError("out_of_range", "split(): every tick must lie inside the clip", { path: this.path });
+      await this.contextPost("separate_clips", { location: ticks, playlist_uid: [this.playlistUid] });
+      const pieces = () => ticks.map((t, i) => this.siblingList().items.find((c) => c.start.value === t && c.stop.value === (ticks[i + 1] ?? stop)));
+      await settle(() => this.stop.value === ticks[0] && pieces().every((p) => p !== void 0), "split clip", this.settleOptions());
+      return [this, ...pieces()];
+    }
+    /**
+     * Mute or unmute the clip. One undo step. (LUNA's `mute_clips` toggles a range instead.)
+     *
+     * @example
+     * await clip.setMuted(true);
+     */
+    setMuted(muted) {
+      return this.property("mute").set(muted);
+    }
+    /**
+     * Slide the audio inside the clip without moving the clip: positive `byNs` moves the audio
+     * later, so an earlier part of the source plays at the clip start. LUNA's own content nudge,
+     * so warps move with it; one undo step. The step is one sample at the engine rate. Only a
+     * clip on its track's active playlist can be slipped. A slip that would run past either end
+     * of the source does nothing in LUNA (fact 117); one past the start is refused here with
+     * `out_of_range`, one past the end rejects with `no_effect`.
+     *
+     * @example
+     * await clip.slip(-10_000_000);   // 10 ms earlier
+     */
+    async slip(byNs) {
+      const [start, stop] = this.bounds("slip");
+      if (!Number.isFinite(byNs)) throw new UAError("out_of_range", "slip(): byNs must be a finite number", { path: this.path });
+      const track = this.client.store.cell(this.playlistPath, "track_uid").value;
+      if (!track || this.client.store.cell(`/sessions/${this.sessionUid}/tracks/${track}`, "playlist_uid").value !== this.playlistUid) {
+        throw new UAError("unavailable", "slip(): LUNA slips only clips on their track's active playlist", { path: this.path });
+      }
+      const info = await this.sessionPost("get_clip_info", { clip_uid: this.id });
+      const rate = info?.sample_rate ?? 48e3;
+      const samples = Math.round(Math.abs(byNs) * rate / 1e9);
+      if (samples === 0) return;
+      const from = this.sourceStart.value ?? 0;
+      if (byNs > 0 && from - samples * 1e9 / rate < 0) {
+        throw new UAError("out_of_range", `slip(): the source has only ${(from / 1e6).toFixed(1)} ms of audio before the clip start`, { path: this.path });
+      }
+      const operation = byNs > 0 ? "content_right" : "content_left";
+      await this.keepingSelection(async () => {
+        await this.context.select({ focus: "timeline", startTick: start, stopTick: stop, trackUids: [track] });
+        await this.contextPost("nudge", { nudge_settings: JSON.stringify({ mode: "samples", samples, operation }) });
+      });
+      const expected = from - Math.sign(byNs) * (samples * 1e9) / rate;
+      await settle(() => Math.abs((this.sourceStart.value ?? from) - expected) < 1e9 / rate + 1, "slip clip", this.refreshingOptions());
+    }
+    /**
+     * Fade the clip in over its first `lengthTicks`, or change the length of its fade-in. One
+     * undo step, or two when `shape` changes an existing fade's shape. Without `shape` a new
+     * fade is `log`, LUNA's default. Audio clips only: a MIDI or video clip rejects with
+     * `unavailable`.
+     *
+     * @example
+     * await clip.setFadeIn(Luna.QUARTER_NOTE, { shape: 'equal_power' });
+     */
+    async setFadeIn(lengthTicks, options = {}) {
+      const [start] = this.bounds("setFadeIn");
+      const length = this.fadeLength(lengthTicks, "setFadeIn");
+      return this.setFade({ fade_type: "fade_in", start, stop_offset: length }, options.shape, "setFadeIn");
+    }
+    /**
+     * Fade the clip out over its last `lengthTicks`, or change the length of its fade-out.
+     *
+     * @example
+     * await clip.setFadeOut(Luna.HALF_NOTE);
+     */
+    async setFadeOut(lengthTicks, options = {}) {
+      const [, stop] = this.bounds("setFadeOut");
+      const length = this.fadeLength(lengthTicks, "setFadeOut");
+      return this.setFade({ fade_type: "fade_out", stop, start_offset: -length }, options.shape, "setFadeOut");
+    }
+    /**
+     * Crossfade from this clip into `next`, which must start where this one stops on the same
+     * playlist. For clips that overlap, such as one on top over the middle of another, crossfade
+     * the segments either side of the edit with {@link CompiledClip.crossfade}. `align` puts the fade across the edit (`center`, the default), before it or
+     * after it. Calling again changes the length. Each clip's source must reach past the edit by
+     * the part of the fade on the other side; LUNA does not check (fact 117).
+     *
+     * @example
+     * await left.crossfade(right, Luna.EIGHTH_NOTE);
+     */
+    async crossfade(next, lengthTicks, options = {}) {
+      const [, stop] = this.bounds("crossfade");
+      if (next.playlistUid !== this.playlistUid) throw new UAError("out_of_range", "crossfade(): both clips must be on the same playlist", { path: this.path });
+      if (next.start.value !== stop) throw new UAError("out_of_range", "crossfade(): the next clip must start where this one stops", { path: this.path });
+      next.requireAudio("crossfade");
+      const length = requireTick(lengthTicks, "lengthTicks");
+      if (length <= 0) throw new UAError("out_of_range", "crossfade(): lengthTicks must be positive", { path: this.path });
+      const align = options.align ?? "center";
+      const [startOffset, stopOffset] = align === "before" ? [-length, 0] : align === "after" ? [0, length] : [-Math.floor(length / 2), length - Math.floor(length / 2)];
+      return this.setFade({ fade_type: "cross_fade", contributor_clip_uid: next.id, start_offset: startOffset, stop_offset: stopOffset, trim_to_edge: false }, options.shape, "crossfade");
+    }
+    /**
+     * Remove the clip's plain fade-in. Resolves at once when there is none.
+     *
+     * @example
+     * await clip.removeFadeIn();
+     */
+    async removeFadeIn() {
+      const [start] = this.bounds("removeFadeIn");
+      const row = (await this.fadeRows()).find((f) => f.type === "fade_in" && !f.contributor);
+      if (row) await this.deleteFadeRange(start + row.startOffset, start + row.stopOffset, [{ clip: this, uid: row.uid }]);
+    }
+    /**
+     * Remove the clip's plain fade-out. Resolves at once when there is none.
+     *
+     * @example
+     * await clip.removeFadeOut();
+     */
+    async removeFadeOut() {
+      const [, stop] = this.bounds("removeFadeOut");
+      const row = (await this.fadeRows()).find((f) => f.type === "fade_out" && !f.contributor);
+      if (row) await this.deleteFadeRange(stop + row.startOffset, stop + row.stopOffset, [{ clip: this, uid: row.uid }]);
+    }
+    /**
+     * Remove the crossfade from this clip into `next`, both halves. Resolves at once when there
+     * is none.
+     *
+     * @example
+     * await left.removeCrossfade(right);
+     */
+    async removeCrossfade(next) {
+      const [, stop] = this.bounds("removeCrossfade");
+      const row = (await this.fadeRows()).find((f) => f.type === "fade_out" && f.contributor === next.id);
+      const other = (await next.fadeRows()).find((f) => f.type === "fade_in" && f.contributor === this.id);
+      if (!row && !other) return;
+      const offsets = [row, other].filter((f) => f !== void 0);
+      const from = Math.min(stop - 1, ...offsets.map((f) => stop + f.startOffset));
+      const to = Math.max(stop + 1, ...offsets.map((f) => stop + f.stopOffset));
+      await this.deleteFadeRange(from, to, [...row ? [{ clip: this, uid: row.uid }] : [], ...other ? [{ clip: next, uid: other.uid }] : []]);
+    }
     /** Add raw MIDI events to this (MIDI) clip in one undo step. */
     addMidi(events) {
       const origin = this.midiSourceStart.value ?? 0;
@@ -6064,9 +7176,413 @@ var Luna = (() => {
     sendToBack() {
       return this.sessionPost("send_to_back", { uid: this.id });
     }
+    get playlistPath() {
+      return this.path.slice(0, this.path.indexOf("/clips/"));
+    }
+    get context() {
+      this.contextView ??= new Context(this.client, `/sessions/${this.sessionUid}/contexts/main`, this.sessionUid);
+      return this.contextView;
+    }
+    contextPost(command, payload) {
+      if (this.disposed) return Promise.reject(new Disposed("Clip", this.path));
+      return this.wire.post(`/sessions/${this.sessionUid}/contexts/main/commands/${command}`, { session_uid: this.sessionUid, ...payload });
+    }
+    /** Commands that select what they act on move the user's selection; put it back after. */
+    async keepingSelection(fn) {
+      const context = this.context;
+      await context.refreshSelection().catch(() => {
+      });
+      const saved = context.snapshot();
+      try {
+        return await fn();
+      } finally {
+        await context.restore(saved).catch(() => {
+        });
+      }
+    }
+    bounds(what) {
+      this.assertLive();
+      const start = this.start.value;
+      const stop = this.stop.value;
+      if (start === void 0 || stop === void 0) throw new UAError("unavailable", `${what}(): the clip's bounds are not loaded yet`, { path: this.path });
+      return [start, stop];
+    }
+    siblingList() {
+      if (!this.siblings) throw new UAError("unavailable", "this clip was not reached through a playlist", { path: this.path });
+      return this.siblings();
+    }
+    /** Settle options that re-read this clip itself, for edits that change only its properties. */
+    refreshingOptions() {
+      return { ...this.settleOptions(), refresh: () => this.client.store.load(this.path, { children: false, commands: false, flatvalue: true }) };
+    }
+    fadeLength(lengthTicks, what) {
+      const length = requireTick(lengthTicks, "lengthTicks");
+      const clipLength = this.length ?? 0;
+      if (length <= 0 || length > clipLength) throw new UAError("out_of_range", `${what}(): lengthTicks must be positive and at most the clip's length`, { path: this.path });
+      return length;
+    }
+    /**
+     * One `set_fade` (fact 117). LUNA applies `fade_shape` only to a fade it creates, so a shape
+     * asked of a fade that already existed goes through `change_fade_curvature` as well.
+     */
+    async setFade(fade, shape, what) {
+      requireFadeShape(shape, `${what}()`);
+      this.requireAudio(what);
+      const reply = await this.contextPost("set_fade", {
+        ...shape ? { fade_shape: shape } : {},
+        clips: [{ playlist_uid: this.playlistUid, clip_uid: this.id, fade_reference_edge: "none", ...fade }]
+      });
+      const changed = (reply?.edit_results?.changed?.fades ?? []).map((f) => f.fade_uid).filter((u) => typeof u === "string");
+      if (shape && changed.length) await this.contextPost("change_fade_curvature", { fades: changed, fade_shape: shape });
+    }
+    /**
+     * LUNA fades audio clips only, and answers a fade on any other with success and no change
+     * (fact 117), so refuse it here. A clip whose type has not loaded is let through.
+     *
+     * @internal
+     */
+    requireAudio(what) {
+      const type = this.clipType.value;
+      if (type !== void 0 && type !== "audio") throw new UAError("unavailable", `${what}(): LUNA fades audio clips only; this one is ${type}`, { path: this.path });
+    }
+    /** The clip's stored fade rows, read fresh. */
+    /** @internal */
+    async fadeRows() {
+      const folder = `${this.path}/fades`;
+      await this.client.store.load(folder, { levels: 2, commands: false, flatvalue: true });
+      return (this.client.store.children(folder).value ?? []).map((uid) => {
+        const cell = (name) => this.client.store.cell(`${folder}/${uid}`, name).value;
+        return {
+          uid,
+          type: String(cell("fade_type") ?? ""),
+          contributor: cell("contributor_clip_uid") ?? void 0,
+          startOffset: Number(cell("start_offset") ?? 0),
+          stopOffset: Number(cell("stop_offset") ?? 0)
+        };
+      });
+    }
+    /** `delete_fades` takes every fade lying wholly inside a range; aim it at one fade's range. */
+    async deleteFadeRange(start, stop, rows) {
+      await this.contextPost("delete_fades", { playlist_uid: [this.playlistUid], start, stop });
+      const gone = () => rows.every(({ clip, uid }) => !(this.client.store.children(`${clip.path}/fades`).value ?? []).includes(uid));
+      await settle(gone, "remove fade", {
+        ...this.settleOptions(),
+        refresh: async () => {
+          for (const { clip } of rows) await this.client.store.load(`${clip.path}/fades`, { levels: 2, commands: false, flatvalue: true });
+        }
+      });
+    }
     release() {
       this.midiClip?.dispose();
       this.midiClip = void 0;
+    }
+  };
+
+  // src/model/compiled-clip.ts
+  var CompiledClip = class extends Node {
+    /** @internal */
+    constructor(client, path, siblings) {
+      super(client, path);
+      this.siblings = siblings;
+      this.clipUid = this.prop("clip_uid");
+      this.name = this.prop("name");
+      this.start = this.prop("start");
+      this.stop = this.prop("stop");
+      this.sourceStart = this.prop("source_start");
+      this.sourceStop = this.prop("source_stop");
+      const fullStart = this.prop("full_start");
+      const fullStop = this.prop("full_stop");
+      this.fullStart = derived([fullStart, this.start], () => fullStart.value ?? this.start.value);
+      this.fullStop = derived([fullStop, this.stop], () => fullStop.value ?? this.stop.value);
+      this.reportsFades = derived([fullStart], () => fullStart.value !== void 0 && fullStart.value !== null, { distinct: true });
+      this.renderSourceUid = this.prop("render_source_uid");
+      this.renderSourceStart = this.prop("render_source_start");
+      this.renderSourceStop = this.prop("render_source_stop");
+      this.needsRender = this.prop("needs_render");
+      this.fadeIn = this.fade("fade_in");
+      this.fadeOut = this.fade("fade_out");
+    }
+    siblings;
+    /** The clip this segment is cut from; look it up with `playlist.clips.byId`. */
+    clipUid;
+    name;
+    /** Where this segment starts playing, ticks. */
+    start;
+    /** Where this segment stops playing, ticks. */
+    stop;
+    /** Source offset at `start`, nanoseconds. */
+    sourceStart;
+    /** Source offset at `stop`, nanoseconds. */
+    sourceStop;
+    /**
+     * `start` moved earlier by an incoming crossfade, where this segment's audio already sounds
+     * under the one before it. Equal to `start` without one, and on a LUNA that does not report
+     * fades.
+     */
+    fullStart;
+    /** `stop` moved later by an outgoing crossfade. Equal to `stop` without one. */
+    fullStop;
+    fadeIn;
+    fadeOut;
+    /**
+     * Whether this LUNA reports fades on compiled clips. When false, `fadeIn` and `fadeOut` are
+     * always `undefined` because LUNA does not say, not because there are none; draw no fades
+     * and offer no fade editing.
+     */
+    reportsFades;
+    /**
+     * The rendering this segment plays when its clip is time-stretched: LUNA renders each
+     * compiled piece of a clip on its own, so a clip split by one on top has a render per piece
+     * and its own `renderSourceUid` names only one of them (fact 116). `null` when this segment
+     * is not rendered; `undefined` on a LUNA that does not report it.
+     */
+    renderSourceUid;
+    /** This segment's range in {@link renderSourceUid}, nanoseconds; `null` without a render. */
+    renderSourceStart;
+    renderSourceStop;
+    /**
+     * Whether this segment plays a rendering: time-stretched, with clip effects, or at another
+     * sample rate than the engine's. While LUNA makes one, `renderSourceUid` is `null` and this
+     * stays true, so the original file is not what plays (fact 116). `undefined` on a LUNA that
+     * does not report it.
+     */
+    needsRender;
+    /**
+     * Every field at once, as a frozen plain object, so a view draws one consistent state
+     * rather than reading props across a push.
+     *
+     * @example
+     * lane.compiledClips.onChange(() => draw(lane.compiledClips.inOrder().map((c) => c.snapshot())));
+     */
+    snapshot() {
+      return Object.freeze({
+        id: this.id,
+        clipUid: this.clipUid.value,
+        name: this.name.value,
+        start: this.start.value,
+        stop: this.stop.value,
+        sourceStart: this.sourceStart.value,
+        sourceStop: this.sourceStop.value,
+        fullStart: this.fullStart.value,
+        fullStop: this.fullStop.value,
+        fadeIn: this.fadeIn.value,
+        fadeOut: this.fadeOut.value,
+        reportsFades: this.reportsFades.value ?? false,
+        renderSourceUid: this.renderSourceUid.value,
+        renderSourceStart: this.renderSourceStart.value ?? void 0,
+        renderSourceStop: this.renderSourceStop.value ?? void 0,
+        needsRender: this.needsRender.value
+      });
+    }
+    /**
+     * Move what shows of this clip so it starts at `toTick`, as dragging it in LUNA does: LUNA's
+     * `move_clips` over this segment's own range (fact 119). One undo step; resolves to the
+     * segment at its new place. Where the clip runs on under another clip:
+     *
+     * - if it shows again further along (or before), LUNA **splits** it at this segment's edge:
+     *   the segment moves as a new clip, and the rest stays where it was;
+     * - if the rest is hidden, LUNA **trims** it to this segment's edge and moves it.
+     *
+     * A clip lying wholly on top of this one is not moved, unlike {@link Clip.move}, which moves
+     * everything inside the clip's span. The user's selection is put back afterwards.
+     *
+     * @example
+     * const moved = await seg.move(seg.start.value! + Luna.WHOLE_NOTE);
+     * const copy = await seg.move(seg.stop.value!, { copy: true });
+     */
+    async move(toTick, options = {}) {
+      if (this.disposed) throw new UAError("disposed", "the segment is gone", { path: this.path });
+      const start = this.start.value;
+      const stop = this.stop.value;
+      if (start === void 0 || stop === void 0) throw new UAError("unavailable", "move(): the segment's bounds are not loaded yet", { path: this.path });
+      requireTick(toTick, "toTick");
+      if (toTick < 0) throw new UAError("out_of_range", "move(): toTick must not be negative", { path: this.path });
+      const siblings = this.siblings?.();
+      if (!siblings) throw new UAError("unavailable", "this segment was not reached through a playlist", { path: this.path });
+      const [, , sessionUid, , playlistUid] = this.path.split("/");
+      const context = new Context(this.client, `/sessions/${sessionUid}/contexts/main`, sessionUid);
+      await context.refreshSelection().catch(() => {
+      });
+      const saved = context.snapshot();
+      try {
+        await this.wire.post(`/sessions/${sessionUid}/contexts/main/commands/move_clips`, {
+          session_uid: sessionUid,
+          context_type: "main",
+          playlist_uid: [playlistUid],
+          start,
+          stop,
+          location: toTick,
+          ...options.copy ? { copy: true } : {}
+        });
+      } finally {
+        await context.restore(saved).catch(() => {
+        });
+      }
+      const length = stop - start;
+      const landed = () => siblings.items.find((c) => c.start.value === toTick && c.stop.value === toTick + length);
+      await settle(() => landed() !== void 0, options.copy ? "copy segment" : "move segment", {
+        path: this.path,
+        refresh: () => siblings.reload(),
+        flush: () => this.client.store.scheduler.flush()
+      });
+      return landed();
+    }
+    /**
+     * Crossfade from this segment into `next`, the segment that starts where this one stops on
+     * the same playlist: butted clips, or overlapping ones where a clip on top begins or ends
+     * over another (fact 117). `align` puts the fade across the edit (`center`, the default),
+     * before it or after it; calling again changes the length. One undo step, or two when
+     * `shape` changes an existing crossfade's shape. Resolves once LUNA shows it. Each clip's
+     * source must reach past the edit by the part of the fade on the other side; LUNA does not
+     * check. Audio clips only.
+     *
+     * @example
+     * const [a, b] = lane.compiledClips.inOrder();
+     * await a.crossfade(b, Luna.EIGHTH_NOTE);
+     */
+    async crossfade(next, lengthTicks, options = {}) {
+      const edge = this.edgeWith(next, "crossfade");
+      const length = requireTick(lengthTicks, "lengthTicks");
+      if (length <= 0) throw new UAError("out_of_range", "crossfade(): lengthTicks must be positive", { path: this.path });
+      const shape = options.shape;
+      if (shape !== void 0 && !["linear", "equal_power", "log"].includes(shape)) throw new UAError("out_of_range", "crossfade(): shape must be one of linear, equal_power, log", { path: this.path });
+      const align = options.align ?? "center";
+      const [startOffset, stopOffset] = align === "before" ? [-length, 0] : align === "after" ? [0, length] : [-Math.floor(length / 2), length - Math.floor(length / 2)];
+      const [, , sessionUid, , playlistUid] = this.path.split("/");
+      const commands = `/sessions/${sessionUid}/contexts/main/commands`;
+      const reply = await this.wire.post(`${commands}/set_fade`, {
+        session_uid: sessionUid,
+        ...shape ? { fade_shape: shape } : {},
+        clips: [{ playlist_uid: playlistUid, clip_uid: this.clipUid.value, contributor_clip_uid: next.clipUid.value, fade_type: "cross_fade", start_offset: startOffset, stop_offset: stopOffset, trim_to_edge: false, fade_reference_edge: "none" }]
+      });
+      const changed = (reply?.edit_results?.changed?.fades ?? []).map((f) => f.fade_uid).filter((u) => typeof u === "string");
+      if (shape && changed.length) await this.wire.post(`${commands}/change_fade_curvature`, { session_uid: sessionUid, fades: changed, fade_shape: shape });
+      const out = () => this.fadeOut.value;
+      await settle(() => out()?.contributorClipUid === next.clipUid.value && out().start === edge + startOffset && out().stop === edge + stopOffset, "crossfade", this.settleOptions());
+    }
+    /**
+     * Remove the crossfade between this segment and `next`, both halves. Resolves at once when
+     * there is none.
+     *
+     * @example
+     * await a.removeCrossfade(b);
+     */
+    async removeCrossfade(next) {
+      const edge = this.edgeWith(next, "removeCrossfade");
+      const out = this.fadeOut.value;
+      const into = next.fadeIn.value;
+      const halves = [out, into].filter((f) => f !== void 0 && f.crossfade);
+      if (!halves.length) return;
+      const [, , sessionUid, , playlistUid] = this.path.split("/");
+      await this.wire.post(`/sessions/${sessionUid}/contexts/main/commands/delete_fades`, {
+        session_uid: sessionUid,
+        playlist_uid: [playlistUid],
+        start: Math.min(edge - 1, ...halves.map((f) => f.start)),
+        stop: Math.max(edge + 1, ...halves.map((f) => f.stop))
+      });
+      await settle(() => !this.fadeOut.value?.crossfade && !next.fadeIn.value?.crossfade, "remove crossfade", this.settleOptions());
+    }
+    /** The edit between this segment and `next`, checked: adjoining, same lane, both audio. */
+    edgeWith(next, what) {
+      if (this.disposed || next.disposed) throw new UAError("disposed", `${what}(): a segment is gone`, { path: this.path });
+      const stop = this.stop.value;
+      const lane = (path) => path.slice(0, path.indexOf("/compiled_clips/"));
+      if (lane(next.path) !== lane(this.path)) throw new UAError("out_of_range", `${what}(): both segments must be on the same playlist`, { path: this.path });
+      if (stop === void 0 || next.start.value !== stop) throw new UAError("out_of_range", `${what}(): the next segment must start where this one stops`, { path: this.path });
+      if (!this.reportsFades.value) throw new UAError("unavailable", `${what}(): this LUNA does not report fades on compiled clips`, { path: this.path });
+      for (const seg of [this, next]) {
+        const type = this.client.store.cell(`${lane(this.path)}/clips/${seg.clipUid.value}`, "clip_type").value;
+        if (type !== void 0 && type !== "audio" && type !== 0) throw new UAError("unavailable", `${what}(): LUNA fades audio clips only`, { path: seg.path });
+      }
+      return stop;
+    }
+    settleOptions() {
+      const siblings = this.siblings?.();
+      return {
+        path: this.path,
+        disposed: () => this.disposed,
+        ...siblings ? { refresh: () => siblings.reload() } : {},
+        flush: () => this.client.store.scheduler.flush()
+      };
+    }
+    /** The seven flat `<prefix>_*` properties as one object, `undefined` when LUNA sends null. */
+    fade(prefix) {
+      const uid = this.prop(`${prefix}_uid`);
+      const start = this.prop(`${prefix}_start`);
+      const stop = this.prop(`${prefix}_stop`);
+      const shape = this.prop(`${prefix}_shape`);
+      const curvature = this.prop(`${prefix}_curvature`);
+      const crossfade = this.prop(`${prefix}_crossfade`);
+      const contributor = this.prop(`${prefix}_contributor_clip_uid`);
+      return derived(
+        [uid, start, stop, shape, curvature, crossfade, contributor],
+        () => {
+          if (typeof uid.value !== "string" || typeof start.value !== "number" || typeof stop.value !== "number") return void 0;
+          return Object.freeze({
+            uid: uid.value,
+            start: start.value,
+            stop: stop.value,
+            shape: shape.value ?? "log",
+            curvature: curvature.value ?? 0,
+            crossfade: crossfade.value === true,
+            contributorClipUid: contributor.value ?? void 0
+          });
+        },
+        { distinct: true }
+      );
+    }
+  };
+  var CompiledClips = class extends Collection {
+    enabling;
+    enable;
+    /** @internal */
+    constructor(client, path, enable) {
+      let self;
+      super(client, path, (p) => new CompiledClip(client, p, () => self), { levels: 2, commands: false, flatvalue: true });
+      self = this;
+      this.enable = enable;
+    }
+    /** Turn on publishing (once), then fetch the members. */
+    load() {
+      return this.enabled().then(() => super.load());
+    }
+    async reload() {
+      await this.enabled();
+      await super.reload();
+    }
+    watch(options = {}) {
+      const ready = this.enabled();
+      const w = super.watch(options);
+      return { ready: Promise.all([ready, w.ready]).then(() => void 0), release: w.release };
+    }
+    /**
+     * Segments by timeline position, earliest first.
+     *
+     * @example
+     * const first = lane.compiledClips.inOrder()[0];
+     */
+    inOrder() {
+      return [...this.items].sort((a, b) => (a.start.value ?? 0) - (b.start.value ?? 0));
+    }
+    /**
+     * The segments cut from one clip, earliest first: none when it is fully covered, two or
+     * more when a clip on a higher layer splits it.
+     *
+     * @example
+     * const shown = lane.compiledClips.ofClip(clip.id).length > 0;
+     */
+    ofClip(clipUid) {
+      return this.inOrder().filter((c) => c.clipUid.value === clipUid);
+    }
+    enabled() {
+      this.enabling ??= this.enable().then(
+        () => void 0,
+        (err) => {
+          this.enabling = void 0;
+          throw err;
+        }
+      );
+      return this.enabling;
     }
   };
 
@@ -6080,11 +7596,16 @@ var Luna = (() => {
     stemFormat;
     frozen;
     clips;
+    /**
+     * What the playlist actually plays: the clips with overlaps resolved by layer, and their
+     * fades (fact 116). Draw from these rather than from `clips`.
+     */
+    compiledClips;
     sessionUid;
-    batching;
+    transactionMode;
     contextView;
     /** @internal */
-    constructor(client, path, sessionUid, batching) {
+    constructor(client, path, sessionUid, transactionMode) {
       super(client, path);
       this.uid = this.prop("uid");
       this.name = this.prop("name");
@@ -6092,9 +7613,10 @@ var Luna = (() => {
       this.version = this.prop("version");
       this.stemFormat = this.prop("stem_format");
       this.frozen = this.prop("frozen");
-      this.clips = new Collection(client, `${path}/clips`, (p) => new Clip(client, p, sessionUid, batching), { levels: 2, commands: false, flatvalue: true });
+      this.clips = new Collection(client, `${path}/clips`, (p) => new Clip(client, p, sessionUid, transactionMode, () => this.clips), { levels: 2, commands: false, flatvalue: true });
+      this.compiledClips = new CompiledClips(client, `${path}/compiled_clips`, () => this.property("enable_compiled_clips").set(true));
       this.sessionUid = sessionUid;
-      this.batching = batching;
+      this.transactionMode = transactionMode;
     }
     /** The session's `main` edit context, which `create_note` both reads and overwrites. */
     get context() {
@@ -6103,23 +7625,50 @@ var Luna = (() => {
     }
     /**
      * Write notes onto this lane, making the MIDI clip to hold them if there is none there
-     * (LUNA's `create_note`). One undo entry for the whole batch. Ticks are absolute.
+     * (LUNA's `create_note`). One undo entry for the whole batch. Ticks are absolute, and every
+     * note is on channel 0.
+     *
+     * A note goes into the clip its note-on falls in. When no clip on the lane is under the
+     * notes, LUNA makes one MIDI clip spanning the whole bars they cover, named after the track,
+     * and kept clear of the clips either side (fact 111). Notes whose note-ons fall in two
+     * different clips land in both, and the call then rejects with `no_effect`, since it resolves
+     * to a single clip: write to one clip per call.
+     *
+     * The returned `notes` are read back from the clip, so their ticks are clip-relative
+     * (fact 41): subtract `clip.start.value` from what you passed in to match them up.
      *
      * LUNA answers `null` and instead *selects* what it created, so the new row ids are read
-     * back out of the selection — which means this cannot run inside a `transaction()` batch,
-     * where LUNA holds selection writes until the commit. The user's selection is restored
-     * afterwards.
+     * back out of the selection, and the notes out of the clip. The user's selection is
+     * restored afterwards.
+     *
+     * Inside a continuous `session.transaction()` each call replaces the notes the previous
+     * call wrote, which is how an Add On previews a part it regenerates as the user adjusts
+     * it: one undo step, holding the last take (fact 115). A batch transaction holds the clip's
+     * notes back until its commit, so this refuses inside one; write into an existing clip
+     * there with {@link Clip.addNotes}.
      *
      * @example
      * const bar = session.musical.timeline.tickAt({ bar: 1 });
      * const { clip, notes } = await lane.createNotes(
      *   [60, 64, 67].map((pitch, i) => ({ pitch, startTick: bar + i * Luna.TICKS_PER_BEAT, stopTick: bar + (i + 1) * Luna.TICKS_PER_BEAT })),
      * );
+     *
+     * @example
+     * // Try three roots as one gesture: LUNA keeps only the last take, and one undo removes it.
+     * const bar = session.musical.timeline.tickAt({ bar: 2 });
+     * const take = (pitch) => [{ pitch, startTick: bar, stopTick: bar + Luna.TICKS_PER_BEAT }];
+     * await session.transaction('Pick a root', async () => {
+     *   for (const pitch of [60, 62, 64]) await lane.createNotes(take(pitch));
+     * }, { continuous: true });
      */
     async createNotes(notes) {
       if (!notes.length) throw new UAError("out_of_range", "createNotes(): give at least one note", { path: this.path });
-      if (this.batching?.()) {
-        throw new UAError("busy", "createNotes() reads the new row ids back out of LUNA's selection, which a transaction() batch holds until its commit: call it outside the batch", { path: this.path });
+      if (this.transactionMode?.() === "batch") {
+        throw new UAError(
+          "busy",
+          "createNotes() reads the notes it made back out of the clip, which a batch transaction holds until its commit: write into an existing clip with clip.addNotes() inside the batch, or use a continuous transaction",
+          { path: this.path }
+        );
       }
       const body = notes.map((n) => {
         const start = requireTick(n.startTick, "startTick");
@@ -6179,8 +7728,81 @@ var Luna = (() => {
       }
       return { clip, notes: found };
     }
+    /**
+     * Cut every clip on this lane at each tick (LUNA's `separate_clips`). One undo step.
+     *
+     * @example
+     * await lane.split([bar(5), bar(9)]);
+     */
+    async split(at) {
+      const ticks = (typeof at === "number" ? [at] : [...at]).map((t) => requireTick(t, "at"));
+      if (!ticks.length) throw new UAError("out_of_range", "split(): give at least one tick", { path: this.path });
+      await this.contextPost("separate_clips", { location: ticks, playlist_uid: [this.id] });
+    }
+    /**
+     * Join clips that were split apart and still play on from each other in their source
+     * (LUNA's `heal_separation`). It acts on clips starting after `startTick` up to and
+     * **including** `stopTick`, and on the clip running into `startTick`, so a clip that begins
+     * exactly at `stopTick` and continues the same audio is joined too (fact 117). One undo
+     * step; the user's selection is put back afterwards.
+     *
+     * @example
+     * await lane.heal(clip.start.value!, clip.stop.value! - 1);
+     */
+    async heal(startTick, stopTick) {
+      requireTick(startTick, "startTick");
+      requireTick(stopTick, "stopTick");
+      if (stopTick <= startTick) throw new UAError("out_of_range", "heal(): stopTick must be after startTick", { path: this.path });
+      const context = this.context;
+      await context.refreshSelection().catch(() => {
+      });
+      const saved = context.snapshot();
+      try {
+        await context.select({ startTick, stopTick, playlistUids: [this.id] });
+        await this.contextPost("heal_separation", {});
+      } finally {
+        await context.restore(saved).catch(() => {
+        });
+      }
+    }
+    /**
+     * Fade in and out every clip on the lane between two ticks, `lengthNs` long, the way
+     * LUNA's Batch Fades does: butted clips get a crossfade. LUNA picks the lane through its
+     * track, so this works only on the track's active playlist (fact 117). One undo step.
+     *
+     * @example
+     * await lane.addFades({ startTick: 0, stopTick: session.transport.maxTick.value!, lengthNs: 10_000_000 });
+     */
+    async addFades(options) {
+      requireTick(options.startTick, "startTick");
+      requireTick(options.stopTick, "stopTick");
+      if (!(options.lengthNs > 0)) throw new UAError("out_of_range", "addFades(): lengthNs must be positive", { path: this.path });
+      const shape = requireFadeShape(options.shape, "addFades()");
+      const track = this.trackUid.value;
+      if (!track || this.client.store.cell(`/sessions/${this.sessionUid}/tracks/${track}`, "playlist_uid").value !== this.id) {
+        throw new UAError("unavailable", "addFades(): LUNA fades only a track's active playlist", { path: this.path });
+      }
+      await this.contextPost("batch_fades", { track_uid: [track], start: options.startTick, stop: options.stopTick, length: Math.round(options.lengthNs), ...shape ? { fade_shape: shape } : {} });
+    }
+    /**
+     * Remove every fade, crossfades included, that lies wholly between two ticks on this lane
+     * (LUNA's `delete_fades`). One undo step.
+     *
+     * @example
+     * await lane.deleteFades(0, session.transport.maxTick.value!);
+     */
+    async deleteFades(startTick, stopTick) {
+      requireTick(startTick, "startTick");
+      requireTick(stopTick, "stopTick");
+      await this.contextPost("delete_fades", { playlist_uid: [this.id], start: startTick, stop: stopTick });
+    }
+    contextPost(command, payload) {
+      if (this.disposed) return Promise.reject(new UAError("disposed", "the playlist is gone", { path: this.path }));
+      return this.wire.post(`/sessions/${this.sessionUid}/contexts/main/commands/${command}`, { session_uid: this.sessionUid, ...payload });
+    }
     release() {
       this.clips.dispose();
+      this.compiledClips.dispose();
     }
   };
 
@@ -6315,8 +7937,11 @@ var Luna = (() => {
       renderState: c.renderState.value
     };
   }
+  function lookup(sources, uid) {
+    return Array.isArray(sources) ? sources.find((s) => s.id === uid) : sources.byId(uid);
+  }
   function clipAudio(clip, sources) {
-    const find = (uid) => Array.isArray(sources) ? sources.find((s) => s.id === uid) : sources.byId(uid);
+    const find = (uid) => lookup(sources, uid);
     const snap = snapshotOf(clip);
     if (snap.renderState === "current" && snap.renderSourceUid) {
       const render = find(snap.renderSourceUid);
@@ -6328,6 +7953,38 @@ var Luna = (() => {
     const source = find(snap.sourceUid);
     if (!source) return void 0;
     return Object.freeze({ source, startNs: snap.sourceStartNs, stopNs: snap.sourceStopNs, stretched: false });
+  }
+  function valueOf(v) {
+    return typeof v === "object" && v !== null && "value" in v ? v.value : v;
+  }
+  function compiledClipAudio(timeline, segment, clip, sources) {
+    const start = valueOf(segment.start);
+    const stop = valueOf(segment.stop);
+    if (start === void 0 || stop === void 0) return void 0;
+    const render = valueOf(segment.renderSourceUid);
+    if (typeof render === "string" && render) {
+      const source = lookup(sources, render);
+      const from = valueOf(segment.renderSourceStart);
+      const to = valueOf(segment.renderSourceStop);
+      const length = source?.length.value;
+      if (!source || typeof from !== "number" || typeof to !== "number") return void 0;
+      return Object.freeze({ source, startNs: Math.max(0, from), stopNs: length === void 0 ? to : Math.min(length, to), stretched: true });
+    }
+    if (valueOf(segment.needsRender) === true) return void 0;
+    const whole = clipAudio(clip, sources);
+    const stretchedClip = snapshotOf(clip).renderState === "current";
+    if (render === null && stretchedClip) return void 0;
+    if (!whole) return void 0;
+    if (whole.stretched) {
+      const clipStart = "startTicks" in clip ? clip.startTicks : clip.start.value;
+      if (clipStart === void 0 || start !== clipStart) return void 0;
+      const at = (tick) => Math.max(0, (timeline.seconds(tick) - timeline.seconds(clipStart)) * 1e9);
+      return Object.freeze({ source: whole.source, startNs: at(start), stopNs: Math.min(whole.stopNs, at(stop)), stretched: true });
+    }
+    const startNs = valueOf(segment.sourceStart);
+    const stopNs = valueOf(segment.sourceStop);
+    if (startNs === void 0 || stopNs === void 0) return void 0;
+    return Object.freeze({ source: whole.source, startNs, stopNs, stretched: false });
   }
   function audioNsAtTick(timeline, clip, audio, tick) {
     const startTicks = "startTicks" in clip ? clip.startTicks : clip.start.value;
@@ -6635,17 +8292,214 @@ var Luna = (() => {
     }
   };
 
+  // src/model/preferences.ts
+  function sameJson(a, b) {
+    if (a === b) return true;
+    if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    if (Array.isArray(a)) {
+      const other = b;
+      return a.length === other.length && a.every((v, i) => sameJson(v, other[i]));
+    }
+    const ka = Object.keys(a);
+    const kb = Object.keys(b);
+    return ka.length === kb.length && ka.every((k) => Object.hasOwn(b, k) && sameJson(a[k], b[k]));
+  }
+  function requireName(value, what) {
+    if (typeof value !== "string" || value === "" || value.includes("/")) {
+      throw new UAError("invalid_value", `${what} must be a non-empty string without '/'`);
+    }
+    return value;
+  }
+  var PreferenceContext = class extends Node {
+    /** @internal */
+    constructor(client, path, owner) {
+      super(client, path);
+      this.owner = owner;
+      this.preferences = this.childNames();
+    }
+    owner;
+    /** Names of this context's preferences. */
+    preferences;
+    /** The context's reverse-DNS name. */
+    get name() {
+      return this.id;
+    }
+    /**
+     * Fetch this context's preferences and their values. Call once before reading
+     * {@link value}; pushes keep them current while the session is watched.
+     *
+     * @example await prefs.load();
+     */
+    load() {
+      return super.load({ levels: 2, commands: false, flatvalue: true });
+    }
+    /**
+     * The value of one property as a live prop, `undefined` while it does not exist.
+     * `set` on it is a non-undoable write of an existing property.
+     *
+     * @example
+     * const timeline = prefs.value<{ height: number }>('layout', 'timeline');
+     * timeline.onChange(() => console.log(timeline.value?.height));
+     * await timeline.set({ height: 240 });
+     */
+    value(preference, property) {
+      const path = `${this.path}/${requireName(preference, "preference")}`;
+      const cell = this.client.store.cell(path, requireName(property, "property"));
+      return {
+        get value() {
+          return cell.value;
+        },
+        onChange: (listener) => cell.onChange(listener),
+        set: (value) => this.set(preference, property, value)
+      };
+    }
+    /**
+     * Add a property with an initial value (default `null`) and resolve once it is visible.
+     * A property that already exists keeps its value.
+     *
+     * @example await prefs.add('layout', 'timeline', { height: 200 });
+     */
+    add(preference, property, value = null, options = {}) {
+      return this.owner.add(this.name, preference, property, value, options);
+    }
+    /**
+     * Set an existing property and resolve once the new value is visible. Rejects with
+     * `uasrv.invalid_property` if the property was never added.
+     *
+     * @example await prefs.set('layout', 'timeline', { height: 320 }, { undoable: true });
+     */
+    set(preference, property, value, options = {}) {
+      return this.owner.set(this.name, preference, property, value, options);
+    }
+    /**
+     * Remove one property, or a whole preference when `property` is left out.
+     *
+     * @example
+     * await prefs.remove('layout', 'timeline');
+     * await prefs.remove('layout');
+     */
+    remove(preference, property, options = {}) {
+      return this.owner.remove(this.name, preference, property, options);
+    }
+    /**
+     * Remove every preference in this context.
+     *
+     * @example await prefs.clear();
+     */
+    clear(options = {}) {
+      return this.owner.remove(this.name, void 0, void 0, options);
+    }
+  };
+  var SessionPreferences = class extends Node {
+    /** Names of the contexts that hold at least one property. */
+    contexts;
+    byName = /* @__PURE__ */ new Map();
+    /** @internal */
+    constructor(client, sessionPath) {
+      super(client, `${sessionPath}/preferences`);
+      this.contexts = this.childNames();
+    }
+    /**
+     * Fetch the context names.
+     *
+     * @example await session.preferences.load();
+     */
+    load() {
+      return super.load({ levels: 1, commands: false, flatvalue: true });
+    }
+    /**
+     * One context's preferences. It need not exist yet: the first {@link PreferenceContext.add}
+     * creates it.
+     *
+     * @example const prefs = session.preferences.context('com.example.my-add-on');
+     */
+    context(name) {
+      requireName(name, "context");
+      let ctx = this.byName.get(name);
+      if (!ctx) {
+        ctx = new PreferenceContext(this.client, `${this.path}/${name}`, this);
+        this.byName.set(name, ctx);
+      }
+      return ctx;
+    }
+    /** @internal */
+    async add(context, preference, property, value, options) {
+      const body = this.body(context, preference, property, options);
+      await this.post("add_preference", { ...body, value });
+      await this.settleOn(context, preference, () => this.client.store.cell(`${this.path}/${context}/${preference}`, property).value !== void 0, "add preference");
+    }
+    /** @internal */
+    async set(context, preference, property, value, options) {
+      const body = this.body(context, preference, property, options);
+      await this.post("set_preference", { ...body, value });
+      await this.settleOn(context, preference, () => sameJson(this.client.store.cell(`${this.path}/${context}/${preference}`, property).value, value), "set preference");
+    }
+    /** @internal */
+    async remove(context, preference, property, options) {
+      requireName(context, "context");
+      if (preference !== void 0) requireName(preference, "preference");
+      if (property !== void 0) {
+        if (preference === void 0) throw new UAError("invalid_value", "remove: a property needs its preference");
+        requireName(property, "property");
+      }
+      await this.post("remove_preference", {
+        context,
+        ...preference !== void 0 ? { preference } : {},
+        ...property !== void 0 ? { property } : {},
+        undoable: options.undoable === true
+      });
+      const store = this.client.store;
+      const contextPath = `${this.path}/${context}`;
+      if (preference !== void 0 && property !== void 0) {
+        store.cell(`${contextPath}/${preference}`, property).update(void 0);
+        return;
+      }
+      const gone = preference === void 0 ? () => !(store.children(this.path).value ?? []).includes(context) : () => !(store.children(contextPath).value ?? []).includes(preference);
+      await this.settleOn(context, preference, gone, "remove preference");
+    }
+    body(context, preference, property, options) {
+      return {
+        context: requireName(context, "context"),
+        preference: requireName(preference, "preference"),
+        property: requireName(property, "property"),
+        undoable: options.undoable === true
+      };
+    }
+    /** Wait for the edit to show, re-reading the context while it has not. */
+    settleOn(context, preference, done, what) {
+      const store = this.client.store;
+      const contextPath = `${this.path}/${context}`;
+      return settle(done, what, {
+        path: preference !== void 0 ? `${contextPath}/${preference}` : contextPath,
+        refresh: async () => {
+          await store.load(this.path, { levels: 1, commands: false, flatvalue: true });
+          if (store.knowsNode(contextPath)) await store.load(contextPath, { levels: 2, commands: false, flatvalue: true });
+        },
+        flush: () => store.scheduler.flush()
+      });
+    }
+    release() {
+      for (const ctx of this.byName.values()) ctx.dispose();
+      this.byName.clear();
+    }
+  };
+
   // src/model/chords.ts
-  var CHORD_NAME = /^([A-G](?:#|b)?)([^/]*)(?:\/([A-G](?:#|b)?))?$/;
+  var CHORD_NAME = /^([A-Ga-g](?:#|b)?)([^/]*?)\s*(?:\/\s*([A-Ga-g](?:#|b)?))?$/;
+  var QUALITY_START = /^(?:maj|min|m|dim|aug|sus|add|[0-9+\-o°ø^Δ(])/i;
+  var noteName = (name) => name[0].toUpperCase() + name.slice(1);
   function normalizeChordName2(name) {
     return name.replace(/♭/g, "b").replace(/♯/g, "#");
   }
   function parseChord(name) {
     const match = CHORD_NAME.exec(normalizeChordName2(name.trim()));
     if (!match) return void 0;
-    return { root: match[1], type: match[2], bass: match[3] ?? null };
+    const lowercase = match[1][0] !== match[1][0].toUpperCase();
+    if (lowercase && match[2] !== "" && !QUALITY_START.test(match[2])) return void 0;
+    return { root: noteName(match[1]), type: match[2], bass: match[3] === void 0 ? null : noteName(match[3]) };
   }
-  function requireName(name, what) {
+  function requireName2(name, what) {
     if (typeof name !== "string" || name.trim() === "") throw new UAError("out_of_range", `${what} must be a non-empty chord name`);
     return name;
   }
@@ -6678,7 +8532,7 @@ var Luna = (() => {
     }
     /** @example await chord.rename('C/E'); */
     rename(name) {
-      const wanted = normalizeChordName2(requireName(name, "chord name"));
+      const wanted = normalizeChordName2(requireName2(name, "chord name"));
       return this.edit({ name }, () => this.name.value === wanted, "rename chord");
     }
     /**
@@ -6725,7 +8579,7 @@ var Luna = (() => {
     const ticks = /* @__PURE__ */ new Set();
     for (const c of chords) {
       requireTick(c.tick, "chord tick");
-      requireName(c.name, "chord name");
+      requireName2(c.name, "chord name");
       if (ticks.has(c.tick)) throw new UAError("out_of_range", `setChords(): two chords at tick ${c.tick}; the ruler holds one per tick`);
       ticks.add(c.tick);
     }
@@ -6746,6 +8600,8 @@ var Luna = (() => {
     showWithSession;
     /** The manifest's `manufacturer`, or `''` when it has none. */
     manufacturer;
+    /** The manifest's `description`, an array of strings already concatenated, or `''` when it has none. */
+    description;
     /** @internal */
     constructor(client, path) {
       super(client, path);
@@ -6756,6 +8612,7 @@ var Luna = (() => {
       this.floating = this.prop("floating");
       this.showWithSession = this.prop("show_with_session");
       this.manufacturer = this.prop("manufacturer");
+      this.description = this.prop("description");
     }
     /** Show it in LUNA by target: navigate to an `'app'`, open a `'window'` (toggling it like its
      *  menu item), show a `'browser'` in the secondary browser, or an `'editor'` in the Timeline's
@@ -6879,7 +8736,8 @@ var Luna = (() => {
     /**
      * LUNA's native folder dialog. Resolves to the chosen folders' **absolute paths**, or `[]`
      * if cancelled. A path route like {@link chooseFiles}: hand the paths to
-     * {@link listFiles} or the engine, not to `fetch`. Needs `/gui` ({@link Gui.available}) and a
+     * {@link listFiles} or the engine, not to `fetch`. Picking a folder lets {@link listFiles}
+     * read it and every folder inside it, from now on and after LUNA restarts. Needs `/gui` ({@link Gui.available}) and a
      * LUNA that has the dialog (fact 106); an older one rejects with `Luna.Unsupported`.
      *
      * @example
@@ -6899,18 +8757,58 @@ var Luna = (() => {
      * sort: case ignored, and numbers by value, so `take2` comes before `take10`. `path` must
      * be absolute.
      *
-     * Rejects with a `Luna.Error` whose `code` is `uasrv.filesystem_error` when nothing is at
-     * `path` or it cannot be read, and `uasrv.invalid_value` when `path` is relative or names
-     * a file. An older LUNA without the command rejects with `Luna.Unsupported`.
+     * LUNA lists only folders the user gave it: one picked with {@link chooseFolders} or
+     * dropped on an Add On (`Luna.onPathDrop()`), or a folder inside one. LUNA remembers
+     * them across restarts, at most 64 (the oldest are forgotten first), until the user
+     * clicks FORGET FOLDERS in Settings > Add Ons. They are LUNA-wide, not per Add On. A
+     * path is judged where it really is, so `..` or a link out of a granted folder is
+     * refused.
+     *
+     * Rejects with a `Luna.Error` whose `code` is `uasrv.not_permitted` when `path` is not in
+     * a granted folder (whether or not anything is there: ask with {@link chooseFolders}),
+     * `uasrv.filesystem_error` when nothing is at `path` or it cannot be read, and
+     * `uasrv.invalid_value` when `path` is relative or names a file. An older LUNA without
+     * the command rejects with `Luna.Unsupported`; an older LUNA lists any folder.
      *
      * @example
-     * for (const entry of await luna.gui.listFiles('/Users/me/Samples')) {
+     * const [folder] = await luna.gui.chooseFolders({ title: 'Choose a sample folder' });
+     * for (const entry of folder ? await luna.gui.listFiles(folder) : []) {
      *   if (!entry.isDirectory && entry.name.endsWith('.wav')) await session.importPath(entry.path);
      * }
      */
     async listFiles(path) {
       const reply = await this.post("list_files", { path }).catch(olderLuna("listFiles", "list_files"));
       return (reply?.files ?? []).map((f) => ({ name: f.name, path: f.path, isDirectory: f.is_directory }));
+    }
+    /**
+     * The URL your Add On's page loads a local audio or video file from, given its absolute
+     * `path` (from {@link chooseFiles}, `Luna.onPathDrop()`, or a path you saved, say in
+     * `session.preferences`). Set it as a `<video>` or `<audio>` `src`, or read the bytes with
+     * XMLHttpRequest (fact 114). This is how a page plays or reads a file it knows only by path.
+     *
+     * `addOnId` is your manifest's `id`: the file is served to that Add On's pages only. On
+     * macOS the URL is `ua-content://<your Add On>/<path>` and supports byte ranges, so media
+     * seeks without reading the whole file; on Windows it is a `file:///` URL, which media
+     * elements and XMLHttpRequest load but `fetch()` refuses. Ask again
+     * after every reload: LUNA forgets the files it served when it quits.
+     *
+     * Only real media is served. LUNA follows links and checks the file they lead to: it needs
+     * an audio or video extension (`mp4`, `m4v`, `mov`, `webm`, `ogv`, `wav`, `aif`, `aiff`,
+     * `mp3`, `m4a`, `flac`, `ogg`, `oga`, `opus`) and that format's signature in its first
+     * bytes. Rejects with a `Luna.Error` whose `code` is `uasrv.invalid_value` for a relative
+     * path, a folder, or a file that is not audio or video; `uasrv.filesystem_error` when
+     * nothing is at `path` (a session opened on another computer, a file moved) or it cannot
+     * be read; `uasrv.not_installed` when `addOnId` names no installed Add On with a local
+     * page. A LUNA without the command rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * const [path] = await luna.gui.chooseFiles({ filters: ['*.mov;*.mp4'] });
+     * if (path) video.src = await luna.gui.serveMediaFile('com.example.my-add-on', path);
+     */
+    async serveMediaFile(addOnId, path) {
+      const reply = await this.post("serve_media_file", { add_on_id: addOnId, path }).catch(olderLuna("serveMediaFile", "serve_media_file"));
+      if (typeof reply?.url !== "string") throw new UAError("uasrv.default_error", "serve_media_file: LUNA replied no url", { cmd: "post", path: "/gui/serve_media_file" });
+      return reply.url;
     }
     /**
      * LUNA's native save dialog. Resolves to the chosen absolute path, or `undefined` if
@@ -6995,6 +8893,820 @@ var Luna = (() => {
     return out;
   }
 
+  // src/model/system.ts
+  var Drivers = class extends Node {
+    connected;
+    unsupported;
+    sampleRates;
+    /** @internal */
+    constructor(client) {
+      super(client, "/drivers");
+      this.connected = this.prop("connected");
+      this.unsupported = this.prop("unsupported");
+      this.sampleRates = this.prop("sample_rates");
+    }
+  };
+  var Device = class extends Node {
+    name;
+    deviceType;
+    online;
+    sampleRate;
+    clockSource;
+    /** @internal */
+    constructor(client, path) {
+      super(client, path);
+      this.name = this.prop("name");
+      this.deviceType = this.prop("device_type");
+      this.online = this.prop("online");
+      this.sampleRate = this.prop("sample_rate");
+      this.clockSource = this.prop("clock_source");
+    }
+  };
+  var Devices = class extends Collection {
+    /** @internal */
+    constructor(client) {
+      super(client, "/devices", (p) => new Device(client, p), { levels: 2, commands: false, flatvalue: true });
+    }
+  };
+  var LUNA_DEVICE_UID2 = "d37e009d693549a0b6ab1da3fad05443";
+  var PSEUDO_MIDI_DEVICES = /* @__PURE__ */ new Set(["All", "None"]);
+  var MidiPort = class extends Node {
+    uid;
+    /** @internal */
+    constructor(client, path) {
+      super(client, path);
+      this.uid = this.prop("uid");
+    }
+    /** True for a port that sends to the device, false for one that receives from it. */
+    get isOutput() {
+      return this.path.includes("/output_ports/");
+    }
+  };
+  var MidiDevice = class extends Node {
+    name;
+    /** `normal` for a plain MIDI device; `null` for `All` and `None`. */
+    midiDeviceType;
+    midiDeviceMode;
+    /** Milliseconds LUNA shifts MIDI sent to this device. */
+    outputLateness;
+    midiClockGenerationEnabled;
+    /** For example `song1`. */
+    midiClockGenerationMode;
+    midiClockGenerationOffsetMs;
+    /** `[status, data1, data2]` of the last note LUNA received from it; `[255, 255, 255]` before any. */
+    lastMidiNote;
+    /** `[status, data1, data2]` of the last controller LUNA received from it; `[255, 255, 255]` before any. */
+    lastMidiControl;
+    /**
+     * Ports that receive MIDI from the device. `All` and `None` have one too. Empty on a LUNA
+     * that does not publish ports (fact 123).
+     */
+    inputPorts;
+    /** Ports that send MIDI to the device; empty for a device with no MIDI out (fact 123). */
+    outputPorts;
+    /** @internal */
+    constructor(client, path) {
+      super(client, path);
+      this.name = this.prop("name");
+      this.midiDeviceType = this.prop("midi_device_type");
+      this.midiDeviceMode = this.prop("midi_device_mode");
+      this.outputLateness = this.prop("output_lateness");
+      this.midiClockGenerationEnabled = this.prop("midi_clock_generation_enabled");
+      this.midiClockGenerationMode = this.prop("midi_clock_generation_mode");
+      this.midiClockGenerationOffsetMs = this.prop("midi_clock_generation_offset_ms");
+      this.lastMidiNote = this.prop("last_midi_note");
+      this.lastMidiControl = this.prop("last_midi_control");
+      const portOptions = { levels: 2, commands: false, flatvalue: true };
+      this.inputPorts = new Collection(client, `${path}/input_ports`, (p) => new MidiPort(client, p), portOptions);
+      this.outputPorts = new Collection(client, `${path}/output_ports`, (p) => new MidiPort(client, p), portOptions);
+    }
+    /** The device's first input port. LUNA gives a device at most one. */
+    get inputPort() {
+      return this.inputPorts.items[0];
+    }
+    /** The device's first output port, or `undefined` when it has no MIDI out. */
+    get outputPort() {
+      return this.outputPorts.items[0];
+    }
+    release() {
+      this.inputPorts.dispose();
+      this.outputPorts.dispose();
+    }
+    /** False for LUNA's `All` and `None` entries, true for a device that exists. */
+    get isPhysical() {
+      const name = this.name.value;
+      return name !== void 0 && !PSEUDO_MIDI_DEVICES.has(name);
+    }
+  };
+  var MidiDevices = class extends Collection {
+    /** @internal */
+    constructor(client) {
+      super(client, `/devices/${LUNA_DEVICE_UID2}/midi`, (p) => new MidiDevice(client, p), { levels: 4, commands: false, flatvalue: true });
+    }
+    /**
+     * Called when a device is added or removed, and also when a device's name or ports arrive
+     * or change. A device that comes online is announced before its name and ports (fact 123),
+     * so a listener that needs `inputPort` or `outputPort` would otherwise miss it.
+     *
+     * @example
+     * luna.midiDevices.onChange(() => {
+     *   const inputs = luna.midiDevices.items.filter((d) => d.isPhysical && d.inputPort);
+     *   draw(inputs);
+     * });
+     */
+    onChange(listener) {
+      const perDevice = /* @__PURE__ */ new Map();
+      const follow = () => {
+        const current = new Set(this.items);
+        for (const [device, offs] of perDevice) {
+          if (current.has(device)) continue;
+          for (const off of offs) off();
+          perDevice.delete(device);
+        }
+        for (const device of current) {
+          if (perDevice.has(device)) continue;
+          perDevice.set(device, [device.name.onChange(listener), device.inputPorts.onChange(listener), device.outputPorts.onChange(listener)]);
+        }
+      };
+      const offMembers = super.onChange(() => {
+        follow();
+        listener();
+      });
+      follow();
+      return () => {
+        offMembers();
+        for (const offs of perDevice.values()) for (const off of offs) off();
+        perDevice.clear();
+      };
+    }
+  };
+  var Preferences = class extends Node {
+    ioBufferSize;
+    playFromStopLocation;
+    recordMute;
+    metronomeSound;
+    metronomeSounds;
+    /** @internal */
+    constructor(client) {
+      super(client, "/preferences");
+      this.ioBufferSize = this.writableProp("io_buffer_size");
+      this.playFromStopLocation = this.writableProp("play_from_stop_location");
+      this.recordMute = this.writableProp("record_mute");
+      this.metronomeSound = this.writableProp("metronome_sound");
+      this.metronomeSounds = this.prop("metronome_sounds");
+    }
+  };
+  var Render = class extends Node {
+    state;
+    /** 0..100, as the engine reports it. {@link progress} is the 0..1 view. */
+    percentComplete;
+    errorMessage;
+    name;
+    renderType;
+    /** Seconds left, as the engine estimates it; absent for an offline render. */
+    timeRemaining;
+    /** True for an offline (faster than real time) render, which reports no time remaining. */
+    isOffline;
+    totalSamples;
+    /** 0..1, ready for a `<progress>` element. */
+    progress;
+    /** @internal */
+    constructor(client, path) {
+      super(client, path);
+      this.state = this.prop("state");
+      this.percentComplete = this.prop("percent_complete");
+      this.errorMessage = this.prop("error_message");
+      this.name = this.prop("name");
+      this.renderType = this.prop("type");
+      this.timeRemaining = this.prop("time_remaining");
+      this.isOffline = this.prop("render_is_offline");
+      this.totalSamples = this.prop("total_samples");
+      this.progress = derived([this.percentComplete], () => (this.percentComplete.value ?? 0) / 100);
+    }
+    /** `completed`, `aborted` or `failed`: nothing more will happen. */
+    get isTerminal() {
+      const s = this.state.value;
+      return s === "completed" || s === "aborted" || s === "failed";
+    }
+    /**
+     * Resolve when the render completes; reject when it is aborted, fails, or the engine
+     * removes the node before it was seen to finish. A short offline render can finish and
+     * vanish before anything observes it (fact 44), which surfaces as a `removed` rejection
+     * even though the output was written.
+     */
+    done(timeoutMs = 10 * 6e4) {
+      const watch = this.client.store.watch("/renders", { recursive: true, load: false });
+      return new Promise((resolve, reject) => {
+        let finish = () => void 0;
+        const settle2 = () => {
+          const s = this.state.value;
+          if (s === "completed") {
+            finish();
+            resolve();
+            return true;
+          }
+          if (s === "aborted" || s === "failed") {
+            finish();
+            reject(new UAError(s, `render ${this.name.value ?? this.id} ${s}${this.errorMessage.value ? `: ${this.errorMessage.value}` : ""}`, { path: this.path }));
+            return true;
+          }
+          return false;
+        };
+        const timer = setTimeout(() => {
+          finish();
+          reject(new UAError("no_effect", `render ${this.id} did not settle within ${timeoutMs} ms`, { path: this.path }));
+        }, timeoutMs);
+        const offState = this.state.onChange(() => settle2());
+        const renders = this.client.store.children("/renders");
+        const offChildren = renders.onChange(() => {
+          if (settle2()) return;
+          if (!(renders.value ?? []).includes(this.id)) {
+            finish();
+            reject(new UAError("removed", `render ${this.id} was removed before it was seen to finish`, { path: this.path }));
+          }
+        });
+        finish = () => {
+          clearTimeout(timer);
+          offState();
+          offChildren();
+          watch.release();
+        };
+        settle2();
+      });
+    }
+    abort() {
+      return this.wire.post("/renders/abort", { uid: this.id });
+    }
+    delete() {
+      return this.wire.post("/renders/delete", { uid: this.id });
+    }
+  };
+  var Renders = class extends Collection {
+    /** @internal */
+    constructor(client) {
+      super(client, "/renders", (p) => new Render(client, p), { levels: 2, commands: false, flatvalue: true });
+    }
+  };
+  var Job = class extends Node {
+    uid;
+    /** Nil uuid (32 zeros) when the job belongs to no session. */
+    sessionUid;
+    jobType;
+    /** `queued | running | canceling | completed | failed | canceled`. */
+    status;
+    stage;
+    error;
+    warning;
+    /** Track uid the job targets, when any. */
+    targetUid;
+    cancellable;
+    percentComplete;
+    /** @internal */
+    constructor(client, path) {
+      super(client, path);
+      this.uid = this.prop("uid");
+      this.sessionUid = this.prop("session_uid");
+      this.jobType = this.prop("job_type");
+      this.status = this.prop("status");
+      this.stage = this.prop("stage");
+      this.error = this.prop("error");
+      this.warning = this.prop("warning");
+      this.targetUid = this.prop("target_uid");
+      this.cancellable = this.prop("cancellable");
+      this.percentComplete = this.prop("percent_complete");
+    }
+    get isTerminal() {
+      const s = this.status.value;
+      return s === "completed" || s === "failed" || s === "canceled";
+    }
+    cancel() {
+      return this.post("commands/cancel_job", {});
+    }
+  };
+  var Jobs = class extends Collection {
+    /** @internal */
+    constructor(client) {
+      super(client, "/jobs", (p) => new Job(client, p), { levels: 2, commands: false, flatvalue: true });
+    }
+  };
+
+  // src/model/send-midi.ts
+  var STATUS_NOTE_OFF = 128;
+  var STATUS_NOTE_ON = 144;
+  var STATUS_CONTROL_CHANGE = 176;
+  var STATUS_PROGRAM_CHANGE = 192;
+  var CC_BANK_SELECT_MSB = 0;
+  var CC_BANK_SELECT_LSB = 32;
+  function outputPortUid(target) {
+    if (typeof target === "string") {
+      if (!target) throw new UAError("invalid_value", "output port uid must not be empty");
+      return target;
+    }
+    const port = target instanceof MidiDevice ? target.outputPort : target;
+    if (!port) throw new UAError("not_found", `MIDI device ${target.name.value ?? target.id} has no output port`, { path: target.path });
+    if (!(port instanceof MidiPort) || !port.isOutput) throw new UAError("invalid_value", `${port.path} is an input port; MIDI can only be sent to an output port`, { path: port.path });
+    const uid = port.uid.value;
+    if (!uid) throw new UAError("not_found", `${port.path} has no uid loaded; load luna.midiDevices first`, { path: port.path });
+    return uid;
+  }
+  function statusByte(value) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 128 || value > 255) {
+      throw new UAError("out_of_range", "status byte must be an integer 0x80-0xff");
+    }
+    return value;
+  }
+  function channelOf(value) {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 15) {
+      throw new UAError("out_of_range", "channel must be an integer 0-15");
+    }
+    return value;
+  }
+  function checked(build, then) {
+    let value;
+    try {
+      value = build();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    return then(value);
+  }
+  var SendMidi = class {
+    constructor(client) {
+      this.client = client;
+    }
+    client;
+    /**
+     * Send a note-on or note-off on channel 1 to one track. It also hands the note to LUNA's
+     * record input (`record_enabled`), so record-enabled tracks hear it too.
+     *
+     * @example
+     * await midi.sendMidiNote(session.uid, track.id, 60, 100, true);  // note-on
+     * await midi.sendMidiNote(session.uid, track.id, 60, 0, false);   // note-off
+     */
+    sendMidiNote(sessionUid, trackUid, note, velocity, noteOn) {
+      return this.sendMidi(sessionUid, trackUid, noteOn ? STATUS_NOTE_ON : STATUS_NOTE_OFF, note, velocity);
+    }
+    /**
+     * Send any 3-byte MIDI message to one track: pitch bend, channel pressure and anything else
+     * not wrapped here. The channel is in the status byte's low nibble.
+     *
+     * @example
+     * await midi.sendMidi(session.uid, track.id, 0xe0, 0x00, 0x40);  // pitch bend centre
+     */
+    sendMidi(sessionUid, trackUid, byte0, byte1, byte2) {
+      return checked(
+        () => ({ session_uid: sessionUid, track_uid: trackUid, byte_0: statusByte(byte0), byte_1: midiByte(byte1, "data byte 1"), byte_2: midiByte(byte2, "data byte 2"), record_enabled: true }),
+        (payload) => this.post("send_midi", payload)
+      );
+    }
+    /**
+     * Send the same note-on or note-off to several tracks. LUNA's own multi-track form delivers
+     * the note but answers `uasrv.invalid_property` every time (fact 109), so this sends one
+     * message per track instead, and hands the note to the record input once when any entry
+     * asks for it, which is what LUNA's form does.
+     *
+     * @example
+     * await midi.sendNoteToTracks(session.uid, [
+     *   { trackUid: piano.id, recordEnable: true },
+     *   { trackUid: pad.id },
+     * ], 60, 100, true);
+     */
+    sendNoteToTracks(sessionUid, tracks, note, velocity, noteOn) {
+      return checked(
+        () => {
+          if (!tracks.length) throw new UAError("out_of_range", "sendNoteToTracks(): give at least one track");
+          const bytes = { byte_0: noteOn ? STATUS_NOTE_ON : STATUS_NOTE_OFF, byte_1: midiByte(note, "note"), byte_2: midiByte(velocity, "velocity") };
+          const recordAt = tracks.findIndex((t) => t.recordEnable === true);
+          return tracks.map((t, i) => ({ session_uid: sessionUid, track_uid: t.trackUid, ...bytes, record_enabled: i === recordAt }));
+        },
+        async (payloads) => {
+          await Promise.all(payloads.map((p) => this.post("send_midi", p)));
+        }
+      );
+    }
+    /**
+     * Send a Control Change to a track.
+     *
+     * @param controller CC number, 0-127 (7 volume, 10 pan, 64 sustain).
+     * @param value CC value, 0-127.
+     * @param channel MIDI channel, 0-15. Default 0.
+     *
+     * @example
+     * await midi.sendController(session.uid, track.id, 64, 127);  // sustain down
+     */
+    sendController(sessionUid, trackUid, controller, value, channel = 0) {
+      return checked(
+        () => STATUS_CONTROL_CHANGE | channelOf(channel),
+        (status) => this.sendMidi(sessionUid, trackUid, status, controller, value)
+      );
+    }
+    /**
+     * Send a Program Change to a track, after Bank Select MSB and LSB (CC 0 and CC 32) when
+     * either bank is given; the one left out is sent as 0. The messages go in order, one at a
+     * time, so another sender on the same track could land between them.
+     *
+     * @example
+     * await midi.sendProgramChange(session.uid, track.id, 0);         // program only
+     * await midi.sendProgramChange(session.uid, track.id, 5, 0, 12);  // bank 0/12, program 5
+     */
+    sendProgramChange(sessionUid, trackUid, program, bankMSB, bankLSB) {
+      return checked(
+        () => {
+          midiByte(program, "program");
+          if (bankMSB !== void 0) midiByte(bankMSB, "bankMSB");
+          if (bankLSB !== void 0) midiByte(bankLSB, "bankLSB");
+          return bankMSB !== void 0 || bankLSB !== void 0;
+        },
+        async (needsBank) => {
+          if (needsBank) {
+            await this.sendMidi(sessionUid, trackUid, STATUS_CONTROL_CHANGE, CC_BANK_SELECT_MSB, bankMSB ?? 0);
+            await this.sendMidi(sessionUid, trackUid, STATUS_CONTROL_CHANGE, CC_BANK_SELECT_LSB, bankLSB ?? 0);
+          }
+          await this.sendMidi(sessionUid, trackUid, STATUS_PROGRAM_CHANGE, program, 0);
+        }
+      );
+    }
+    /**
+     * Panic: send All Notes Off to every MIDI-capable track and connected MIDI device, in every
+     * session.
+     *
+     * @example
+     * await midi.sendAllNotesOff();
+     */
+    async sendAllNotesOff() {
+      await this.client.raw.post("/sessions/send_midi_all_notes_off", {});
+    }
+    /**
+     * Send a note-on or note-off on channel 1 to a MIDI input source by name, as though it came
+     * from that device, bypassing track routing. It goes into LUNA, not out to the device; to
+     * play the hardware use {@link sendNoteToOutput}. LUNA answers success for a name it does not
+     * know (fact 108), so a typo fails silently.
+     *
+     * @example
+     * await midi.sendDeviceNote('IAC Driver Bus 1', 60, 100, true);
+     */
+    sendDeviceNote(midiInputSource, note, velocity, noteOn) {
+      return checked(
+        () => ({ midi_input_source: midiInputSource, byte_0: noteOn ? STATUS_NOTE_ON : STATUS_NOTE_OFF, byte_1: midiByte(note, "note"), byte_2: midiByte(velocity, "velocity") }),
+        (payload) => this.post("send_midi", payload)
+      );
+    }
+    /**
+     * Send any 3-byte MIDI message out of a MIDI device's output port, to the hardware rather
+     * than a track (fact 124). The channel is in the status byte's low nibble. LUNA answers
+     * success whatever the uid, so a port that has gone (the device was unplugged, or LUNA
+     * restarted and gave it a new uid) fails silently: look the device up by name each session.
+     *
+     * @example
+     * await luna.midiDevices.load();
+     * const synth = luna.midiDevices.items.find((d) => d.name.value === 'Volt 876');
+     * if (synth?.outputPort) await midi.sendMidiToOutput(synth, 0xe0, 0x00, 0x40);  // pitch bend centre
+     */
+    sendMidiToOutput(output, byte0, byte1, byte2) {
+      return checked(
+        () => ({ midi_input_source: outputPortUid(output), byte_0: statusByte(byte0), byte_1: midiByte(byte1, "data byte 1"), byte_2: midiByte(byte2, "data byte 2") }),
+        (payload) => this.post("send_midi", payload)
+      );
+    }
+    /**
+     * Send a note-on or note-off out of a MIDI device's output port.
+     *
+     * @param channel MIDI channel, 0-15. Default 0.
+     *
+     * @example
+     * await midi.sendNoteToOutput(synth, 60, 100, true);  // note-on, middle C
+     * await midi.sendNoteToOutput(synth, 60, 0, false);   // note-off
+     */
+    sendNoteToOutput(output, note, velocity, noteOn, channel = 0) {
+      return checked(
+        () => (noteOn ? STATUS_NOTE_ON : STATUS_NOTE_OFF) | channelOf(channel),
+        (status) => this.sendMidiToOutput(output, status, note, velocity)
+      );
+    }
+    /**
+     * Send a Control Change out of a MIDI device's output port.
+     *
+     * @param controller CC number, 0-127 (7 volume, 10 pan, 64 sustain).
+     * @param value CC value, 0-127.
+     * @param channel MIDI channel, 0-15. Default 0.
+     *
+     * @example
+     * await midi.sendControllerToOutput(synth, 7, 100);  // volume
+     */
+    sendControllerToOutput(output, controller, value, channel = 0) {
+      return checked(
+        () => STATUS_CONTROL_CHANGE | channelOf(channel),
+        (status) => this.sendMidiToOutput(output, status, controller, value)
+      );
+    }
+    /**
+     * Send a Program Change out of a MIDI device's output port, after Bank Select MSB and LSB
+     * (CC 0 and CC 32) when either bank is given; the one left out is sent as 0.
+     *
+     * @param channel MIDI channel, 0-15. Default 0.
+     *
+     * @example
+     * await midi.sendProgramChangeToOutput(synth, 5, 0, 12);  // bank 0/12, program 5
+     */
+    sendProgramChangeToOutput(output, program, bankMSB, bankLSB, channel = 0) {
+      return checked(
+        () => {
+          midiByte(program, "program");
+          if (bankMSB !== void 0) midiByte(bankMSB, "bankMSB");
+          if (bankLSB !== void 0) midiByte(bankLSB, "bankLSB");
+          return { uid: outputPortUid(output), channel: channelOf(channel), needsBank: bankMSB !== void 0 || bankLSB !== void 0 };
+        },
+        async ({ uid, channel: ch, needsBank }) => {
+          if (needsBank) {
+            await this.sendMidiToOutput(uid, STATUS_CONTROL_CHANGE | ch, CC_BANK_SELECT_MSB, bankMSB ?? 0);
+            await this.sendMidiToOutput(uid, STATUS_CONTROL_CHANGE | ch, CC_BANK_SELECT_LSB, bankLSB ?? 0);
+          }
+          await this.sendMidiToOutput(uid, STATUS_PROGRAM_CHANGE | ch, program, 0);
+        }
+      );
+    }
+    async post(command, payload) {
+      await this.client.raw.post(`/sessions/${command}`, payload);
+    }
+  };
+
+  // src/model/midi-input.ts
+  var ALL_DEVICE_NAME = "All";
+  function isBatch(v) {
+    return typeof v === "object" && v !== null && typeof v.seq === "number" && Array.isArray(v.events);
+  }
+  function typeOf(status, data2) {
+    switch (status & 240) {
+      case 128:
+        return "noteOff";
+      case 144:
+        return data2 === 0 ? "noteOff" : "noteOn";
+      case 160:
+        return "polyPressure";
+      case 176:
+        return "controlChange";
+      case 192:
+        return "programChange";
+      case 208:
+        return "channelPressure";
+      default:
+        return "pitchBend";
+    }
+  }
+  function decodeMidiEvents(events, port) {
+    const out = [];
+    for (const e of events) {
+      if (!Array.isArray(e) || e.length < 4) continue;
+      const [time, status, data1, data2] = e;
+      if (typeof time !== "number" || typeof status !== "number" || typeof data1 !== "number" || typeof data2 !== "number") continue;
+      if (status < 128 || status > 239) continue;
+      out.push(Object.freeze({ type: typeOf(status, data2), status, channel: status & 15, data1, data2, time, port }));
+    }
+    return out;
+  }
+  var MidiInput = class {
+    constructor(client) {
+      this.client = client;
+    }
+    client;
+    /**
+     * Call `handler` with every message `target` sends LUNA, in arrival order, until the returned
+     * function is called. `target` is a {@link MidiDevice} from `luna.midiDevices` (load it
+     * first), one of its input ports, or `'all'` for every device. Throws `not_found` for a
+     * device with no MIDI in, or for `'all'` before `luna.midiDevices` has loaded.
+     *
+     * MIDI device uids change when LUNA restarts (fact 123), so an Add On that remembers a device
+     * should remember its name and look it up again.
+     *
+     * @example
+     * await luna.midiDevices.load();
+     * const input = new Luna.MidiInput(luna);
+     * const stop = input.listen('all', (m) => console.log(m.type, m.channel, m.data1, m.data2));
+     */
+    listen(target, handler, options = {}) {
+      const port = this.inputPort(target);
+      const path = `${port.path}/midi_events`;
+      let lastSeq;
+      let lastDropped;
+      return this.client.raw.subscribe(path, (event) => {
+        if (event.path !== path || event.operation !== void 0 || !isBatch(event.data)) return;
+        const { seq, dropped = 0, events } = event.data;
+        const missed = lastSeq !== void 0 && seq > lastSeq + 1 ? seq - lastSeq - 1 : 0;
+        const newlyDropped = lastDropped !== void 0 && dropped > lastDropped;
+        lastSeq = seq;
+        lastDropped = dropped;
+        if (missed > 0 || newlyDropped) options.onGap?.({ missed, dropped });
+        for (const message of decodeMidiEvents(events, port)) handler(message);
+      });
+    }
+    /**
+     * Note-ons and note-offs from `target`, as `(note, velocity, noteOn, message)`. A note-on
+     * with velocity 0 arrives as a note-off. Same targets and rules as {@link listen}.
+     *
+     * @example
+     * const stop = input.onNote(keys, (note, velocity, on) => {
+     *   if (on) lights.light(note, velocity); else lights.clear(note);
+     * });
+     */
+    onNote(target, handler, options) {
+      return this.listen(
+        target,
+        (m) => {
+          if (m.type === "noteOn" || m.type === "noteOff") handler(m.data1, m.data2, m.type === "noteOn", m);
+        },
+        options
+      );
+    }
+    /**
+     * Controller changes from `target`, as `(controller, value, message)`. Same targets and
+     * rules as {@link listen}.
+     *
+     * @example
+     * const stop = input.onControlChange(keys, (cc, value) => {
+     *   if (cc === 1) modWheel.value = String(value);
+     * });
+     */
+    onControlChange(target, handler, options) {
+      return this.listen(
+        target,
+        (m) => {
+          if (m.type === "controlChange") handler(m.data1, m.data2, m);
+        },
+        options
+      );
+    }
+    inputPort(target) {
+      if (target === "all") {
+        const all = this.client.midiDevices.items.find((d) => d.name.value === ALL_DEVICE_NAME);
+        if (!all?.inputPort) throw new UAError("not_found", "MIDI device 'All' has no input port; load luna.midiDevices first");
+        return all.inputPort;
+      }
+      if (target instanceof MidiDevice) {
+        const port = target.inputPort;
+        if (!port) throw new UAError("not_found", `MIDI device ${target.name.value ?? target.id} has no input port`, { path: target.path });
+        return port;
+      }
+      if (!(target instanceof MidiPort) || target.isOutput) {
+        throw new UAError("invalid_value", `${target.path} is an output port; MIDI can only be received on an input port`, { path: target.path });
+      }
+      return target;
+    }
+  };
+
+  // src/model/qwerty-midi.ts
+  var NOTE_OFFSETS = {
+    A: 0,
+    W: 1,
+    S: 2,
+    E: 3,
+    D: 4,
+    F: 5,
+    T: 6,
+    G: 7,
+    Y: 8,
+    H: 9,
+    U: 10,
+    J: 11,
+    K: 12,
+    O: 13,
+    L: 14,
+    P: 15,
+    ";": 16
+  };
+  var OCTAVE_MIN = 0;
+  var OCTAVE_MAX = 9;
+  var VELOCITY_STEP = 8;
+  var VELOCITY_MIN = 1;
+  var VELOCITY_MAX = 127;
+  var clamp = (v, min, max) => Math.min(max, Math.max(min, Math.round(v)));
+  function isEditable2(target) {
+    const el = target;
+    if (!el || typeof el.tagName !== "string") return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName.toUpperCase();
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag !== "INPUT") return false;
+    const type = (el.type ?? "text").toLowerCase();
+    return !["button", "checkbox", "radio", "range", "color", "file", "image", "reset", "submit"].includes(type);
+  }
+  var keyOf = (e) => e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  var QwertyMidi = class {
+    constructor(sendMidi) {
+      this.sendMidi = sendMidi;
+      const scheduler = sendMidi.client.store.scheduler;
+      this.octaveCell = new Cell(scheduler, 4);
+      this.velocityCell = new Cell(scheduler, 100);
+      this.octave = writable(this.octaveCell, async (v) => void this.octaveCell.update(clamp(v, OCTAVE_MIN, OCTAVE_MAX)));
+      this.velocity = writable(this.velocityCell, async (v) => void this.velocityCell.update(clamp(v, VELOCITY_MIN, VELOCITY_MAX)));
+    }
+    sendMidi;
+    /** The octave the note keys play, 0-9. A is C in this octave. `set` clamps. */
+    octave;
+    /** The note-on velocity, 1-127. `set` clamps. */
+    velocity;
+    octaveCell;
+    velocityCell;
+    /** Held notes by key: suppresses key repeat and sends the right note-off on keyup. */
+    heldNotes = /* @__PURE__ */ new Map();
+    /**
+     * Handle a keydown. Returns true, having called `preventDefault()`, when the key was a note
+     * or a control key; a repeat of a held note key is claimed but not replayed.
+     *
+     * @example
+     * document.addEventListener('keydown', (e) => qwerty.handleKeyDown(e, session.uid, track.id));
+     */
+    handleKeyDown(e, sessionUid, trackUid) {
+      return this.keyDown(e, (note, velocity, noteOn) => this.sendMidi.sendMidiNote(sessionUid, trackUid, note, velocity, noteOn));
+    }
+    /**
+     * Handle a keydown, playing the note out of a MIDI device's output port rather than on a
+     * track (fact 124). Same keys and return value as {@link handleKeyDown}; the note-off on
+     * keyup goes to the same port.
+     *
+     * @param channel MIDI channel, 0-15. Default 0.
+     *
+     * @example
+     * await luna.midiDevices.load();
+     * const synth = luna.midiDevices.items.find((d) => d.name.value === 'Volt 876');
+     * document.addEventListener('keydown', (e) => synth?.outputPort && qwerty.handleKeyDownToOutput(e, synth));
+     */
+    handleKeyDownToOutput(e, output, channel = 0) {
+      return this.keyDown(e, (note, velocity, noteOn) => this.sendMidi.sendNoteToOutput(output, note, velocity, noteOn, channel));
+    }
+    keyDown(e, send) {
+      if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing || isEditable2(e.target)) return false;
+      const key = keyOf(e);
+      const octave = this.octaveCell.value ?? 4;
+      const velocity = this.velocityCell.value ?? 100;
+      switch (key) {
+        case "Z":
+          this.octaveCell.update(Math.min(OCTAVE_MAX, octave + 1));
+          e.preventDefault();
+          return true;
+        case "X":
+          this.octaveCell.update(Math.max(OCTAVE_MIN, octave - 1));
+          e.preventDefault();
+          return true;
+        case "C":
+          this.velocityCell.update(Math.min(VELOCITY_MAX, velocity + VELOCITY_STEP));
+          e.preventDefault();
+          return true;
+        case "V":
+          this.velocityCell.update(Math.max(VELOCITY_MIN, velocity - VELOCITY_STEP));
+          e.preventDefault();
+          return true;
+      }
+      const offset = NOTE_OFFSETS[key];
+      if (offset === void 0) return false;
+      e.preventDefault();
+      if (this.heldNotes.has(key)) return true;
+      const note = octave * 12 + offset;
+      this.heldNotes.set(key, { release: () => send(note, 0, false) });
+      void send(note, velocity, true).catch(warn2);
+      return true;
+    }
+    /**
+     * Handle a keyup. Returns true, having called `preventDefault()`, when it released a held
+     * note. The note-off goes to the track or output and pitch the note-on went to, even if the
+     * octave or the target changed while it was held.
+     *
+     * @example
+     * document.addEventListener('keyup', (e) => qwerty.handleKeyUp(e));
+     */
+    handleKeyUp(e) {
+      const key = keyOf(e);
+      const held = this.heldNotes.get(key);
+      if (held === void 0) return false;
+      this.heldNotes.delete(key);
+      e.preventDefault();
+      void held.release().catch(warn2);
+      return true;
+    }
+    /**
+     * Send a note-off for every held note. Call it when the page loses focus, which swallows
+     * the keyups.
+     *
+     * @example
+     * window.addEventListener('blur', () => qwerty.releaseAll());
+     */
+    releaseAll() {
+      const held = [...this.heldNotes.values()];
+      this.heldNotes.clear();
+      for (const h of held) void h.release().catch(warn2);
+    }
+    /** Forget held notes without sending note-offs, after the connection was replaced. */
+    resetConnection() {
+      this.heldNotes.clear();
+    }
+    /** Release every held note and forget them. */
+    destroy() {
+      this.releaseAll();
+    }
+  };
+  function warn2(error) {
+    console.warn("Luna.QwertyMidi send failed:", error);
+  }
+
   // src/model/plugins.ts
   var Plugin = class extends Node {
     pluginId;
@@ -7062,24 +9774,30 @@ var Luna = (() => {
       super(client, "/presets");
     }
     /**
-     * Query the preset database (fact 98). Columnar on the wire; rows here.
+     * Query the preset database (fact 98). Columnar on the wire; rows here. Search and tags
+     * combine: a row must match both (fact 120).
      *
      * @example
      * const rows = await luna.presets.query({ pluginId: 'uaudio_qi', search: 'EQ' });
      * rows[0]?.uid; rows[0]?.name; rows[0]?.factory;
+     * const clean = await luna.presets.query({ pluginId, tags: ['Clean', 'Jazz'], withTags: true });
+     * clean[0]?.tags; // ['Clean', 'Jazz', ...]
      */
     async query(options = {}) {
       const payload = {};
       if (options.pluginId !== void 0) payload["plugin_id"] = options.pluginId;
       if (options.deviceTypeId !== void 0) payload["device_type_id"] = options.deviceTypeId;
       if (options.search !== void 0) payload["search"] = options.search;
+      if (options.tags !== void 0) payload["tag"] = typeof options.tags === "string" ? options.tags : [...options.tags];
+      if (options.matchAnyTag !== void 0) payload["union"] = options.matchAnyTag;
+      if (options.withTags) payload["tags"] = true;
       if (options.favorite !== void 0) payload["favorite"] = options.favorite;
       if (options.limit !== void 0) payload["limit"] = options.limit;
       const reply = await this.post("query", payload);
       return rowsFrom(reply?.results);
     }
     /**
-     * The plugin's preset named exactly `name` (case-insensitive), or `undefined`. When the
+     * The plugin's preset name exactly `name` (case-insensitive), or `undefined`. When the
      * library holds a user preset and a factory preset of the same name, the user one wins,
      * matching what LUNA's preset browser opens.
      *
@@ -7093,7 +9811,337 @@ var Luna = (() => {
       const named = rows.filter((r) => r.name.trim().toLowerCase() === q);
       return named.find((r) => !r.factory) ?? named[0];
     }
+    /**
+     * The plugin's tag groups, in LUNA's order (fact 120). Empty for a plugin whose presets
+     * are not tagged.
+     *
+     * @example
+     * const groups = await luna.presets.tagGroups('uaudio_paradise_guitar_studio');
+     * groups.map((g) => g.name); // ['TYPE', 'GENRE', 'DESCRIPTION']
+     */
+    async tagGroups(pluginId) {
+      const tree = await this.wire.get(`/presets/plugins/${pluginId}/categories`, { recursive: true, children: true, properties: true, commands: false, flatvalue: true });
+      const groups = [];
+      for (const category of tree?.children ?? []) {
+        const subs = category.children?.find((c) => c.path === "sub_categories");
+        for (const sub of subs?.children ?? []) {
+          const tagFolder = sub.children?.find((c) => c.path === "tags");
+          groups.push({
+            uid: String(sub.properties?.["uid"] ?? sub.path ?? ""),
+            name: String(sub.properties?.["name"] ?? ""),
+            category: String(category.properties?.["name"] ?? ""),
+            categoryUid: String(category.properties?.["uid"] ?? category.path ?? ""),
+            tags: (tagFolder?.children ?? []).map((t) => t.properties?.["tag"]).filter((t) => typeof t === "string" && t !== "")
+          });
+        }
+      }
+      return groups;
+    }
+    /**
+     * Presets UA Assistant recommends for free text, best first, five at most (fact 121). Needs
+     * UA Assistant connected to LUNA ({@link Assistant.enabled}), and an instance of the plugin
+     * created since it connected, which is when LUNA builds the plugin's search index. Otherwise
+     * this rejects with the engine's code: `ua.unknown` (no assistant),
+     * `assistant.preset_search_not_initialized_error` (no index yet), or
+     * `assistant.input_classifier_rejected` (text the assistant will not search on). Empty text
+     * resolves to `[]` without asking.
+     *
+     * @example
+     * const recs = await luna.presets.recommend('uaudio_paradise_guitar_studio', 'warm jazz clean');
+     * await slot.loadPreset(recs[0].uid);
+     */
+    async recommend(pluginId, text) {
+      if (text.trim() === "") return [];
+      const reply = await this.post("preset_recommendations", { plugin_id: pluginId, query: text });
+      const results = Array.isArray(reply?.results) ? reply.results : [];
+      return results.filter((r) => typeof r["preset_uuid"] === "string" && r["preset_uuid"] !== "").map((r) => {
+        const rec = { uid: String(r["preset_uuid"]), name: String(r["preset_name"] ?? ""), score: Number(r["rrf_score"] ?? 0) };
+        if (typeof r["keyword_score"] === "number") rec.keywordScore = r["keyword_score"];
+        if (typeof r["semantic_score"] === "number") rec.semanticScore = r["semantic_score"];
+        return rec;
+      });
+    }
+    /**
+     * A live preset selection over one plugin: set `search` and `tags`, read `presets` and
+     * `recommendations`. Requests are debounced and a reply that a newer one overtook is
+     * dropped, so the lists always match the inputs. Recommendations come from the search text,
+     * keep only presets carrying the selected tags (so with tags selected there can be fewer
+     * than the assistant's five), and stay empty while UA Assistant is not connected. A refused
+     * request leaves them empty and its code in `recommendationError`. Call `dispose()` when done.
+     *
+     * @example
+     * const sel = luna.presets.selection('uaudio_paradise_guitar_studio');
+     * await sel.ready();
+     * sel.groups.value;                       // tag groups for the chips
+     * await sel.search.set('warm');
+     * await sel.toggleTag('Clean');
+     * await sel.settled();
+     * sel.presets.items.map((p) => p.name);   // names containing "warm", tagged Clean
+     * sel.recommendations.items[0]?.name;     // the assistant's best match, tagged Clean
+     * await slot.loadPreset(sel.presets.items[0].uid);
+     * sel.dispose();
+     */
+    selection(pluginId, options = {}) {
+      return new PresetSelection(this.client, pluginId, options);
+    }
   };
+  var Assistant = class extends Node {
+    /** True while UA Assistant is connected to LUNA. */
+    enabled;
+    /** @internal */
+    constructor(client) {
+      super(client, "/assistant");
+      this.enabled = this.prop("enabled");
+    }
+  };
+  var PresetSelection = class {
+    /** @internal Use {@link Presets.selection}. */
+    constructor(client, pluginId, options = {}) {
+      this.client = client;
+      this.pluginId = pluginId;
+      this.options = options;
+      const scheduler = client.store.scheduler;
+      this.presetsApi = client.presets;
+      this.searchCell = new Cell(scheduler, "");
+      this.tagsCell = new Cell(scheduler, []);
+      this.anyCell = new Cell(scheduler, false);
+      this.groupsCell = new Cell(scheduler, []);
+      this.presetsCell = new Cell(scheduler, []);
+      this.recsCell = new Cell(scheduler, []);
+      this.loadingCell = new Cell(scheduler, false);
+      this.errorCell = new Cell(scheduler, null);
+      this.recErrorCell = new Cell(scheduler, null);
+      const input = (cell) => writable(cell, async (value) => {
+        if (cell.update(value)) this.changed();
+      });
+      this.search = input(this.searchCell);
+      this.tags = input(this.tagsCell);
+      this.matchAnyTag = input(this.anyCell);
+      this.groups = this.groupsCell;
+      this.presets = listOf(this.presetsCell, (row) => row.uid);
+      this.recommendations = listOf(this.recsCell, (rec) => rec.uid);
+      this.recommendationsAvailable = derived([client.assistant.enabled], () => client.assistant.enabled.value === true);
+      this.loading = this.loadingCell;
+      this.error = this.errorCell;
+      this.recommendationError = this.recErrorCell;
+    }
+    client;
+    pluginId;
+    options;
+    /** Search text. Filters `presets` by name and is what recommendations are asked for. */
+    search;
+    /** Selected tags. */
+    tags;
+    /** Match presets carrying any selected tag rather than all of them. Default false. */
+    matchAnyTag;
+    /** The plugin's tag groups, once {@link ready}. */
+    groups;
+    /** Presets matching the search text and tags, with their tags. */
+    presets;
+    /** UA Assistant's picks for the search text, among presets carrying the tags. Best first. */
+    recommendations;
+    /** True while UA Assistant is connected, so recommendations can come. */
+    recommendationsAvailable;
+    /** True while a list query or a recommendation request is in flight or waiting. */
+    loading;
+    /** The last list query's failure, or `null`. */
+    error;
+    /** The last recommendation request's failure, or `null`. */
+    recommendationError;
+    searchCell;
+    tagsCell;
+    anyCell;
+    groupsCell;
+    presetsCell;
+    recsCell;
+    loadingCell;
+    errorCell;
+    recErrorCell;
+    presetsApi;
+    releases = [];
+    queryTimer;
+    recTimer;
+    queryGen = 0;
+    recGen = 0;
+    inFlight = 0;
+    waiters = [];
+    readyPromise;
+    /** Uids carrying the selected tags, by tag selection, for filtering recommendations. */
+    taggedUids = /* @__PURE__ */ new Map();
+    isDisposed = false;
+    /**
+     * Read the tag groups and the first list, and start following UA Assistant's connection.
+     * Idempotent.
+     *
+     * @example
+     * await sel.ready();
+     */
+    ready() {
+      this.readyPromise ??= this.start();
+      return this.readyPromise;
+    }
+    async start() {
+      if (this.wantsRecommendations) {
+        const watch = this.client.assistant.watch();
+        this.releases.push(watch.release);
+        this.releases.push(this.client.assistant.enabled.onChange(() => this.scheduleRecommendations(0)));
+        await watch.ready.catch(() => {
+        });
+      }
+      const groups = this.track(this.presetsApi.tagGroups(this.pluginId).catch(() => []));
+      this.scheduleQuery(0);
+      this.groupsCell.update(await groups);
+      await this.settled();
+    }
+    /**
+     * Add `tag` to the selection, or remove it if selected.
+     *
+     * @example
+     * await sel.toggleTag('Clean');
+     */
+    toggleTag(tag) {
+      const now = this.tagsCell.value ?? [];
+      return this.tags.set(now.includes(tag) ? now.filter((t) => t !== tag) : [...now, tag]);
+    }
+    /** Clear the search text and the selected tags. */
+    async clear() {
+      const searchMoved = this.searchCell.update("");
+      const tagsMoved = this.tagsCell.update([]);
+      if (searchMoved || tagsMoved) this.changed();
+    }
+    /** Query again with the current inputs, for example after presets were saved or deleted. */
+    refresh() {
+      this.taggedUids.clear();
+      this.changed();
+    }
+    /**
+     * Resolves once nothing is waiting or in flight and the lists match the inputs.
+     *
+     * @example
+     * await sel.search.set('lion');
+     * await sel.settled();
+     */
+    settled() {
+      if (this.idle) return this.client.store.scheduler.settled();
+      return new Promise((resolve) => this.waiters.push(resolve)).then(() => this.client.store.scheduler.settled());
+    }
+    /** Stop following and drop pending requests. */
+    dispose() {
+      if (this.isDisposed) return;
+      this.isDisposed = true;
+      clearTimeout(this.queryTimer);
+      clearTimeout(this.recTimer);
+      this.queryTimer = this.recTimer = void 0;
+      this.queryGen++;
+      this.recGen++;
+      for (const release2 of this.releases.splice(0)) release2();
+      this.wake();
+    }
+    get disposed() {
+      return this.isDisposed;
+    }
+    get wantsRecommendations() {
+      return this.options.recommend !== false;
+    }
+    get idle() {
+      return this.inFlight === 0 && this.queryTimer === void 0 && this.recTimer === void 0;
+    }
+    changed() {
+      if (this.isDisposed || !this.readyPromise) return;
+      this.scheduleQuery(this.options.queryDelayMs ?? 100);
+      this.scheduleRecommendations(this.options.recommendDelayMs ?? 300);
+    }
+    scheduleQuery(delayMs) {
+      if (this.isDisposed) return;
+      clearTimeout(this.queryTimer);
+      this.queryGen++;
+      this.queryTimer = setTimeout(() => {
+        this.queryTimer = void 0;
+        void this.runQuery();
+      }, delayMs);
+      this.loadingCell.update(true);
+    }
+    scheduleRecommendations(delayMs) {
+      if (this.isDisposed || !this.readyPromise) return;
+      clearTimeout(this.recTimer);
+      this.recGen++;
+      this.recTimer = setTimeout(() => {
+        this.recTimer = void 0;
+        void this.runRecommendations();
+      }, delayMs);
+      this.loadingCell.update(true);
+    }
+    async runQuery() {
+      const gen = this.queryGen;
+      const tags = this.tagsCell.value ?? [];
+      const options = { pluginId: this.pluginId, search: this.searchCell.value ?? "", withTags: true };
+      if (tags.length > 0) {
+        options.tags = tags;
+        options.matchAnyTag = this.anyCell.value === true;
+      }
+      if (this.options.limit !== void 0) options.limit = this.options.limit;
+      try {
+        const rows = await this.track(this.presetsApi.query(options));
+        if (gen !== this.queryGen) return;
+        this.presetsCell.update(rows);
+        this.errorCell.update(null);
+      } catch (err) {
+        if (gen !== this.queryGen) return;
+        this.errorCell.update(asError(err));
+      }
+    }
+    async runRecommendations() {
+      const gen = this.recGen;
+      const text = (this.searchCell.value ?? "").trim();
+      if (!this.wantsRecommendations || text === "" || this.client.assistant.enabled.value !== true) {
+        this.recsCell.update([]);
+        this.recErrorCell.update(null);
+        this.wake();
+        return;
+      }
+      const tags = this.tagsCell.value ?? [];
+      const any = this.anyCell.value === true;
+      try {
+        const [recs, allowed] = await this.track(Promise.all([this.presetsApi.recommend(this.pluginId, text), tags.length > 0 ? this.tagged(tags, any) : Promise.resolve(void 0)]));
+        if (gen !== this.recGen) return;
+        const kept = allowed ? recs.filter((r) => allowed.has(r.uid)) : recs;
+        this.recsCell.update(kept.slice(0, this.options.maxRecommendations ?? 5));
+        this.recErrorCell.update(null);
+      } catch (err) {
+        if (gen !== this.recGen) return;
+        this.recsCell.update([]);
+        this.recErrorCell.update(asError(err));
+      }
+    }
+    /** Every preset uid carrying `tags`, ignoring the search text. Cached per tag selection. */
+    tagged(tags, any) {
+      const key = JSON.stringify([any, [...tags].sort()]);
+      let found = this.taggedUids.get(key);
+      if (!found) {
+        found = this.presetsApi.query({ pluginId: this.pluginId, tags, matchAnyTag: any }).then((rows) => new Set(rows.map((r) => r.uid)));
+        found.catch(() => this.taggedUids.delete(key));
+        this.taggedUids.set(key, found);
+      }
+      return found;
+    }
+    /** Count `work` as in flight until it settles. */
+    track(work) {
+      this.inFlight++;
+      return work.finally(() => {
+        this.inFlight--;
+        this.wake();
+      });
+    }
+    wake() {
+      if (!this.idle && !this.isDisposed) return;
+      this.loadingCell.update(false);
+      const waiters = this.waiters.splice(0);
+      for (const w of waiters) w();
+    }
+  };
+  function asError(err) {
+    return err instanceof UAError ? err : new UAError("unknown", err instanceof Error ? err.message : String(err));
+  }
   function rowsFrom(results) {
     if (!results) return [];
     const n = typeof results.num_rows === "number" ? results.num_rows : results["uid"]?.length ?? 0;
@@ -7101,9 +10149,10 @@ var Luna = (() => {
       const arr = results[name];
       return Array.isArray(arr) && arr[i] !== void 0 ? arr[i] : fallback;
     };
+    const withTags = Array.isArray(results["tags"]);
     const rows = [];
     for (let i = 0; i < n; i++) {
-      rows.push({
+      const row = {
         uid: col("uid", i, ""),
         name: col("name", i, ""),
         version: col("version", i, 0),
@@ -7111,7 +10160,9 @@ var Luna = (() => {
         favorite: Boolean(col("favorite", i, 0)),
         factory: Boolean(col("factory", i, 0)),
         path: col("path", i, "")
-      });
+      };
+      if (withTags) row.tags = col("tags", i, []);
+      rows.push(row);
     }
     return rows;
   }
@@ -7423,9 +10474,49 @@ var Luna = (() => {
     setTimeSignature(numerator, denominator, bar = 1) {
       return this.post("set_time_signature", { numerator, denominator, bar });
     }
-    /** `sharpsAndFlats`: 1..7 sharps, -1..-7 flats, 0 for C / A minor. */
-    setKeySignature(sharpsAndFlats, isMinor, tick = 0) {
-      return this.post("set_key_signature", { tick, sharps_and_flats: sharpsAndFlats, is_minor: isMinor });
+    /**
+     * Set the key from `tick` (default: the session start) and resolve to its row once it is in
+     * {@link keySignatures}. LUNA keeps one key signature per tick, so one already at `tick` is
+     * rewritten in place (the same row), not joined by a second (fact 113). One undo entry. `sharpsAndFlats` is 1..7 sharps, -1..-7
+     * flats, 0 for C major or A minor. Rejects with `out_of_range` before anything is sent for a
+     * value outside those, a non-boolean `isMinor` or a non-integer tick.
+     *
+     * @example
+     * await session.musical.ready();
+     * await session.musical.setKeySignature(-3, true);   // C minor from the start
+     * session.musical.keySignatureAt(session.transport.tick)?.sharpsAndFlats.value;   // -3
+     */
+    async setKeySignature(sharpsAndFlats, isMinor, tick = 0) {
+      requireTick(tick, "key signature tick");
+      if (!Number.isInteger(sharpsAndFlats) || sharpsAndFlats < -7 || sharpsAndFlats > 7) {
+        throw new UAError("out_of_range", "setKeySignature(): sharpsAndFlats must be an integer from -7 (flats) to 7 (sharps)");
+      }
+      if (typeof isMinor !== "boolean") throw new UAError("out_of_range", "setKeySignature(): isMinor must be a boolean");
+      await this.post("set_key_signature", { tick, sharps_and_flats: sharpsAndFlats, is_minor: isMinor });
+      const isIt = (k) => k.tick.value === tick && k.sharpsAndFlats.value === sharpsAndFlats && k.isMinor.value === isMinor;
+      await settle(() => this.keySignatures.items.some(isIt), "set key signature", {
+        path: this.keySignatures.path,
+        refresh: () => this.keySignatures.reload(),
+        flush: () => this.client.store.scheduler.flush()
+      });
+      return this.keySignatures.items.find(isIt);
+    }
+    /**
+     * The key signature in effect at `tick`: the last one at or before it. `undefined` when
+     * none is, or the list is not loaded (`await musical.ready()` first).
+     *
+     * @example
+     * const key = session.musical.keySignatureAt(session.transport.tick);
+     * key && `${key.sharpsAndFlats.value} ${key.isMinor.value ? 'minor' : 'major'}`;
+     */
+    keySignatureAt(tick) {
+      let found;
+      for (const k of this.keySignatures.items) {
+        const at = k.tick.value;
+        if (at === void 0 || at > tick) continue;
+        if (found === void 0 || at > found.tick.value) found = k;
+      }
+      return found;
     }
     /** Move bar one to `tick`. */
     setBarOne(tick) {
@@ -7605,191 +10696,6 @@ var Luna = (() => {
     return rows;
   }
 
-  // src/model/system.ts
-  var Drivers = class extends Node {
-    connected;
-    unsupported;
-    sampleRates;
-    /** @internal */
-    constructor(client) {
-      super(client, "/drivers");
-      this.connected = this.prop("connected");
-      this.unsupported = this.prop("unsupported");
-      this.sampleRates = this.prop("sample_rates");
-    }
-  };
-  var Device = class extends Node {
-    name;
-    deviceType;
-    online;
-    sampleRate;
-    clockSource;
-    /** @internal */
-    constructor(client, path) {
-      super(client, path);
-      this.name = this.prop("name");
-      this.deviceType = this.prop("device_type");
-      this.online = this.prop("online");
-      this.sampleRate = this.prop("sample_rate");
-      this.clockSource = this.prop("clock_source");
-    }
-  };
-  var Devices = class extends Collection {
-    /** @internal */
-    constructor(client) {
-      super(client, "/devices", (p) => new Device(client, p), { levels: 2, commands: false, flatvalue: true });
-    }
-  };
-  var Preferences = class extends Node {
-    ioBufferSize;
-    playFromStopLocation;
-    recordMute;
-    metronomeSound;
-    metronomeSounds;
-    /** @internal */
-    constructor(client) {
-      super(client, "/preferences");
-      this.ioBufferSize = this.writableProp("io_buffer_size");
-      this.playFromStopLocation = this.writableProp("play_from_stop_location");
-      this.recordMute = this.writableProp("record_mute");
-      this.metronomeSound = this.writableProp("metronome_sound");
-      this.metronomeSounds = this.prop("metronome_sounds");
-    }
-  };
-  var Render = class extends Node {
-    state;
-    /** 0..100, as the engine reports it. {@link progress} is the 0..1 view. */
-    percentComplete;
-    errorMessage;
-    name;
-    renderType;
-    /** Seconds left, as the engine estimates it; absent for an offline render. */
-    timeRemaining;
-    /** True for an offline (faster than real time) render, which reports no time remaining. */
-    isOffline;
-    totalSamples;
-    /** 0..1, ready for a `<progress>` element. */
-    progress;
-    /** @internal */
-    constructor(client, path) {
-      super(client, path);
-      this.state = this.prop("state");
-      this.percentComplete = this.prop("percent_complete");
-      this.errorMessage = this.prop("error_message");
-      this.name = this.prop("name");
-      this.renderType = this.prop("type");
-      this.timeRemaining = this.prop("time_remaining");
-      this.isOffline = this.prop("render_is_offline");
-      this.totalSamples = this.prop("total_samples");
-      this.progress = derived([this.percentComplete], () => (this.percentComplete.value ?? 0) / 100);
-    }
-    /** `completed`, `aborted` or `failed`: nothing more will happen. */
-    get isTerminal() {
-      const s = this.state.value;
-      return s === "completed" || s === "aborted" || s === "failed";
-    }
-    /**
-     * Resolve when the render completes; reject when it is aborted, fails, or the engine
-     * removes the node before it was seen to finish. A short offline render can finish and
-     * vanish before anything observes it (fact 44), which surfaces as a `removed` rejection
-     * even though the output was written.
-     */
-    done(timeoutMs = 10 * 6e4) {
-      const watch = this.client.store.watch("/renders", { recursive: true, load: false });
-      return new Promise((resolve, reject) => {
-        let finish = () => void 0;
-        const settle2 = () => {
-          const s = this.state.value;
-          if (s === "completed") {
-            finish();
-            resolve();
-            return true;
-          }
-          if (s === "aborted" || s === "failed") {
-            finish();
-            reject(new UAError(s, `render ${this.name.value ?? this.id} ${s}${this.errorMessage.value ? `: ${this.errorMessage.value}` : ""}`, { path: this.path }));
-            return true;
-          }
-          return false;
-        };
-        const timer = setTimeout(() => {
-          finish();
-          reject(new UAError("no_effect", `render ${this.id} did not settle within ${timeoutMs} ms`, { path: this.path }));
-        }, timeoutMs);
-        const offState = this.state.onChange(() => settle2());
-        const renders = this.client.store.children("/renders");
-        const offChildren = renders.onChange(() => {
-          if (settle2()) return;
-          if (!(renders.value ?? []).includes(this.id)) {
-            finish();
-            reject(new UAError("removed", `render ${this.id} was removed before it was seen to finish`, { path: this.path }));
-          }
-        });
-        finish = () => {
-          clearTimeout(timer);
-          offState();
-          offChildren();
-          watch.release();
-        };
-        settle2();
-      });
-    }
-    abort() {
-      return this.wire.post("/renders/abort", { uid: this.id });
-    }
-    delete() {
-      return this.wire.post("/renders/delete", { uid: this.id });
-    }
-  };
-  var Renders = class extends Collection {
-    /** @internal */
-    constructor(client) {
-      super(client, "/renders", (p) => new Render(client, p), { levels: 2, commands: false, flatvalue: true });
-    }
-  };
-  var Job = class extends Node {
-    uid;
-    /** Nil uuid (32 zeros) when the job belongs to no session. */
-    sessionUid;
-    jobType;
-    /** `queued | running | canceling | completed | failed | canceled`. */
-    status;
-    stage;
-    error;
-    warning;
-    /** Track uid the job targets, when any. */
-    targetUid;
-    cancellable;
-    percentComplete;
-    /** @internal */
-    constructor(client, path) {
-      super(client, path);
-      this.uid = this.prop("uid");
-      this.sessionUid = this.prop("session_uid");
-      this.jobType = this.prop("job_type");
-      this.status = this.prop("status");
-      this.stage = this.prop("stage");
-      this.error = this.prop("error");
-      this.warning = this.prop("warning");
-      this.targetUid = this.prop("target_uid");
-      this.cancellable = this.prop("cancellable");
-      this.percentComplete = this.prop("percent_complete");
-    }
-    get isTerminal() {
-      const s = this.status.value;
-      return s === "completed" || s === "failed" || s === "canceled";
-    }
-    cancel() {
-      return this.post("commands/cancel_job", {});
-    }
-  };
-  var Jobs = class extends Collection {
-    /** @internal */
-    constructor(client) {
-      super(client, "/jobs", (p) => new Job(client, p), { levels: 2, commands: false, flatvalue: true });
-    }
-  };
-
   // src/model/session.ts
   var SYSTEM_TRACK_TYPES = /* @__PURE__ */ new Set(["click", "count_in"]);
   var RECORD_LOOP_MARGIN_TICKS = TICKS_PER_BEAT * 4;
@@ -7816,6 +10722,8 @@ var Luna = (() => {
     /** Tempo map, time and key signatures, and tick/bar/seconds conversion. */
     musical;
     markers;
+    /** Settings Add Ons keep with this session, by reverse-DNS context (fact 110). */
+    preferences;
     /** Edit contexts (`main`, `editor`, `alt_<n>`). */
     contexts;
     /** The `main` edit context: selection, zoom and the context edit commands. */
@@ -7834,7 +10742,7 @@ var Luna = (() => {
     focusedTrack;
     sourcesCollection;
     sourcesRelease;
-    batchDepth = 0;
+    openTransaction;
     watchRelease;
     readyPromise;
     /** @internal */
@@ -7856,9 +10764,10 @@ var Luna = (() => {
       this.transport = new Transport(client, this.path, () => this.musical);
       this.tracks = new Collection(client, `${this.path}/tracks`, (p) => new Track(client, p, uid), { levels: 2, commands: false, flatvalue: true });
       this.buses = new Collection(client, `${this.path}/buses`, (p) => new Bus(client, p, uid), { levels: 2, commands: false, flatvalue: true });
-      this.playlists = new Collection(client, `${this.path}/playlists`, (p) => new Playlist(client, p, uid, () => this.batching), { levels: 2, commands: false, flatvalue: true });
+      this.playlists = new Collection(client, `${this.path}/playlists`, (p) => new Playlist(client, p, uid, () => this.transactionMode), { levels: 2, commands: false, flatvalue: true });
       this.musical = new Musical(client, this.path, uid, (name, fn) => this.transaction(name, fn));
       this.markers = new Markers(client, this.path, uid, () => this.musical.timeline);
+      this.preferences = new SessionPreferences(client, this.path);
       this.contexts = new Collection(client, `${this.path}/contexts`, (p) => new Context(client, p, uid), { levels: 2, commands: false, flatvalue: true });
       this.context = new Context(client, `${this.path}/contexts/main`, uid);
       const focusedId = derived([this.context.lastSelectedTrack, this.context.selectionTracks, this.tracks], () => this.focusedTrackId(), { distinct: true });
@@ -7976,39 +10885,60 @@ var Luna = (() => {
     }
     /**
      * Run `fn` as one undoable step. Aborts (discarding pending changes) if `fn` throws.
-     * Called while a batch is already open, `fn` runs inside that batch: wrappers that batch
+     * Called while a transaction is already open, `fn` runs inside that one: wrappers that batch
      * their own steps (`Output.retarget`) then join the caller's undo entry instead of nesting.
+     *
+     * A batch (the default) holds LUNA's pushes until the commit, so the model shows the edits
+     * only once this resolves. With `continuous`, every command replaces the one before it
+     * (see {@link TransactionOptions.continuous}).
      *
      * @example
      * await session.transaction('Rename all', async () => {
      *   for (const t of session.tracks.items) await t.name.set(`${t.name.value} (mix)`);
      * });
+     *
+     * @example
+     * // Rewrite a clip's notes as one undo step: delete the old ones, write the new ones.
+     * await session.transaction('Humanize', async () => {
+     *   const old = clip.midi.notes.items;
+     *   await clip.midi.deleteNotes(old);
+     *   await clip.addNotes(old.map((n) => ({ pitch: n.pitch, tick: Math.max(0, n.startTick + Math.round((Math.random() - 0.5) * 40)), lengthTicks: n.stopTick! - n.startTick, velocity: n.velocity })));
+     * });
+     * await clip.midi.refresh();
      */
     async transaction(name, fn, options = {}) {
-      if (this.batching) return fn();
-      await this.post("begin_transaction", { session_uid: this.uid, name, is_continuous: options.continuous ?? false });
-      this.batchDepth++;
+      if (this.openTransaction) return fn();
+      const continuous = options.continuous ?? false;
+      const payload = { session_uid: this.uid, name, is_continuous: continuous };
+      if (continuous) payload["sends_undo_notifications"] = true;
+      await this.post("begin_transaction", payload);
+      this.openTransaction = continuous ? "continuous" : "batch";
       try {
         const result = await fn();
-        this.batchDepth--;
+        this.openTransaction = void 0;
         await this.post("commit_transaction", { session_uid: this.uid });
         return result;
       } catch (err) {
-        this.batchDepth--;
+        this.openTransaction = void 0;
         await this.post("abort_transaction", { session_uid: this.uid }).catch(() => void 0);
         throw err;
       }
     }
-    /**
-     * True while a {@link transaction} batch is open. LUNA holds selection writes and MIDI
-     * deltas until the commit, so the selection-based verbs refuse to run inside one.
-     */
+    /** True while a {@link transaction} is open, of either kind. */
     get batching() {
-      return this.batchDepth > 0;
+      return this.openTransaction !== void 0;
+    }
+    /** The kind of {@link transaction} open now, or `undefined` outside one. */
+    get transactionMode() {
+      return this.openTransaction;
     }
     /**
      * Insert a clip from a source file onto a track's active playlist. Timeline position is in
      * ticks; source offsets are nanoseconds (fact 16).
+     *
+     * `sourceUid` is required for every clip type, MIDI included: LUNA answers
+     * `uasrv.invalid_property` without one (fact 112). To start a MIDI clip of your own, write
+     * its notes with {@link Playlist.createNotes}, which makes the clip.
      */
     insertClip(options) {
       const payload = { session_uid: this.uid, source_uid: options.sourceUid, start: options.startTick, stop: options.stopTick };
@@ -8060,6 +10990,32 @@ var Luna = (() => {
       if (options.trackUids !== void 0) payload["track_uid"] = options.trackUids;
       if (options.copy !== void 0) payload["copy"] = options.copy;
       return this.post("move_clips", payload);
+    }
+    /**
+     * Set the shape and/or curvature of fades, given as `seg.fadeIn.value` / `seg.fadeOut.value`
+     * from {@link Playlist.compiledClips} (pass both halves of a crossfade). LUNA's
+     * `change_fade_curvature`, one undo step; it also reaches the matching fades of tracks in the
+     * same edit group. `curvature` is -1 to 1, 0 being the shape's own curve; `reset` puts back
+     * `log` with curvature 0 (fact 117).
+     *
+     * @example
+     * const seg = lane.compiledClips.ofClip(clip.id)[0];
+     * await session.setFadeCurve([seg.fadeIn.value], { shape: 'equal_power', curvature: 0.3 });
+     */
+    async setFadeCurve(fades, options) {
+      const uids = fades.map((f) => f?.uid).filter((u) => typeof u === "string" && u.length > 0);
+      if (!uids.length) throw new UAError("out_of_range", "setFadeCurve(): give at least one fade");
+      const shape = requireFadeShape(options.shape, "setFadeCurve()");
+      const payload = { session_uid: this.uid, fades: uids };
+      if (options.reset) payload["default"] = true;
+      if (shape) payload["fade_shape"] = shape;
+      if (options.curvature !== void 0) {
+        if (!Number.isFinite(options.curvature) || options.curvature < -1 || options.curvature > 1) throw new UAError("out_of_range", "setFadeCurve(): curvature must be between -1 and 1");
+        payload["fade_curvature"] = options.curvature;
+        payload["initial_curvature_values"] = uids.map(() => 0);
+      }
+      if (!options.reset && !shape && options.curvature === void 0) throw new UAError("out_of_range", "setFadeCurve(): give shape, curvature or reset");
+      await this.wire.post(`${this.path}/contexts/main/commands/change_fade_curvature`, payload);
     }
     /**
      * Delete tracks by uid in one undo step, and resolve once they have left {@link tracks}.
@@ -8408,6 +11364,7 @@ var Luna = (() => {
       this.playlists.dispose();
       this.musical.dispose();
       this.markers.dispose();
+      this.preferences.dispose();
       this.contexts.dispose();
       this.sourcesCollection?.dispose();
       this.sourcesRelease?.();
@@ -8660,12 +11617,16 @@ var Luna = (() => {
     sessions;
     /** The plugin catalog (`/plugins`). Call `load()` once before reading. */
     plugins;
-    /** The preset library query (`/presets`). */
+    /** The preset library (`/presets`): query, tag groups, recommendations, live selection. */
     presets;
+    /** Whether UA Assistant is connected to LUNA (`/assistant`); preset recommendations need it. */
+    assistant;
     /** Session packages on disk and the workspace query. */
     workspace;
     drivers;
     devices;
+    /** The MIDI devices LUNA sees (`/devices/<LUNA>/midi`), `All` and `None` included. */
+    midiDevices;
     preferences;
     renders;
     jobs;
@@ -8686,10 +11647,12 @@ var Luna = (() => {
       this.statusUnsub = port.onStatus((s) => this.statusCell.update(s));
       this.sessions = new Sessions(this);
       this.plugins = new Plugins(this);
+      this.assistant = new Assistant(this);
       this.presets = new Presets(this);
       this.workspace = new Workspace(this);
       this.drivers = new Drivers(this);
       this.devices = new Devices(this);
+      this.midiDevices = new MidiDevices(this);
       this.preferences = new Preferences(this);
       this.renders = new Renders(this);
       this.jobs = new Jobs(this);
@@ -8832,37 +11795,6 @@ var Luna = (() => {
     return typeof value === "object" && value !== null && !Array.isArray(value) && "value" in value ? value.value : value;
   }
 
-  // src/client/detect.ts
-  function search() {
-    const loc = globalThis.location;
-    return typeof loc?.search === "string" ? loc.search : void 0;
-  }
-  function locationOptions() {
-    const s = search();
-    if (!s) return {};
-    const params = new URLSearchParams(s);
-    const out = {};
-    const host = params.get("host");
-    const port = params.get("port");
-    if (host) out.host = host;
-    if (port && Number.isFinite(Number(port))) out.port = Number(port);
-    const engine = params.get("engine");
-    if (engine === "wasm" || engine === "luna" || engine === "mock") out.engine = engine;
-    const engineUrl = params.get("engine_url");
-    if (engineUrl) out.engineUrl = engineUrl;
-    return out;
-  }
-  function isEmbeddedInLuna() {
-    return locationOptions().port !== void 0;
-  }
-  function isLunaEnginePort(port) {
-    return port === DEFAULT_LUNA_PORT;
-  }
-  function hasNativeBridge() {
-    const w = globalThis;
-    return typeof w.lunaAPI?.setAcceptsFileDrops === "function";
-  }
-
   // src/client/connect.ts
   async function connect(options = {}) {
     if (options.port_) {
@@ -8968,6 +11900,6 @@ var Luna = (() => {
   }
 
   // src/luna.ts
-  var VERSION = "0.1.0.15";
+  var VERSION = "0.2.1";
   return __toCommonJS(global_exports);
 })();

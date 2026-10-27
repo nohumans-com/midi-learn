@@ -4,12 +4,15 @@
     "name": "MIDI Learn",
     "title": "MIDI Learn",
     "manufacturer": "No Humans",
-    "version": "0.2.0",
-    "sdk_version": "0.1.0.15",
-    "min_luna_version": "1.9.0",
-    "engines": ["luna"],
+    "version": "0.3.0",
+    "sdk_version": "0.2.1",
+    "min_luna_version": "3.1.1",
+    "engines": [
+        "luna"
+    ],
     "html": "index.html",
     "target": "browser",
     "width": 360,
-    "height": 720
+    "height": 720,
+    "description": "Map any MIDI controller to faders, plugin parameters and commands. Mappings are saved with the session."
 }
