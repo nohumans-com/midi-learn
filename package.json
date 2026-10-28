@@ -15,8 +15,7 @@
     "bridge:install": "node bridge/agent.mjs install",
     "bridge:uninstall": "node bridge/agent.mjs uninstall",
     "bridge:status": "node bridge/agent.mjs status",
-    "bridge:diag": "node bridge/agent.mjs diag",
-    "installer": "bash installer/build.sh"
+    "bridge:diag": "node bridge/agent.mjs diag"
   },
   "devDependencies": {
     "@uaudio/luna-builder-sdk": "file:../../Library/Application Support/LUNA Builder SDK/plugins/ua-luna-builder",

@@ -1,8 +1,0 @@
-#!/bin/sh
-# Stop a running bridge before an upgrade replaces its files.
-LABEL=com.uaudio.midi-learn.bridge
-user=$(stat -f%Su /dev/console)
-if [ -n "$user" ] && [ "$user" != root ] && [ "$user" != loginwindow ]; then
-  launchctl bootout "gui/$(id -u "$user")/$LABEL" 2>/dev/null || true
-fi
-exit 0
