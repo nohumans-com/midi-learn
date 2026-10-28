@@ -102,7 +102,7 @@ function toast(text, error = false) {
 //   luna    LUNA publishes MIDI ports (Luna.MidiInput / Luna.SendMidi): every message, in order, and
 //           feedback out of the device. A LUNA release that has them is the way forward.
 //   webmidi the browser's Web MIDI (Chrome, Edge, LUNA on Windows). LUNA's macOS webview has none.
-//   bridge  the local helper on 127.0.0.1:8797 (npm run bridge, or the macOS installer), which
+//   bridge  the local helper on 127.0.0.1:8797 (npm run bridge), which
 //           carries every input and the feedback out.
 //   last    LUNA's per-device "last controller / last note" values, which every LUNA publishes. They
 //           are coalesced and a repeat of the same value is not a change, so a knob works but a
