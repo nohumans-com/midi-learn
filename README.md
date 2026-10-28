@@ -169,7 +169,7 @@ The page takes MIDI from the best source it finds, one at a time (the MIDI chip'
    device. Needs a LUNA that publishes MIDI ports to Add Ons (SDK facts 123 to 125); LUNA 3.1.1 does
    not.
 2. **Web MIDI**, where the browser has it (Chrome, Edge, LUNA on Windows). LUNA's macOS webview has none.
-3. **The helper** (`npm run bridge`, or the macOS installer): carries every input and the feedback
+3. **The helper** (`npm run bridge`): carries every input and the feedback
    out. This is what a Mac with LUNA 3.1.1 uses.
 4. **LUNA's last-controller values**, which every LUNA publishes for each device. Knobs and faders
    work with nothing installed, but there is no feedback, LUNA coalesces fast moves, and a repeat of
@@ -207,30 +207,18 @@ npx ua-builder install           # link into LUNA's Add Ons folder; appears unde
 | `logic.js` | Parsing, the control catalog, learn mode, applying MIDI, storage, templates. No DOM. |
 | `main.js` | MIDI in and out (the SDK), the page, the background picker. |
 | `bridge/midi-bridge.mjs` | The optional local helper (log, disk copy of the settings). |
-| `installer/` | Builds the macOS `.pkg` (Add On + self-contained bridge). |
 | `tests/` | Vitest against the mock engine. |
 | `vendor/luna.global.js` | The SDK bundle, **patched** (see below). |
 | `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries, as a source diff. |
 | `scripts/vendor-sdk.mjs` | Vendors the installed SDK's bundle with that change applied. |
 
-## Share it (macOS installer)
+## Share it
 
 ```sh
-npm run installer          # -> .build/MIDI Learn <version>.pkg
+npm run pack               # -> midi-learn.lunaaddon
 ```
 
-MIDI no longer needs the helper, so the `.lunaaddon` (`npm run pack`) is enough to share. The `.pkg`
-still installs the helper too, for its log and disk copy, without Node or npm. It puts the Add On in LUNA's Add Ons folder (replacing any earlier MIDI Learn, a
-`npm run install-addon` symlink included) and installs the bridge with its own Node runtime
-(official nodejs.org build, universal) in `/Library/Application Support/MIDI Learn`, started at
-every login by `/Library/LaunchAgents/com.uaudio.midi-learn.bridge.plist`. That agent has the same
-label as `npm run bridge:install`'s, so on a machine with both only one runs. To remove it:
-`sudo "/Library/Application Support/MIDI Learn/uninstall.sh"`.
-
-The package is not signed with a Developer ID, so macOS blocks it on first open: the recipient
-opens it, then clicks **Open Anyway** in System Settings > Privacy & Security. The build checks
-the vendored bundle still carries its patch and starts the packaged bridge on arm64 and x86_64.
-`installer/` holds the sources: `build.sh`, the pkg scripts, the agent and the uninstaller.
+MIDI no longer needs the helper, so the `.lunaaddon` is all you hand out. The recipient double-clicks it to install it in LUNA.
 
 ## The vendored SDK is patched
 
