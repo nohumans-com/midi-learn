@@ -2,7 +2,7 @@
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { Luna } from '@uaudio/ua-builder-sdk';
+import { Luna } from '@uaudio/luna-builder-sdk';
 
 globalThis.Luna = Luna; // logic.js is a classic script that reads the Luna global
 await import('../logic.js');
@@ -329,6 +329,23 @@ describe('vendored SDK bundle', () => {
     // patches/ua-builder-sdk-load-retry.patch: Node, Collection and Session forget a failed load.
     expect(bundle.match(/if \(this\.loading === loading\) this\.loading = void 0;/g)).toHaveLength(2);
     expect(bundle).toContain('if (this.readyPromise !== ready) return;');
+  });
+
+  it('is kept by npm run pack', () => {
+    // ua-builder pack replaces vendor/luna.global.js with the unpatched bundle unless told not to.
+    expect(JSON.parse(read('package.json')).scripts.pack).toBe('ua-builder pack --no-vendor');
+  });
+});
+
+describe('manifest', () => {
+  const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url), 'utf8'));
+
+  it('carries name and title, so LUNA builds before and after the rename both show it', () => {
+    expect(manifest).toMatchObject({ name: 'MIDI Learn', title: 'MIDI Learn' });
+  });
+
+  it('names its manufacturer for Settings > Add Ons', () => {
+    expect(manifest.manufacturer).toBe('No Humans');
   });
 });
 
@@ -1434,5 +1451,164 @@ describe('Hold in Plugins mode', () => {
     const map = mapper.pluginMappings.map((m) => `${m.source.number}:${m.target.param}`);
     expect(map).toEqual(bands.map((b, i) => `${24 + i}:eq_${b}`));
     expect(mapper.learning).toBe(true);
+  });
+});
+
+describe('saved with the session', () => {
+  async function open({ engine = new Luna.MockEngine(), storage = logic.memoryStore(), uid = 'abc' } = {}) {
+    if (!engine.sessionAdded) {
+      engine.addSession(uid, { name: 'Demo', tracks: ['Vocal', 'Bass'], packageUid: `pkg_${uid}` });
+      engine.sessionAdded = true;
+    }
+    await engine.settled();
+    const luna = await Luna.connect({ port_: engine.port() });
+    const session = await luna.session();
+    const sessionStore = new logic.SessionSettings(session);
+    await sessionStore.load();
+    const mapper = new logic.Mapper(session, { storage, sessionStore, subscribe: (p, fn) => luna.raw.subscribe(p, fn, { recursive: true }) });
+    await mapper.start();
+    return { engine, luna, session, sessionStore, mapper, storage };
+  }
+  const learnFader = async (r, cc) => {
+    const gain = gainOf(r.session, 'Bass');
+    r.mapper.setLearning(true);
+    r.engine.setValue(gain.path, 'touch_count', 1);
+    await r.mapper.settled();
+    await r.engine.settled();
+    r.mapper.midi(CC(cc, 64), 'dev');
+  };
+
+  it('keeps session mappings in the session, not in the machine\'s storage', async () => {
+    const r = await open();
+    await learnFader(r, 7);
+    await r.mapper.flushSession();
+    expect(r.sessionStore.available).toBe(true);
+    expect(r.storage.get(logic.KEYS.session('pkg_abc'))).toBeUndefined();
+    // a fresh page on the same session reads them back from LUNA
+    const again = await open({ engine: r.engine });
+    expect(again.mapper.sessionMappings).toHaveLength(1);
+    expect(again.mapper.sessionMappings[0].source).toMatchObject({ type: 'cc', number: 7 });
+  });
+
+  it('adopts mappings an earlier version kept in local storage, once', async () => {
+    const storage = logic.memoryStore();
+    storage.set(logic.KEYS.session('pkg_abc'), [{ id: 'old', scope: 'session', mode: 'follow', source: { type: 'cc', number: 9, channel: null, device: null }, target: { kind: 'command', command: 'play', label: 'Play' } }]);
+    const r = await open({ storage });
+    expect(r.mapper.sessionMappings.map((m) => m.id)).toEqual(['old']);
+    await r.mapper.flushSession();
+    expect(r.sessionStore.get('session')).toHaveLength(1);
+    // the session's copy now wins over the machine's
+    storage.set(logic.KEYS.session('pkg_abc'), []);
+    const again = await open({ engine: r.engine, storage });
+    expect(again.mapper.sessionMappings.map((m) => m.id)).toEqual(['old']);
+  });
+
+  it('writes nothing into a session that has no mappings', async () => {
+    const r = await open();
+    await r.mapper.flushSession();
+    expect(r.sessionStore.has('session')).toBe(false);
+  });
+
+  it('saves Channel Focus with the session only when asked, and goes back to the shared layout', async () => {
+    const r = await open();
+    const focus = [{ id: 'f1', scope: 'focus', mode: 'follow', source: { type: 'cc', number: 20, channel: null, device: null }, target: { kind: 'focus', area: 'Strip', label: 'Fader', control: 'gain' } }];
+    r.mapper.focusMappings = focus;
+    r.mapper.save();
+    expect(r.mapper.savedWithSession('focus')).toBe(false);
+    expect(r.storage.get(logic.KEYS.focus)).toHaveLength(1);
+
+    r.mapper.setSavedWithSession('focus', true);
+    await r.mapper.flushSession();
+    expect(r.mapper.savedWithSession('focus')).toBe(true);
+    r.mapper.focusMappings = [];
+    r.mapper.save(); // goes to the session, so the shared layout keeps its mapping
+    await r.mapper.flushSession();
+    expect(r.storage.get(logic.KEYS.focus)).toHaveLength(1);
+    const again = await open({ engine: r.engine, storage: r.storage });
+    expect(again.mapper.focusMappings).toEqual([]);
+
+    again.mapper.setSavedWithSession('focus', false);
+    await again.mapper.flushSession();
+    expect(again.mapper.savedWithSession('focus')).toBe(false);
+    const third = await open({ engine: r.engine, storage: r.storage });
+    expect(third.mapper.focusMappings).toHaveLength(1);
+  });
+
+  it('falls back to local storage on a LUNA without session preferences', async () => {
+    const engine = new Luna.MockEngine();
+    engine.addSession('abc', { name: 'Demo', tracks: ['Vocal', 'Bass'], packageUid: 'pkg_abc' });
+    await engine.settled();
+    const luna = await Luna.connect({ port_: engine.port() });
+    const session = await luna.session();
+    const sessionStore = new logic.SessionSettings(session);
+    sessionStore.ctx.load = () => Promise.reject(new Error('no preferences'));
+    expect(await sessionStore.load()).toBe(false);
+    const storage = logic.memoryStore();
+    const mapper = new logic.Mapper(session, { storage, sessionStore });
+    mapper.sessionMappings = [{ id: 'x' }];
+    mapper.loadStored();
+    mapper.sessionMappings = [{ id: 'x' }];
+    mapper.save();
+    expect(storage.get(logic.KEYS.session('pkg_abc'))).toEqual([{ id: 'x' }]);
+    expect(mapper.setSavedWithSession('focus', true)).toBe(false);
+  });
+});
+
+describe('device names', () => {
+  it('treats the same hardware as one device whoever names it', () => {
+    expect(logic.sameDevice('Roto-Control (2)', 'Roto-Control')).toBe(true);
+    expect(logic.sameDevice('IAC IAC Bus 1', 'IAC Bus 1')).toBe(true);
+    expect(logic.sameDevice('nanoKONTROL2', 'NANOKONTROL2')).toBe(true);
+    expect(logic.sameDevice('Roto-Control', 'Roto-Control Mini')).toBe(false);
+    expect(logic.sameDevice('IAC Bus 1', 'IAC Bus 5')).toBe(false);
+    expect(logic.sameDevice('a', undefined)).toBe(false);
+  });
+});
+
+describe('pan on mono and stereo channels', () => {
+  const fake = (path, n) => {
+    const subs = [];
+    return { path, normalized: { value: n, onChange: (f) => (subs.push(f), () => subs.splice(subs.indexOf(f), 1)), set: async (v) => { fake.last[path] = v; } }, begin() {}, end() {}, resetToDefault: async () => {}, load: async () => {} };
+  };
+  fake.last = {};
+
+  it('names the pan a channel really has', () => {
+    expect(logic.panFor('pan', false)).toBe('pan');
+    expect(logic.panFor('pan_left', false)).toBe('pan');
+    expect(logic.panFor('balance', false)).toBe('pan');
+    expect(logic.panFor('pan', true)).toBe('balance');
+    expect(logic.panFor('pan_left', true)).toBe('pan_left');
+    expect(logic.panFor('gain', true)).toBe('gain');
+  });
+
+  it('Balance moves the left and right pans together, and reads back from them', async () => {
+    const left = fake('/o/controls/pan_left', 0);
+    const right = fake('/o/controls/pan_right', 1);
+    const b = new logic.BalanceControl(left, right);
+    expect(b.path).toBe('/o/controls/balance');
+    expect(b.normalized.value).toBe(0.5);
+    expect(b.display.value).toBe('C');
+    await b.normalized.set(1);
+    expect(fake.last['/o/controls/pan_left']).toBe(1);
+    expect(fake.last['/o/controls/pan_right']).toBe(1);
+    await b.normalized.set(0.75);
+    expect([fake.last['/o/controls/pan_left'], fake.last['/o/controls/pan_right']]).toEqual([0.5, 1]);
+    await b.normalized.set(0);
+    expect([fake.last['/o/controls/pan_left'], fake.last['/o/controls/pan_right']]).toEqual([0, 0]);
+    left.normalized.value = 0.5;
+    right.normalized.value = 1;
+    expect(b.normalized.value).toBe(0.75);
+    expect(b.display.value).toBe('50R');
+  });
+
+  it('a pan mapped on a mono channel finds the stereo channel\'s pan, and back', () => {
+    const e = (name) => ({ path: `/t/outputs/main/controls/${name}`, channel: 'T', area: 'Strip', name });
+    const stereo = [e('gain'), e('pan_left'), e('pan_right'), e('balance')];
+    const mono = [e('gain'), e('pan')];
+    const target = (name) => ({ kind: 'control', path: '/other', channel: 'T', area: 'Strip', name });
+    expect(logic.resolve(stereo, target('pan')).name).toBe('balance');
+    expect(logic.resolve(stereo, target('pan_right')).name).toBe('pan_right');
+    expect(logic.resolve(mono, target('pan_left')).name).toBe('pan');
+    expect(logic.resolve(mono, target('balance')).name).toBe('pan');
   });
 });

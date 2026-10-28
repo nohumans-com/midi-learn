@@ -10,23 +10,22 @@
       --chalk: #F6F6F3; --tape: #FFB65A; --ink: #000; --paper: #E9E9E6;
       --red: #FF3B30; --yellow: #FFC400; --green: #34C759;
       --fg: #000; --fg-2: rgba(0, 0, 0, 0.5); --line: rgba(0, 0, 0, 0.09); --well: rgba(0, 0, 0, 0.07);
-      --grid: rgba(0, 0, 0, 0.07); /* the background grid only: quieter than any line that means something */
       --card: rgba(255, 255, 255, 0.55); --card-hi: rgba(255, 255, 255, 0.78); --rule: rgba(0, 0, 0, 0.14); --stroke: rgba(0, 0, 0, 0.32);
-      --solid: #000; --on-solid: #fff; --cell: 44px; --gap: 14px;
+      --tape-hi: var(--tape); --tape-lo: var(--tape); /* main.js sets these: the room, a touch lighter above and darker below */
+      --solid: #000; --on-solid: #fff; --gap: 14px;
       --spring: cubic-bezier(0.32, 0.72, 0, 1);
       --type: "Helvetica Neue", "Neue Haas Grotesk Text", Helvetica, Arial, -apple-system, sans-serif;
       color-scheme: light;
     }
     :root[data-tone="dark"] {
       --fg: #fff; --fg-2: rgba(255, 255, 255, 0.62); --line: rgba(255, 255, 255, 0.12); --well: rgba(255, 255, 255, 0.12);
-      --grid: rgba(255, 255, 255, 0.035); /* barely there on dark rooms, so it never competes with the controls */
       --card: rgba(255, 255, 255, 0.09); --card-hi: rgba(255, 255, 255, 0.16); --rule: rgba(255, 255, 255, 0.16); --stroke: rgba(255, 255, 255, 0.34);
       --solid: #fff; --on-solid: #000; color-scheme: dark;
     }
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body { height: 100%; overscroll-behavior: none; }
     body {
-      margin: 0; background: var(--tape); color: var(--fg); font: 15px/1.25 var(--type); -webkit-font-smoothing: antialiased;
+      margin: 0; background: var(--tape); background: linear-gradient(180deg, var(--tape-hi) 0%, var(--tape) 42%, var(--tape-lo) 100%) fixed var(--tape); color: var(--fg); font: 15px/1.25 var(--type); -webkit-font-smoothing: antialiased;
       display: flex; flex-direction: column; overflow: hidden; transition: background-color 300ms ease, color 300ms ease;
       -webkit-user-select: none; user-select: none;
     }
@@ -38,11 +37,42 @@
     [hidden] { display: none !important; }
     select option { color: #000; }
 
-    /* ---- Status line ---------------------------------------------------------------- */
-    .status { display: flex; align-items: center; gap: 8px; padding: 10px 16px 8px; font-size: 13px; font-weight: 500; flex: none; min-width: 0; }
-    .status .session { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 0 1 auto; }
-    .status .session b { font-weight: 700; }
-    .status .session span { color: var(--fg-2); }
+    /* ---- Brand header: the UA diamond, the DIN-plug reader and the name; help and colour at the right --- */
+    .help-title { display: flex; align-items: center; gap: 12px; margin: 0 0 6px; }
+    .help-title h4 { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.03em; }
+    .help-title .plug { width: 84px; height: 84px; flex: none; overflow: visible; color: #000; --tape: var(--chalk); }
+    .help .page { transform-origin: 50% 100%; animation: flip 6s ease-in-out infinite; }
+    @keyframes flip { 0%, 88%, 100% { transform: none; } 92% { transform: scaleX(0.82) skewY(-3deg); } 96% { transform: none; } }
+    /* ---- Masthead: one raised card holding the logo, the name, the session and the controls ---- */
+    .mast { flex: none; display: flex; flex-direction: column; min-width: 0; position: relative; font-size: 13px; font-weight: 500; margin: 10px 12px 2px; border-radius: 16px; background: var(--card-hi); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 8px 22px -10px rgba(0, 0, 0, 0.35), 0 0 0 1px var(--line); }
+    .mast-top { display: flex; align-items: center; gap: 10px; padding: 12px 14px 10px; min-width: 0; }
+    .mast-sub { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px 12px; border-top: 1px solid var(--line); min-width: 0; }
+    /* The UA diamond stands alone: no badge, box or ring around it. */
+    .mast .logo { display: flex; flex: none; }
+    .mast .logo svg { flex: none; overflow: visible; color: var(--fg); width: 50px; height: 37px; }
+    .mast h1 { margin: 0; font-size: clamp(18px, 5vw, 25px); font-weight: 800; letter-spacing: -0.04em; line-height: 1; white-space: nowrap; min-width: 0; }
+    .mast h1 .w2 { margin-left: 0.22em; }
+    .mast .tools { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: none; }
+    .mast-sub .session { flex: 1 1 150px; }
+    @media (max-height: 560px) { .mast .logo svg { width: 40px; height: 30px; } }
+    @media (max-width: 520px) { .mast-sub .session { flex-basis: 100%; } }
+    @media (max-width: 420px) {
+      .mast { margin: 8px 8px 2px; }
+      .mast .logo svg { width: 40px; height: 30px; }
+      .mast-top { gap: 8px; }
+      .mast .tools { gap: 6px; }
+    }
+    @media (max-width: 330px) {
+      .mast .logo svg { width: 34px; height: 25px; }
+      .mast h1 { font-size: 16px; }
+      .help-btn, .swatch { width: 24px; height: 24px; }
+    }
+    .session { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
+    .session #status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .session b { font-weight: 700; }
+    .session .lbl { font-weight: 700; letter-spacing: 0.06em; margin-right: 6px; }
+    .session span { color: var(--fg-2); }
+
     .chip {
       position: relative; display: flex; align-items: center; gap: 6px; height: 28px; min-width: 0; max-width: min(280px, 44vw);
       padding: 0 26px 0 11px; border-radius: 14px; background: rgba(128, 128, 128, 0.18); cursor: pointer; transition: background-color 200ms; flex: 0 1 auto;
@@ -50,17 +80,18 @@
     .chip:hover { background: rgba(128, 128, 128, 0.26); }
     .chip:focus-within { outline: 2px solid var(--fg); outline-offset: 2px; }
     .chip .k { font-size: 12px; font-weight: 500; color: var(--fg-2); flex: none; }
-    .chip select { appearance: none; -webkit-appearance: none; border: 0; background: transparent; padding: 0; min-width: 0; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; cursor: pointer; outline: none; }
+    .chip select { pointer-events: none; appearance: none; -webkit-appearance: none; border: 0; background: transparent; padding: 0; min-width: 0; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; overflow: hidden; cursor: pointer; outline: none; }
     .chip::after { content: ""; position: absolute; right: 11px; top: 50%; width: 6px; height: 6px; border: solid currentColor; border-width: 0 1.8px 1.8px 0; transform: translateY(-70%) rotate(45deg); pointer-events: none; }
     .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: #bbb; flex: none; transition: background 300ms; }
     .chip .dot.live { background: var(--green); }
     .chip .dot.hit { background: var(--hit, var(--yellow)); transition: none; }
-    .link { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--fg-2); flex: none; }
-    .link::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #bbb; transition: background 300ms; }
-    .link.live::before { background: var(--green); }
+    .ldot { width: 8px; height: 8px; border-radius: 50%; background: #bbb; flex: none; transition: background 300ms, box-shadow 300ms; }
+    .ldot.ok { background: var(--green); box-shadow: 0 0 6px 0 rgba(52, 199, 89, 0.6); }
+    .ldot.wait { background: var(--yellow); }
+    .ldot.off { background: var(--red); }
     .help-btn { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; flex: none; font-size: 15px; font-weight: 700; background: rgba(128, 128, 128, 0.18); }
     .help-btn:hover { background: rgba(128, 128, 128, 0.26); }
-    .help { width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 70px); overflow-y: auto; padding: 16px 18px; }
+    .help { width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 92px); overflow-y: auto; padding: 16px 18px; }
     .pop.help h4 { margin: 0 0 4px; font-size: 18px; letter-spacing: -0.02em; }
     .help > p { margin: 0 0 10px; font-size: 13px; color: rgba(0, 0, 0, 0.6); }
     .help details { border-top: 1px solid rgba(0, 0, 0, 0.1); }
@@ -80,18 +111,16 @@
     .board {
       flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 6px 16px 20px;
       display: grid; gap: 22px var(--gap); grid-template-columns: minmax(0, 1fr); align-content: start;
-      background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-      background-size: var(--cell) var(--cell); background-position: -1px -1px;
     }
     .col { display: flex; flex-direction: column; gap: 14px; min-width: 0; container-type: inline-size; }
     h2 { margin: 0; font-size: clamp(26px, 5vw, 34px); font-weight: 700; letter-spacing: -0.035em; line-height: 1; }
     h3 { margin: 0; font-size: 19px; font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: baseline; gap: 8px; }
     h3 small { font-size: 13px; font-weight: 600; color: var(--fg-2); letter-spacing: 0; font-variant-numeric: tabular-nums; }
     .lede { margin: 6px 0 0; color: var(--fg-2); font-size: 14px; max-width: 46ch; }
-    .head { display: flex; align-items: center; gap: 8px; min-height: 32px; flex-wrap: wrap; }
+    .head { display: flex; align-items: baseline; gap: 8px; min-height: 32px; flex-wrap: wrap; }
     .head h3 { margin-right: auto; }
 
-    /* Wide (the long bottom-tab shape): Proxy, Mappings and Channel Focus | Parameters, each
+    /* Wide (the long bottom-tab shape): Click & Turn, Mappings and Channel Focus | Parameters, each
        column scrolling on its own. */
     @media (min-width: 720px) {
       .board { grid-template-columns: minmax(0, 1fr) var(--c3, 330px); grid-template-rows: minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
@@ -109,21 +138,46 @@
 
     /* Folding: a section's header stays, its body goes; in the wide layout the column narrows. */
     .body { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+    /* An open section's body sits in a softly shaded well, so what belongs to it reads as inside it */
+    .sect > .body, .col > .body { padding: 12px 14px; border-radius: 16px; background: linear-gradient(180deg, rgba(0, 0, 0, 0.085), rgba(0, 0, 0, 0.03)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3), 0 0 0 1px rgba(0, 0, 0, 0.04); }
+    :root[data-tone="dark"] .sect > .body, :root[data-tone="dark"] .col > .body { background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0.035)); box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 0 0 1px rgba(255, 255, 255, 0.05); }
     .col.folded > .body { display: none; } /* its own body only, not a section nested inside it */
     .col.folded { container-type: normal; } /* size containment would make a folded column 0 wide */
-    .fold { display: flex; align-items: center; gap: 8px; text-align: left; margin-right: auto; min-width: 0; }
-    .fold::before { content: ""; width: 7px; height: 7px; border: solid currentColor; border-width: 0 2px 2px 0; transform: rotate(45deg) translate(-2px, -2px); transition: transform 260ms var(--spring); flex: none; }
+    .fold { display: flex; align-items: baseline; gap: 8px; text-align: left; margin-right: auto; min-width: 0; }
+    .fold::before { align-self: center; content: ""; width: 7px; height: 7px; border: solid currentColor; border-width: 0 2px 2px 0; transform: rotate(45deg) translate(-2px, -2px); transition: transform 260ms var(--spring); flex: none; }
     .fold[aria-expanded="false"]::before { transform: rotate(-45deg); }
     .head .fold h3 { margin: 0; }
+    .fold h3 small:empty { display: none; }
 
     /* The learn bar: opens at the top of the section that is learning. */
     .learnbar { display: flex; flex-direction: column; gap: 10px; margin-bottom: 6px; animation: rise 320ms var(--spring) both; }
     .learnbar .slots { grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr); }
     .learnbar.proxy .slots { grid-template-columns: 1fr; }
     .learnbar.proxy #slot-target { display: none; }
+    .cmd-toggle { align-self: flex-start; margin-top: 8px; }
+    .cmd-toggle[aria-expanded="true"] { background: var(--solid); color: var(--on-solid); }
+    .slot.got .cmd-toggle { background: rgba(255, 255, 255, 0.16); color: #fff; }
+    .learnbar.proxy .cmd-toggle, .learnbar.no-cmd .cmd-toggle { display: none; }
+    .cmd-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 2px 8px; max-height: 232px; overflow-y: scroll; padding: 6px; border-radius: 12px; background: var(--card); box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.12); }
+    .cmd-list::-webkit-scrollbar { width: 10px; }
+    .cmd-list::-webkit-scrollbar-thumb { background: var(--stroke); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
     .lb-foot { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
     .hold-switch { flex: none; }
     @media (max-width: 560px) { .learnbar .slots { grid-template-columns: 1fr; } }
+    /* The MIDI input list wears the room's colours, like the masthead card above it, with a scroll bar that stays visible */
+    .device-menu { position: fixed; z-index: 40; display: flex; flex-direction: column; gap: 2px; min-width: 220px; max-width: calc(100vw - 16px); padding: 6px; border-radius: 16px;
+      background: linear-gradient(var(--card-hi), var(--card-hi)), var(--tape); color: var(--fg); overflow-y: scroll; overscroll-behavior: contain;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), 0 14px 34px -10px rgba(0, 0, 0, 0.45), 0 0 0 1px var(--line); }
+    .device-menu button { text-align: left; padding: 8px 12px; border-radius: 12px; font-size: 13px; font-weight: 700; white-space: nowrap; flex: none; display: flex; align-items: center; gap: 8px; transition: background-color 160ms; }
+    .device-menu button::before { content: ""; width: 7px; height: 7px; border-radius: 50%; flex: none; background: transparent; }
+    .device-menu button:hover, .device-menu button:focus-visible { background: var(--well); outline: none; }
+    .device-menu button[aria-selected="true"] { background: var(--solid); color: var(--on-solid); }
+    .device-menu button[aria-selected="true"]::before { background: var(--green); }
+    /* One scroll bar look for every scrolling area */
+    .device-menu::-webkit-scrollbar, .board::-webkit-scrollbar, .help::-webkit-scrollbar { width: 10px; }
+    .device-menu::-webkit-scrollbar-track, .board::-webkit-scrollbar-track, .help::-webkit-scrollbar-track { background: transparent; margin: 6px 0; }
+    .device-menu::-webkit-scrollbar-thumb, .board::-webkit-scrollbar-thumb, .help::-webkit-scrollbar-thumb { background: var(--stroke); border-radius: 5px; border: 2px solid transparent; background-clip: padding-box; }
+    .device-menu::-webkit-scrollbar-thumb:hover, .board::-webkit-scrollbar-thumb:hover, .help::-webkit-scrollbar-thumb:hover { background: var(--fg-2); background-clip: padding-box; }
     .learn-menu { padding: 6px; display: flex; flex-direction: column; min-width: 220px; position: fixed; }
     .learn-menu button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 8px 10px; border-radius: 10px; }
     .learn-menu button:hover, .learn-menu button:focus-visible { background: rgba(0, 0, 0, 0.07); outline: none; }
@@ -192,6 +246,9 @@
     .board { --section-gap: 26px; row-gap: var(--section-gap); }
     #col-maps { gap: var(--section-gap); }
     #col-maps > .sect { margin-top: 0; }
+    .sess-row { display: flex; justify-content: flex-end; margin: 0 0 6px; }
+    .sess-row .switch { font-weight: 600; color: var(--fg-2); }
+    .sess-row .switch:disabled { opacity: 0.4; }
     .saved-maps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--fg-2); }
     .saved-maps .map-chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 4px 0 11px; border-radius: 14px; background: var(--well); color: var(--fg); font-weight: 700; }
     .saved-maps .map-chip.on { background: var(--solid); color: var(--on-solid); }
@@ -203,9 +260,7 @@
        a status line rather than part of the title. */
     .fold-sum { flex: 1 1 0; min-width: 0; font-size: 13px; font-weight: 400; color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .sect:not(.folded) .fold-sum { display: none; }
-    /* Folded, line everything in the header up on the title's text baseline, so the summary sits
-       on the same line as the title instead of floating above it. */
-    .sect.folded > .head, .col.folded > .head { align-items: baseline; }
+    /* Folded or open, the header aligns the same way, so unfolding never nudges the title or what is below it. */
     .sect.folded .fold { margin-right: 0; }
     .sect.folded .segments, .sect.folded .focus-chip, .sect.folded #focus-fb { display: none; }
     .focus-chip { max-width: min(220px, 50%); }
@@ -217,7 +272,7 @@
     .slot .mode-note { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 9px; background: var(--ink); color: var(--tape); margin-left: auto; }
     .slot.got .mode-note { background: #fff; color: #000; }
 
-    /* ---- Proxy ----------------------------------------------------------------- */
+    /* ---- Click & Turn ----------------------------------------------------------------- */
     .mighty { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "src tgt val" "opts opts opts"; align-items: center; gap: 10px 10px; padding: 12px; border-radius: 4px; background: linear-gradient(var(--card), var(--card)), var(--tape); }
     .mighty .src { grid-area: src; }
     .mighty .tgt { grid-area: tgt; min-width: 0; }
@@ -249,6 +304,8 @@
     .val { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; width: 84px; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; }
     .val .meter { width: 100%; height: 4px; }
     .tags { display: flex; align-items: center; gap: 4px; }
+    .tag.fb { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 22px; padding: 0; }
+    .tag.fb svg { display: block; }
     .tag { font-size: 11px; font-weight: 700; padding: 3px 8px; border-radius: 10px; background: var(--well); white-space: nowrap; }
     .tag.global { background: var(--ink); color: var(--tape); }
     :root[data-tone="dark"] .tag.global { background: #fff; color: #000; }
@@ -314,7 +371,7 @@
     :root[data-tone="dark"] .note.banner code { background: rgba(0, 0, 0, 0.08); }
 
     /* ---- Popovers: background colour, templates -------------------------------------- */
-    .pop { position: fixed; top: 46px; right: 16px; z-index: 40; background: var(--chalk); color: #000; border-radius: 16px; padding: 14px; width: max-content; max-width: calc(100vw - 32px);
+    .pop { position: fixed; top: 72px; right: 16px; z-index: 40; background: var(--chalk); color: #000; border-radius: 16px; padding: 14px; width: max-content; max-width: calc(100vw - 32px);
       box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22); animation: rise 260ms var(--spring) both; --fg: #000; --fg-2: rgba(0, 0, 0, 0.5); --well: rgba(0, 0, 0, 0.07); --rule: rgba(0, 0, 0, 0.12); --solid: #000; --on-solid: #fff; }
     .pop h4 { margin: 0 0 10px; font-size: 13px; }
     .colors .grid { display: grid; grid-template-columns: repeat(6, 30px); gap: 10px; }
@@ -372,14 +429,13 @@
     }
     @media (max-width: 420px) {
       .map.open { margin: 6px -8px; padding: 0 8px 4px; } /* the board's padding is 12px here */
-      .status { padding: 8px 12px 6px; gap: 6px; }
-      .link { font-size: 0; gap: 0; }
+      .mast-sub { padding-left: 12px; padding-right: 12px; gap: 6px; }
       .board { padding-left: 12px; padding-right: 12px; }
       .chip { padding: 0 22px 0 9px; }
       .chip::after { right: 9px; }
     }
     @media (max-width: 520px) {
-      .status .k { display: none; }
+      .mast-sub .k { display: none; }
       .val { width: 60px; }
       .tags .tag.mode { display: none; }
     }
@@ -389,26 +445,40 @@
   </style>
 </head>
 <body>
-  <div class="status">
-    <div class="session" id="status">Connecting</div>
-    <label class="chip" title="Which MIDI input MIDI Learn listens to">
-      <i class="dot" id="midi-dot"></i><span class="k">MIDI</span><select id="device" aria-label="MIDI input"></select>
-    </label>
-    <div class="link" id="link">LUNA</div>
+  <header class="mast">
+    <!-- The UA diamond, as LUNA Channel draws it (qi_channel shared/src/application-root.ts, from UA_DIAMOND_FRIEND.svg) -->
+    <div class="mast-top">
+      <span class="logo">
+    <svg class="ua" viewBox="0 0 69.86 51.37" fill="currentColor" role="img" aria-label="Universal Audio">
+      <path d="M1.23,26.55l33.29,19.3c.26.15.57.15.83,0l33.29-19.3c.54-.32.55-1.1.02-1.43L35.36,4.86c-.26-.16-.6-.16-.86,0L1.21,25.12c-.54.33-.53,1.11.02,1.43ZM41.88,17.04v9.38s.02.05.05.05h15.75l.09,1.11-15.84.76s-.05.02-.05.05v5.48s-.16,3.23,3.38,3.19c0,0-2.99.73-4.42-.52-1.09-.98-.98-2.84-.98-2.84v-5.21s-.03-.05-.06-.05l-5.55.27s-.05.02-.05.05v4.18c0,2.56-1.87,4.87-4.43,5.09-2.88.25-5.29-2.01-5.29-4.84v-14.26s.32-3.17-3.38-3.19c0,0,2.99-.73,4.42.52,1.08.97,1.02,2.84,1.02,2.84v.21l-.02,13.88c0,1.56,1.26,2.81,2.82,2.82,1.56,0,2.82-1.26,2.82-2.82v-4.32s-.02-.05-.05-.05l-2.56.12s-.07-.05-.04-.08l1.72-2.38h.93v-4.96s0-4.72,0-4.72c0-2.83,2.41-5.09,5.29-4.84,2.55.22,4.43,2.53,4.43,5.09Z"/>
+      <path d="M39.84,16.8c0-1.56-1.26-2.82-2.82-2.82-1.56,0-2.81,1.26-2.82,2.82v4.87s0,4.81,0,4.81h5.65v-9.68Z"/>
+    </svg>
+      </span>
+      <h1 aria-label="MIDI Learn"><span class="w1">MIDI</span><span class="w2">Learn</span></h1>
+    <div class="tools">
+      <button class="help-btn" id="open-help" aria-label="Help" title="Help: what each part does">?</button>
+      <button class="swatch" id="open-colors" aria-label="Background colour" title="Background colour"></button>
+    </div>
+    </div>
+    <div class="mast-sub">
+      <div class="session"><div id="status">Connecting</div><i class="ldot wait" id="link" title="Connecting to LUNA"></i></div>
+    <div class="chip" id="midi-chip" role="button" tabindex="0" aria-haspopup="listbox" title="Which MIDI input MIDI Learn listens to">
+      <i class="dot" id="midi-dot"></i><span class="k">MIDI</span><select id="device" aria-label="MIDI input" tabindex="-1"></select>
+    </div>
     <button class="pill" id="open-templates" aria-haspopup="dialog" title="Save or load your whole controller layout: every section">Templates</button>
-    <button class="help-btn" id="open-help" aria-label="Help" title="Help: what each part does">?</button>
-    <button class="swatch" id="open-colors" aria-label="Background colour" title="Background colour"></button>
-  </div>
+    </div>
+  </header>
 
   <main class="board" id="board">
     <section class="col" id="col-maps" aria-label="Mappings">
-      <section class="sect first" id="mighty-sect" aria-label="Proxy">
+      <section class="sect first" id="mighty-sect" aria-label="Click &amp; Turn">
         <div class="head">
-          <button class="fold" data-fold="mighty" aria-expanded="true"><h3>Proxy</h3></button>
+          <button class="fold" data-fold="mighty" aria-expanded="true"><h3>Click &amp; Turn</h3></button>
           <span class="fold-sum" id="mighty-sum"></span>
           <button class="pill learn-pill" id="mighty-learn" data-learn="mighty" aria-pressed="false" title="Learn the knob that drives whatever you click (right-click for options)">Learn</button>
         </div>
         <div class="body">
+          <div class="sess-row"><button class="switch" data-session="mighty" aria-pressed="false" title="Keep Click &amp; Turn inside this LUNA session, so it comes back with the session file, on any machine. Off: one layout shared by every session"><i></i>Save with this session</button></div>
           <div class="mighty" id="mighty" data-state="empty">
             <span class="src" id="mighty-src">—</span>
             <span class="tgt"><b id="mighty-label">No knob yet</b><small id="mighty-where"></small></span>
@@ -416,7 +486,7 @@
             <span class="line mighty-opts">
               <button class="switch" id="mighty-hold" aria-pressed="false" title="Pin: stay on this control; clicks elsewhere don't move it"><i></i>Pin</button>
               <button class="switch" id="mighty-fb" aria-pressed="true" title="Send the value back, so a motorized knob turns to each new control"><i></i>Feedback</button>
-              <button class="x" id="mighty-x" aria-label="Remove Proxy"><svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+              <button class="x" id="mighty-x" aria-label="Remove Click &amp; Turn"><svg viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
             </span>
           </div>
         </div>
@@ -435,7 +505,7 @@
         <div class="body">
           <div class="learnbar" id="learnbar" hidden>
             <div class="slots">
-              <div class="slot wait" id="slot-target"><span class="n"><i>1</i>Parameter</span><span class="what">None</span></div>
+              <div class="slot wait" id="slot-target"><span class="n"><i>1</i>Parameter</span><span class="what">None</span><button class="pill cmd-toggle" id="cmd-toggle" aria-expanded="false" aria-controls="cmd-list" title="Pick a command (play, record, undo…) from a list here, instead of a control">Commands</button></div>
               <div class="slot wait" id="slot-source">
                 <span class="n"><i>2</i>MIDI</span>
                 <div class="src-edit">
@@ -448,6 +518,7 @@
                 </div>
               </div>
             </div>
+            <div class="cmd-list" id="cmd-list" role="group" aria-label="Commands" hidden></div>
             <div class="lb-foot"><button class="pill" id="learn-done">Done</button></div>
           </div>
           <ul class="maps" id="maps"></ul>
@@ -465,6 +536,7 @@
           <button class="pill learn-pill" id="focus-learn" data-learn="focus" aria-pressed="false" title="Learn a Channel Focus mapping. Shift-click or right-click to Hold and learn several">Learn</button>
         </div>
         <div class="body">
+          <div class="sess-row"><button class="switch" data-session="focus" aria-pressed="false" title="Keep Channel Focus inside this LUNA session, so it comes back with the session file, on any machine. Off: one layout shared by every session"><i></i>Save with this session</button></div>
           <ul class="maps" id="focus-maps"></ul>
         </div>
       </section>
@@ -480,6 +552,7 @@
           <button class="pill learn-pill" id="plugin-learn" data-learn="plugin" aria-pressed="false" title="Learn a parameter into this plugin's map: turn a knob in the plugin's window, then on your controller. Shift-click or right-click to Hold">Learn</button>
         </div>
         <div class="body">
+          <div class="sess-row"><button class="switch" data-session="plugins" aria-pressed="false" title="Keep the plugin maps inside this LUNA session, so it comes back with the session file, on any machine. Off: one layout shared by every session"><i></i>Save with this session</button></div>
           <ul class="maps" id="plugin-maps"></ul>
           <div class="saved-maps" id="saved-maps"></div>
         </div>
@@ -500,8 +573,39 @@
   </main>
 
   <div class="pop help" id="help" role="dialog" aria-label="Help" hidden>
-    <h4>MIDI Learn</h4>
-    <p>Map any MIDI controller to anything in LUNA. Three sections do the mapping. Each has its own Learn button.</p>
+    <div class="help-title">
+      <svg class="plug" viewBox="0 0 80 80" role="img" aria-label="A cartoon figure with a 5-pin MIDI plug for a head, reading a book called MIDI">
+        <!-- legs and feet -->
+        <path d="M33 62v8M47 62v8" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+        <path d="M29 72h8M43 72h8" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+        <!-- body -->
+        <path d="M26 62c-1-9 2-17 14-17s15 8 14 17z" fill="var(--well)" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round"/>
+        <!-- head: a 5-pin DIN plug end-on. Round shield with its key tab on top, the five pins on a
+             half circle (the two ends level with the centre, one at 45 degrees each side, one on top),
+             each in its own ring. The lower half is the face. -->
+        <rect x="36" y="4.5" width="8" height="5" rx="1.4" fill="var(--tape)" stroke="currentColor" stroke-width="2.4"/>
+        <circle cx="40" cy="26" r="17.5" fill="var(--tape)" stroke="currentColor" stroke-width="3"/>
+        <circle cx="40" cy="26" r="13.6" fill="currentColor" opacity=".13"/>
+        <g fill="currentColor">
+          <circle cx="31" cy="26" r="2.3"/><circle cx="33.6" cy="19.6" r="2.3"/><circle cx="40" cy="17" r="2.3"/><circle cx="46.4" cy="19.6" r="2.3"/><circle cx="49" cy="26" r="2.3"/>
+        </g>
+        <g fill="var(--tape)" stroke="currentColor" stroke-width="1.6">
+          <circle cx="35" cy="31.5" r="2.7"/><circle cx="45" cy="31.5" r="2.7"/>
+        </g>
+        <circle cx="35" cy="32.6" r="1.2" fill="currentColor"/><circle cx="45" cy="32.6" r="1.2" fill="currentColor"/>
+        <path d="M36 37.4q4 2.6 8 0" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+        <!-- the book, held open in front, cover out, its pages flipping now and then -->
+        <g class="page">
+          <path d="M17 44l23 4 23-4v18l-23 4-23-4z" fill="var(--solid)" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round"/>
+          <text x="40" y="60" text-anchor="middle" font-size="11" font-weight="800" letter-spacing=".5" fill="var(--on-solid)" font-family="system-ui, -apple-system, sans-serif">MIDI</text>
+        </g>
+        <!-- hands on the book -->
+        <circle cx="17" cy="52" r="4.2" fill="var(--tape)" stroke="currentColor" stroke-width="2.4"/>
+        <circle cx="63" cy="52" r="4.2" fill="var(--tape)" stroke="currentColor" stroke-width="2.4"/>
+      </svg>
+      <h4>MIDI Learn</h4>
+    </div>
+    <p>Map any MIDI controller to anything in LUNA.</p>
     <details open><summary>Learning a mapping</summary><div class="doc">
       <p>Press <b>Learn</b> in a section's header (<kbd>L</kbd> for Mappings). Then, in either order: touch a control in LUNA (or pick one in Parameters), and move a knob, fader or pad. A learn bar opens at the top of that section while it learns.</p>
       <dl>
@@ -512,18 +616,20 @@
       </dl>
       <p>One MIDI control drives one thing: learning it again moves it, from any section.</p>
     </div></details>
-    <details><summary>Proxy</summary><div class="doc">
+    <details><summary>Click &amp; Turn</summary><div class="doc">
       <p>One knob that controls <b>whatever you last clicked or dragged in LUNA</b>: a fader, a pan, a send, a mute or a plugin parameter. Learn it once, then click around. LUNA doesn't report what the mouse hovers over, only what you touch.</p>
       <dl>
         <dt>Pin</dt><dd>Stay on the current control; clicks elsewhere don't move it.</dd>
-        <dt>Feedback</dt><dd>On by default. When the Proxy moves to a new control, that control's value is sent to the knob, so a motorized knob (Roto-Control) turns to it.</dd>
-        <dt>×</dt><dd>Removes the Proxy.</dd>
+        <dt>Feedback</dt><dd>On by default. When Click &amp; Turn moves to a new control, that control's value is sent to the knob, so a motorized knob (Roto-Control) turns to it.</dd>
+        <dt>Save with this session</dt><dd>Keep this knob inside the LUNA session, so it comes back with the session file. Off: one Click &amp; Turn knob shared by every session.</dd>
+        <dt>×</dt><dd>Removes Click &amp; Turn.</dd>
       </dl>
     </div></details>
     <details><summary>Mappings</summary><div class="doc">
       <p>Fixed mappings: this knob always drives that control on that track, or runs that command.</p>
       <dl>
-        <dt>All / Session / Global</dt><dd>Filter the list. Session mappings belong to this session and come back when it reopens. Global mappings work in every session.</dd>
+        <dt>All / Session / Global</dt><dd>Filter the list. Session mappings are saved inside this LUNA session and come back when it reopens, on any machine. Global mappings work in every session.</dd>
+        <dt>Commands</dt><dd>While learning, the <b>Commands</b> button in the learn bar opens the list of LUNA commands right there (Play, Record, Undo…), so you can pick one without scrolling down to Parameters.</dd>
         <dt>Templates</dt><dd>In the top bar: save or load your whole layout, every section (see Templates).</dd>
       </dl>
     </div></details>
@@ -533,21 +639,23 @@
         <dt>Selected / Lock</dt><dd>Follow LUNA's selection, or lock the focus to one track.</dd>
         <dt>Feedback</dt><dd>On or off for every Channel Focus mapping at once. On: selecting a track sends its values, so motorized knobs jump to it.</dd>
         <dt>Plugins</dt><dd>A plugin parameter only works on tracks with the same plugin in the same insert slot; elsewhere its row reads "not on …".</dd>
+        <dt>Save with this session</dt><dd>Keep Channel Focus inside the LUNA session, so each session can have its own layout. Off: one layout shared by every session.</dd>
         <dt>Stepping tracks</dt><dd>Map <b>Select next track</b> and <b>Select previous track</b> (Parameters → Commands) to two buttons.</dd>
       </dl>
     </div></details>
     <details><summary>Plugins</summary><div class="doc">
-      <p>Plugin maps: one map per plugin <i>type</i> (UA 1176, Pro-Q…), used by <b>whichever instance of it is in focus</b>. Map your knobs once and they control any 1176 you open, in any session.</p>
+      <p>Plugin maps: one map per plugin <i>type</i> (UA 1176, Pro-Q…), used by <b>whichever instance of it is in focus</b>. Map your knobs once and they control any 1176 you open, in any session (or only this one, with Save with this session).</p>
       <dl>
         <dt>Focus</dt><dd>Like Channel Focus: <b>select a track</b> and its plugin with a map is in focus. Turning a knob in another plugin's window switches to that instance until you select another track. Opening a plugin window alone can't: LUNA doesn't tell add-ons which plugin windows are open, only what you touch. The menu can <b>lock</b> one instance.</dd>
         <dt>Learn</dt><dd>Press <b>Learn</b>, turn a knob in the plugin's window, then one on your controller. Turn on <b>Hold</b> (next to <b>Learn</b> while it learns) to map several parameters in a row.</dd>
         <dt>A layer</dt><dd>While a plugin with a map is in focus, its knobs win; the same knobs fall back to your other mappings when it isn't. So eight knobs can mean different things for every plugin.</dd>
         <dt>Feedback</dt><dd>On by default: focusing another instance sends its values, so motorized knobs jump to them.</dd>
+        <dt>Save with this session</dt><dd>Keep the plugin maps inside the LUNA session. Off: one set of maps shared by every session.</dd>
         <dt>Saved maps</dt><dd>Every plugin with a map, with how many controls it has. × deletes a map (press twice).</dd>
       </dl>
     </div></details>
     <details><summary>Templates</summary><div class="doc">
-      <p><b>Templates</b> (top bar) save your whole controller layout, every section: this session's mappings, global mappings, Channel Focus, the Proxy and plugin maps. <b>Load</b> merges a template in; <b>Replace</b> clears those sections first. <b>Export</b>/<b>Import</b> move templates and everything global to another machine.</p>
+      <p><b>Templates</b> (top bar) save your whole controller layout, every section: this session's mappings, global mappings, Channel Focus, Click &amp; Turn and plugin maps. <b>Load</b> merges a template in; <b>Replace</b> clears those sections first. <b>Export</b>/<b>Import</b> move templates and everything global to another machine.</p>
     </div></details>
     <details><summary>A mapping's settings (the ⌄ on a row)</summary><div class="doc">
       <dl>
@@ -557,7 +665,7 @@
         <dt>Range</dt><dd>The lowest and highest MIDI value (0–127) the control can reach. Drag the two caps, or use the arrow keys (Shift for 10).</dd>
         <dt>Invert</dt><dd>Turning up turns the control down.</dd>
         <dt>Global</dt><dd>Use this mapping in every session (Mappings only).</dd>
-        <dt>Feedback</dt><dd>Send LUNA's value back to the controller, so motorized knobs and button lights follow. Off unless turned on (on by default in Channel Focus and Proxy). A ↔ on the row shows it's on.</dd>
+        <dt>Feedback</dt><dd>Send LUNA's value back to the controller, so motorized knobs and button lights follow. Off unless turned on (on by default in Channel Focus and Click &amp; Turn). A ↔ on the row shows it's on.</dd>
         <dt>Device</dt><dd>The MIDI input this mapping listens to, and where its feedback goes (the output of the same name). <b>Any input</b> listens to all; feedback then goes to whichever device it last heard from.</dd>
         <dt>×</dt><dd>Deletes the mapping.</dd>
       </dl>
@@ -566,8 +674,9 @@
       <p>Everything you can map, per track: strip controls (fader, pan, mute, solo), sends, cues, automation modes, plugins, and LUNA commands. Click one while learning to pick it, or click one any time to start learning it. Search filters the list; <b>Rescan</b> reads the session again.</p>
       <dl>
         <dt>Plugins</dt><dd>Listed by name; touch a knob in the plugin's window while learning to map it. Their parameters are read one at a time, never all at once (that can hang LUNA).</dd>
+        <dt>Pan</dt><dd>A mono channel has one <b>Pan</b>. A stereo channel lists <b>Pan L</b> and <b>Pan R</b> (Stereo Pan) and <b>Balance</b>, one knob that moves both (Balance). A pan mapped on one kind of channel finds the pan on the other, so Channel Focus pans keep working as the focus moves between mono and stereo tracks.</dd>
         <dt>Automation</dt><dd>Off / Read / Write / Touch / Latch buttons, Next automation mode (steps through them), and Automation mode (a knob with five zones).</dd>
-        <dt>Commands</dt><dd>Play/Stop, Record, Loop, Undo, Redo, Save, Select next/previous track and more. <b>Reset parameter to default</b> puts the parameter in focus (the one you last touched in LUNA, or last moved with the Proxy or a Channel Focus knob) back to LUNA's default, as one undo step.</dd>
+        <dt>Commands</dt><dd>Play/Stop, Record, Loop, Undo, Redo, Save, Select next/previous track and more. <b>Reset parameter to default</b> puts the parameter in focus (the one you last touched in LUNA, or last moved with Click &amp; Turn or a Channel Focus knob) back to LUNA's default, as one undo step.</dd>
       </dl>
     </div></details>
     <details><summary>Feedback and motorized controllers</summary><div class="doc">
@@ -576,7 +685,7 @@
     </div></details>
     <details><summary>Top bar</summary><div class="doc">
       <dl>
-        <dt>MIDI</dt><dd>Which input MIDI Learn listens to: all, or one device. In LUNA on a Mac, MIDI arrives through a small helper (<kbd>npm run bridge:install</kbd>, once).</dd>
+        <dt>MIDI</dt><dd>Which input MIDI Learn listens to: all, or one device. It is the helper, Web MIDI or LUNA itself, whichever is available (see the MIDI chip's tooltip).</dd>
         <dt>LUNA</dt><dd>Green when connected.</dd>
         <dt>?</dt><dd>This help.</dd>
         <dt>Colour</dt><dd>The background colour; text turns white on dark ones.</dd>
@@ -590,6 +699,7 @@
       </dl>
     </div></details>
   </div>
+  <div class="device-menu" id="device-menu" role="listbox" aria-label="MIDI input" hidden></div>
   <div class="pop learn-menu" id="learn-menu" role="menu" hidden>
     <button role="menuitem" data-latch="false"><b>Learn once</b><small>One mapping, then stop</small></button>
     <button role="menuitem" data-latch="true"><b>Hold</b><small>Keep learning, one after another, until you stop</small></button>
@@ -597,6 +707,28 @@
   <div class="toast" id="message" role="status" aria-live="polite"></div>
   <input type="file" id="import-file" accept="application/json,.json" hidden>
 
+  <script>
+    /* Folding works from the first paint, before the SDK and main.js (500 KB+) have loaded and run:
+       it flips the section now and notes the flip for main.js to fold into its saved prefs. */
+    window.__earlyFolds = {};
+    try {
+      const saved = JSON.parse(localStorage.getItem('midilearn.prefs') || '{}').fold || {};
+      for (const b of document.querySelectorAll('.fold')) {
+        b.closest('.sect, .col').classList.toggle('folded', !!saved[b.dataset.fold]);
+        b.setAttribute('aria-expanded', String(!saved[b.dataset.fold]));
+      }
+    } catch {}
+    window.__earlyFold = (e) => {
+      const b = e.target.closest && e.target.closest('.fold');
+      if (!b) return;
+      const sec = b.closest('.sect, .col');
+      const folded = !sec.classList.contains('folded');
+      sec.classList.toggle('folded', folded);
+      b.setAttribute('aria-expanded', String(!folded));
+      window.__earlyFolds[b.dataset.fold] = !window.__earlyFolds[b.dataset.fold];
+    };
+    document.addEventListener('click', window.__earlyFold);
+  </script>
   <script src="vendor/luna.global.js"></script>
   <script src="logic.js"></script>
   <script src="main.js"></script>

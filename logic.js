@@ -13,9 +13,91 @@ const KEYS = {
   globals: 'midilearn.globals',
   focus: 'midilearn.focus', // Channel Focus mappings: one controller layout for every session
   plugins: 'midilearn.plugins', // plugin maps: one map per plugin type, for whichever instance has the focus
-  mighty: 'midilearn.mighty', // the Proxy: one knob that drives whatever was touched last (first called the Mighty Knob; 'mighty' in code and storage, so saved setups carry over)
+  mighty: 'midilearn.mighty', // Click & Turn: one knob that drives whatever was touched last (first called the Mighty Knob; 'mighty' in code and storage, so saved setups carry over)
   templates: 'midilearn.templates',
 };
+
+/** The preference context MIDI Learn keeps in a session (the Add On's id, as LUNA's docs advise). */
+const SESSION_CONTEXT = 'com.uaudio.midi-learn';
+const SESSION_PREFERENCE = 'settings';
+/** The settings that can be saved with a session: one session preference property each. */
+const SESSION_KINDS = ['focus', 'plugins', 'mighty'];
+
+/**
+ * Settings saved inside the LUNA session (`session.preferences`, SDK fact 110), so they travel with
+ * the session file. Reads are synchronous once `load()` resolves; writes update the cache at once
+ * and reach LUNA in order, in the background (`flush()` waits for them). Values are wrapped,
+ * since a property that reads null is one that was never added.
+ */
+class SessionSettings {
+  constructor(session, { onError } = {}) {
+    this.ctx = session.preferences.context(SESSION_CONTEXT);
+    this.onError = onError;
+    this.available = false; // false on a LUNA without session preferences
+    this.cache = new Map(); // key -> value, or undefined once removed
+    this.queue = new Map(); // key -> { value } | { remove: true }, the writes still to send
+    this.running = undefined;
+  }
+
+  /** Read the saved settings. Resolves to whether this LUNA keeps session preferences. */
+  async load() {
+    try {
+      await this.ctx.load();
+      this.available = true;
+    } catch (e) {
+      this.available = false;
+      this.onError?.(e);
+    }
+    return this.available;
+  }
+
+  get(key) {
+    if (this.cache.has(key)) return this.cache.get(key);
+    const raw = this.available ? this.ctx.value(SESSION_PREFERENCE, key).value : undefined;
+    return raw && typeof raw === 'object' && 'v' in raw ? raw.v : undefined;
+  }
+
+  has(key) {
+    return this.get(key) !== undefined;
+  }
+
+  set(key, value) {
+    this.cache.set(key, value);
+    this.queue.set(key, { value });
+    this.run();
+  }
+
+  remove(key) {
+    this.cache.set(key, undefined);
+    this.queue.set(key, { remove: true });
+    this.run();
+  }
+
+  /** Resolves when every write so far has been answered by LUNA. */
+  flush() {
+    return this.running ?? Promise.resolve();
+  }
+
+  run() {
+    this.running ??= (async () => {
+      while (this.queue.size) {
+        const [key, job] = this.queue.entries().next().value;
+        this.queue.delete(key);
+        try {
+          if (job.remove) await this.ctx.remove(SESSION_PREFERENCE, key);
+          else {
+            const exists = this.ctx.value(SESSION_PREFERENCE, key).value != null;
+            if (exists) await this.ctx.set(SESSION_PREFERENCE, key, { v: job.value });
+            else await this.ctx.add(SESSION_PREFERENCE, key, { v: job.value });
+          }
+        } catch (e) {
+          this.onError?.(e);
+        }
+      }
+      this.running = undefined;
+    })();
+  }
+}
 
 /** A touch held open this long after the last MIDI value is released (one undo step per move). */
 const RELEASE_MS = 400;
@@ -46,6 +128,18 @@ const LEARN_ECHO_MS = 1500;
  */
 const LEARN_SETTLE_MS = 600;
 
+/**
+ * Soft takeover: a knob whose position differs from the control's value is ignored until it
+ * reaches the value (within TAKEOVER_NEAR of it, or crossing it between two messages). Once
+ * picked up it stays hooked until something else moves the control by more than TAKEOVER_DRIFT.
+ */
+const TAKEOVER_NEAR = 0.02;
+const TAKEOVER_DRIFT = 0.05;
+/** How a relative (endless) encoder writes a turn: the CC value for a step up or down. */
+const RELATIVE_ENCODINGS = ['twos', 'signmag', 'offset'];
+/** The default size of one encoder click, as a fraction of the control's travel. */
+const RELATIVE_STEP = 0.01;
+
 /** LUNA's automation modes, in its own order (fact 31: the command takes the index). */
 const AUTOMATION_MODES = ['off', 'read', 'write', 'touch', 'latch'];
 const AUTOMATION_LABELS = { off: 'Off', read: 'Read', write: 'Write', touch: 'Touch', latch: 'Latch' };
@@ -71,10 +165,77 @@ const COMMANDS = [
   { id: 'save', label: 'Save session', run: (s) => s.save() },
   { id: 'selectNextTrack', label: 'Select next track', run: (s) => selectTrack(s, 1) },
   { id: 'selectPreviousTrack', label: 'Select previous track', run: (s) => selectTrack(s, -1) },
-  // Resets the parameter in focus: the one last touched in LUNA (what the Proxy follows) or last
-  // moved through the Proxy or a Channel Focus knob.
+  // Resets the parameter in focus: the one last touched in LUNA (what Click & Turn follows) or last
+  // moved through Click & Turn or a Channel Focus knob.
   { id: 'resetFocusedParameter', label: 'Reset parameter to default', run: (s, mapper) => mapper?.resetFocused() },
 ];
+
+/**
+ * Balance for a stereo channel, as one control. LUNA publishes a stereo channel's pan as two
+ * controls, `pan_left` and `pan_right` (SDK fact 84), whichever pan mode its own GUI shows, so one
+ * knob has to move both. At centre they sit at their defaults (full left, full right); turning
+ * right brings the left one across toward the right, turning left does the same to the right one.
+ * It looks like a Control to the Mapper: `normalized`, `real`, `display`, begin/end, reset.
+ */
+class BalanceControl {
+  constructor(left, right) {
+    this.left = left;
+    this.right = right;
+    this.id = 'balance';
+    this.path = `${left.path.slice(0, left.path.lastIndexOf('/'))}/balance`;
+    this.name = { value: 'Balance' };
+    this.isSwitch = false;
+    this.on = false;
+    const read = () => {
+      const l = left.normalized.value;
+      const r = right.normalized.value;
+      if (typeof l !== 'number' || typeof r !== 'number') return undefined;
+      return l > 0 ? (l + 1) / 2 : r / 2;
+    };
+    const watch = (fn) => {
+      const stops = [left.normalized.onChange(fn), right.normalized.onChange(fn)];
+      return () => stops.forEach((stop) => stop());
+    };
+    this.normalized = {
+      get value() {
+        return read();
+      },
+      onChange: watch,
+      set: async (n) => {
+        const c = Math.min(1, Math.max(0, n));
+        await Promise.all([left.normalized.set(Math.max(2 * c - 1, 0)), right.normalized.set(Math.min(2 * c, 1))]);
+      },
+    };
+    this.real = { get value() { return read(); }, onChange: watch };
+    this.display = {
+      get value() {
+        const n = read();
+        if (n === undefined) return '';
+        const c = Math.round(Math.abs(2 * n - 1) * 100);
+        return c === 0 ? 'C' : `${c}${n > 0.5 ? 'R' : 'L'}`;
+      },
+      onChange: watch,
+    };
+  }
+
+  load(options) {
+    return Promise.all([this.left.load(options), this.right.load(options)]).then(() => undefined);
+  }
+
+  begin() {
+    this.left.begin();
+    this.right.begin();
+  }
+
+  end() {
+    this.left.end();
+    this.right.end();
+  }
+
+  async resetToDefault() {
+    await Promise.all([this.left.resetToDefault(), this.right.resetToDefault()]);
+  }
+}
 
 /**
  * Move LUNA's track selection by one, in track order, stopping at the first and last track. It
@@ -113,7 +274,20 @@ const AddOnLogic = {
   automationZone(v) {
     return AUTOMATION_MODES[Math.min(AUTOMATION_MODES.length - 1, Math.floor(v * AUTOMATION_MODES.length))];
   },
+  /**
+   * Whether two MIDI device names are one device. The same hardware is named differently by LUNA
+   * ("Roto-Control (2)", "IAC IAC Bus 1"), the browser and the helper ("Roto-Control", "IAC Bus 1"):
+   * a trailing " (2)" and a driver prefix are ignored, case too.
+   */
+  sameDevice(a, b) {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    const key = (n) => String(n).toLowerCase().replace(/\s*\(\d+\)$/, '').trim();
+    const [x, y] = [key(a), key(b)];
+    return x === y || x.endsWith(` ${y}`) || y.endsWith(` ${x}`);
+  },
   KEYS,
+  SESSION_KINDS,
   COMMANDS,
   RELEASE_MS,
 
@@ -136,6 +310,31 @@ const AddOnLogic = {
     return null;
   },
 
+  RELATIVE_ENCODINGS,
+
+  /**
+   * How far an endless encoder turned: a signed number of clicks (0 for none) from the CC value.
+   * twos: 1..63 up, 127..65 down (127 = -1). signmag: 1..63 up, 65..127 down (65 = -1).
+   * offset: 65..127 up (65 = +1), 63..0 down (63 = -1); 64 is no movement.
+   */
+  relativeDelta(encoding, raw) {
+    if (encoding === 'offset') return raw - 64;
+    if (raw === 0 || raw === 64) return 0;
+    if (encoding === 'signmag') return raw < 64 ? raw : -(raw - 64);
+    return raw < 64 ? raw : raw - 128; // twos
+  },
+
+  /**
+   * Which encoding a first turn suggests, or undefined when it is ambiguous (1 could be two's
+   * complement or sign-magnitude; two's complement is the most common, so 1 and 127 say that).
+   */
+  guessEncoding(raw) {
+    if (raw === 127 || (raw >= 1 && raw <= 3)) return 'twos';
+    if (raw === 65) return 'signmag';
+    if (raw === 63) return 'offset';
+    return undefined;
+  },
+
   /** "C3" for note 60, the octave numbering LUNA and most controllers use. */
   noteName(n) {
     return `${NOTE_NAMES[n % 12]}${Math.floor(n / 12) - 2}`;
@@ -155,9 +354,17 @@ const AddOnLogic = {
    * // { device: null, type: 'cc', channel: null, number: 100 }
    */
   manualSource({ type, number, channel, device = null }) {
-    if (!['cc', 'note', 'pitch', 'program'].includes(type)) return undefined;
+    if (!['cc', 'note', 'pitch', 'program', 'cc14', 'nrpn'].includes(type)) return undefined;
     let n = 0;
-    if (type !== 'pitch') {
+    if (type === 'nrpn') {
+      // NRPN parameter 0..16383, or "msb/lsb" as 7-bit halves ("1/2")
+      const text = String(number ?? '').trim();
+      const pair = /^(\d+)\s*[/:]\s*(\d+)$/.exec(text);
+      if (pair) n = (Number(pair[1]) << 7) | Number(pair[2]);
+      else if (/^\d+$/.test(text)) n = Number(text);
+      else return undefined;
+      if (n < 0 || n > 16383 || (pair && (Number(pair[1]) > 127 || Number(pair[2]) > 127))) return undefined;
+    } else if (type !== 'pitch') {
       const text = String(number ?? '').trim();
       const note = /^([A-Ga-g])(#|b)?(-?\d)$/.exec(text);
       if (note && type === 'note') {
@@ -167,6 +374,7 @@ const AddOnLogic = {
       else return undefined;
       if (type === 'program' && note === null && /^\d+$/.test(text)) n -= 1; // programs are shown 1..128
       if (n < 0 || n > 127) return undefined;
+      if (type === 'cc14' && n > 31) return undefined; // the MSB of a pair: CC 0..31, its LSB is 32..63
     }
     const ch = channel === null || channel === undefined || channel === '' ? null : Number(channel);
     if (ch !== null && !(Number.isInteger(ch) && ch >= 1 && ch <= 16)) return undefined;
@@ -178,13 +386,15 @@ const AddOnLogic = {
     if (src.type === 'cc') return `CC ${src.number}`;
     if (src.type === 'note') return `Note ${AddOnLogic.noteName(src.number)}`;
     if (src.type === 'pitch') return 'Pitch bend';
+    if (src.type === 'cc14') return `CC ${src.number}+${src.number + 32} (14-bit)`;
+    if (src.type === 'nrpn') return `NRPN ${src.number >> 7}/${src.number & 127}`;
     if (src.type === 'program') return `Program ${src.number + 1}`;
     return src.type;
   },
 
   /** LUNA's control ids made readable: `gain` is the Fader, `pre_fader` is Pre-fader. */
   controlLabel(name) {
-    const known = { gain: 'Fader', pan: 'Pan', pan_left: 'Pan L', pan_right: 'Pan R', mute: 'Mute', solo: 'Solo', pre_fader: 'Pre-fader', enabled: 'Send on' };
+    const known = { gain: 'Fader', pan: 'Pan', pan_left: 'Pan L', pan_right: 'Pan R', balance: 'Balance', mute: 'Mute', solo: 'Solo', pre_fader: 'Pre-fader', enabled: 'Send on' };
     if (known[name]) return known[name];
     const s = String(name ?? '').replace(/_/g, ' ');
     return s ? s[0].toUpperCase() + s.slice(1) : '?';
@@ -210,12 +420,16 @@ const AddOnLogic = {
     for (const ch of channels) {
       await Promise.all([ch.loadStrip(), ch.controls.load(), ch.outputs.load(), ch.effects.load()]);
       for (const c of ch.main.controls.items) entries.push(AddOnLogic.entryOf(ch, 'Strip', c));
+      const balance = AddOnLogic.balanceOf(ch.main);
+      if (balance) entries.push(AddOnLogic.entryOf(ch, 'Strip', balance));
       const solo = ch.controls.byId('solo');
       if (solo) entries.push(AddOnLogic.entryOf(ch, 'Strip', solo));
       for (const out of ch.outputs.items) {
         if (!out.isCue && !(out.isSend && out.assigned)) continue;
         await out.controls.load();
         for (const c of out.controls.items) entries.push(AddOnLogic.entryOf(ch, AddOnLogic.outputArea(out.id), c));
+        const sendBalance = AddOnLogic.balanceOf(out);
+        if (sendBalance) entries.push(AddOnLogic.entryOf(ch, AddOnLogic.outputArea(out.id), sendBalance));
       }
       inserts.push(...AddOnLogic.insertsOf(ch, pluginName));
     }
@@ -235,6 +449,30 @@ const AddOnLogic = {
       out.push({ channel: ch.name.value ?? ch.id, channelId: ch.id, slot: fx.id, path: fx.path, pluginId: id, pluginName: fx.pluginName.value || pluginName(id) || id, area: AddOnLogic.insertArea(fx, pluginName) });
     }
     return out;
+  },
+
+  /** Balance for an output whose pan is a left/right pair (a stereo channel or send); undefined otherwise. */
+  balanceOf(output) {
+    const left = output.controls.byId('pan_left');
+    const right = output.controls.byId('pan_right');
+    return left && right ? new BalanceControl(left, right) : undefined;
+  },
+
+  /** Is this control one of a channel's pans (any mode)? */
+  isPan(id) {
+    return id === 'pan' || id === 'pan_left' || id === 'pan_right' || id === 'balance';
+  },
+
+  /**
+   * LUNA gives a mono channel one `pan` and a stereo channel `pan_left` and `pan_right`, so a
+   * pan mapped on one kind of channel would find nothing on the other. This is the control a pan
+   * id means on a channel: on mono any pan is `pan`; on stereo `pan` is the one-knob Balance and
+   * the Left/Right pans stay themselves.
+   */
+  panFor(id, stereo) {
+    if (!AddOnLogic.isPan(id)) return id;
+    if (!stereo) return 'pan';
+    return id === 'pan' ? 'balance' : id;
   },
 
   /** "Send 2" for `send_1`, "Cue 1" for `cue_0`, "Strip" for `main`. */
@@ -296,7 +534,11 @@ const AddOnLogic = {
       await ch.outputs.load();
       const out = ch.outputs.byId(where.slice('outputs/'.length));
       if (!out) return undefined;
-      control = out.controls.get(id);
+      if (id === 'balance') {
+        await out.controls.load();
+        control = AddOnLogic.balanceOf(out);
+        if (!control) return undefined;
+      } else control = out.controls.get(id);
       area = AddOnLogic.outputArea(out.id);
     } else return undefined;
     let timer;
@@ -323,9 +565,9 @@ const AddOnLogic = {
     return { kind: 'focus', rest: target.rest, area: target.area, name: target.name, label: target.label };
   },
 
-  /** The Proxy's target: whichever control the user last touched in LUNA. */
+  /** Click & Turn's target: whichever control the user last touched in LUNA. */
   mightyTarget() {
-    return { kind: 'mighty', label: 'Proxy' };
+    return { kind: 'mighty', label: 'Click & Turn' };
   },
 
   /** A command target. */
@@ -340,7 +582,16 @@ const AddOnLogic = {
    */
   resolve(entries, target) {
     if (target.kind !== 'control') return undefined;
-    return entries.find((e) => e.path === target.path) ?? entries.find((e) => e.channel === target.channel && e.area === target.area && e.name === target.name);
+    const same = entries.filter((e) => e.channel === target.channel && e.area === target.area);
+    const exact = entries.find((e) => e.path === target.path) ?? same.find((e) => e.name === target.name);
+    if (exact || !AddOnLogic.isPan(target.name)) return exact;
+    // A pan mapped on a mono channel meets a stereo one (or the reverse): take the pan it has.
+    const wanted = { pan_left: ['pan_left', 'pan'], pan_right: ['pan_right', 'pan'] }[target.name] ?? ['balance', 'pan'];
+    for (const name of wanted) {
+      const e = same.find((x) => x.name === name);
+      if (e) return e;
+    }
+    return undefined;
   },
 
   /** The mode a new mapping starts in: buttons toggle, knobs and faders follow. */
@@ -379,7 +630,7 @@ class Mapper {
    * an unsubscribe function: `(p, fn) => luna.raw.subscribe(p, fn, { recursive: true })`. It is
    * how a touch on any control reaches learn mode, plugin parameters included (fact 100).
    */
-  constructor(session, { storage, subscribe, pluginName, send, feedbackHoldMs = FEEDBACK_HOLD_MS, now = () => Date.now() } = {}) {
+  constructor(session, { storage, sessionStore, subscribe, pluginName, send, feedbackHoldMs = FEEDBACK_HOLD_MS, now = () => Date.now() } = {}) {
     this.session = session;
     this.send = send; // (device, bytes) => boolean: MIDI out, for feedback; none means no feedback
     this.feedbackHoldMs = feedbackHoldMs;
@@ -393,6 +644,7 @@ class Mapper {
     this.subscribe = subscribe;
     this.pluginName = pluginName;
     this.storage = storage;
+    this.sessionStore = sessionStore; // a loaded SessionSettings: what is saved with the session
     this.now = now;
     this.entries = [];
     this.inserts = [];
@@ -408,7 +660,7 @@ class Mapper {
     this.pluginLock = undefined; // an insert path that holds the plugin focus
     this.learnMode = 'map'; // 'map' (regular) or 'focus' (Channel Focus)
     this.focusLock = undefined; // a track id that holds the focus, instead of LUNA's selection
-    this.mighty = null; // the Proxy mapping, if one is learned
+    this.mighty = null; // Click & Turn mapping, if one is learned
     this.mightyPath = undefined; // the control it drives: the one touched last in LUNA
     this.mightyHold = false; // true: stay on the current control, ignore touches
     this.activity = new Map(); // mapping id -> when it last moved
@@ -417,6 +669,10 @@ class Mapper {
     this.writers = new Map(); // control path -> { busy, next, timer }
     this.selfTouched = new Map(); // control path -> when we last wrote it
     this.inflight = new Set(); // apply() promises not yet answered
+    this.hires = new Map(); // device|channel -> the CC halves and NRPN selection seen, to join 14-bit values
+    this.relTarget = new Map(); // control path -> where relative turns have taken it, while its writer is open
+    this.pickup = new Map(); // mapping id -> soft takeover state { path, pos, last, hooked }
+    this.learnOptions = {}; // { kind: 'cc14' | 'nrpn', relative: encoding | 'auto', takeover }
     this.justLearned = new Map(); // source key -> when its last message arrived since it completed a mapping
     this.lastTouchPath = undefined; // the control touched last while learning
     this.justMapped = undefined; // { path, at }: a parameter just mapped, whose touch may still be trailing
@@ -456,14 +712,56 @@ class Mapper {
     await this.rescan();
   }
 
+  /** Whether this kind of setting ('focus', 'plugins', 'mighty') is saved inside the session now. */
+  savedWithSession(kind) {
+    return !!this.sessionStore?.available && this.sessionStore.has(kind);
+  }
+
+  /**
+   * Save a kind of setting with the session, or go back to the layout every session shares. Turning
+   * it on copies what is shown into the session. Turning it off leaves the session's copy behind,
+   * and gives the shared layout that copy when it has none of its own, so nothing is lost.
+   */
+  setSavedWithSession(kind, on) {
+    if (!SESSION_KINDS.includes(kind) || !this.sessionStore?.available) return false;
+    const current = this.kindValue(kind);
+    if (on) this.sessionStore.set(kind, current);
+    else {
+      const shared = this.storage.get(KEYS[kind]);
+      if (shared == null || (Array.isArray(shared) && !shared.length)) this.storage.set(KEYS[kind], current);
+      this.sessionStore.remove(kind);
+    }
+    this.emit();
+    return true;
+  }
+
+  kindValue(kind) {
+    return kind === 'focus' ? this.focusMappings : kind === 'plugins' ? this.pluginMappings : this.mighty;
+  }
+
+  /** Where one kind of setting lives: the session when it is saved with it, else shared storage. */
+  readKind(kind) {
+    return this.savedWithSession(kind) ? this.sessionStore.get(kind) : this.storage.get(KEYS[kind]);
+  }
+
   /** Read this session's mappings and the globals. Call once the session is ready. */
   loadStored() {
-    this.sessionKey = KEYS.session(this.session.sessionPackageUid.value ?? this.session.uid);
-    this.sessionMappings = this.storage.get(this.sessionKey) ?? [];
+    const uid = this.session.sessionPackageUid.value ?? this.session.uid;
+    this.sessionKey = KEYS.session(uid);
+    if (this.sessionStore?.available) {
+      // Mappings made before they were saved with the session sit in this machine's storage:
+      // adopt them the first time, and from then on the session's copy is the one that counts.
+      let own = this.sessionStore.get('session');
+      if (own === undefined) {
+        own = this.storage.get(this.sessionKey) ?? [];
+        if (own.length) this.sessionStore.set('session', own);
+      }
+      this.sessionMappings = own;
+    } else this.sessionMappings = this.storage.get(this.sessionKey) ?? [];
     this.globalMappings = this.storage.get(KEYS.globals) ?? [];
-    this.focusMappings = this.storage.get(KEYS.focus) ?? [];
-    this.mighty = this.storage.get(KEYS.mighty) ?? null;
-    this.pluginMappings = this.storage.get(KEYS.plugins) ?? [];
+    this.focusMappings = this.readKind('focus') ?? [];
+    this.mighty = this.readKind('mighty') ?? null;
+    this.pluginMappings = this.readKind('plugins') ?? [];
     // Channel Focus mappings made before feedback defaulted on, and never switched either way,
     // get it now. One the user turned off (feedback: false) stays off.
     let migrated = false;
@@ -473,7 +771,7 @@ class Mapper {
         migrated = true;
       }
     }
-    if (migrated) this.storage.set(KEYS.focus, this.focusMappings);
+    if (migrated) this.writeKind('focus');
     this.emit();
   }
 
@@ -601,10 +899,10 @@ class Mapper {
     return [...maps.values()];
   }
 
-  // ---- Proxy -------------------------------------------------------------------------
+  // ---- Click & Turn -------------------------------------------------------------------------
 
   /**
-   * Point the Proxy at a control the user touched in LUNA (fact 100). Touches MIDI Learn
+   * Point Click & Turn at a control the user touched in LUNA (fact 100). Touches MIDI Learn
    * caused itself never move it. With feedback on, the control's value goes straight back, so
    * a motorized knob turns to it before the user does.
    */
@@ -627,7 +925,7 @@ class Mapper {
 
   /**
    * Put the parameter in focus back to LUNA's default for it (fact 92), as one undo step. The
-   * parameter in focus is the one last touched in LUNA, or last moved through the Proxy or a
+   * parameter in focus is the one last touched in LUNA, or last moved through Click & Turn or a
    * Channel Focus knob. Returns the entry it reset, or undefined when there's nothing in focus.
    */
   async resetFocused() {
@@ -642,7 +940,7 @@ class Mapper {
     return entry;
   }
 
-  /** Keep the Proxy on its current control (true), or let it follow touches again. */
+  /** Keep Click & Turn on its current control (true), or let it follow touches again. */
   setMightyHold(on) {
     this.mightyHold = !!on;
     this.emit();
@@ -775,7 +1073,7 @@ class Mapper {
     if (target.kind === 'mighty') return this.mightyPath;
     if (target.kind === 'focus') {
       const track = this.focusTrack();
-      return track ? `${track.path}/${target.rest}` : undefined;
+      return track ? `${track.path}/${this.panAdjusted(track, target.rest)}` : undefined;
     }
     if (target.kind !== 'control') return undefined;
     if (this.session.path && target.path?.startsWith(`${this.session.path}/`)) return target.path;
@@ -783,6 +1081,15 @@ class Mapper {
     const channels = [...this.session.tracks.items, ...this.session.buses.items];
     const ch = channels.find((c) => (c.name.value ?? c.id) === target.channel);
     return ch ? `${ch.path}/${target.rest}` : undefined;
+  }
+
+  /** A pan target's `rest` on this track: the pan its output really has (mono `pan`, stereo Left/Right/Balance). */
+  panAdjusted(track, rest) {
+    const m = /^(outputs\/([^/]+))\/controls\/([^/]+)$/.exec(rest);
+    if (!m || !AddOnLogic.isPan(m[3])) return rest;
+    const out = track.outputs.byId(m[2]);
+    const stereo = out ? out.stereo : track.stemFormat?.value === 'stereo';
+    return `${m[1]}/controls/${AddOnLogic.panFor(m[3], stereo)}`;
   }
 
   /** LUNA reports a touch on a control: in learn mode, that is the target the user picked. */
@@ -811,23 +1118,27 @@ class Mapper {
   }
 
   /** Start or stop learning; `mode` 'focus' learns a Channel Focus mapping. */
-  setLearning(on, mode = 'map', { latch = false } = {}) {
+  setLearning(on, mode = 'map', { latch = false, kind, relative, takeover } = {}) {
+    // kind: learn a 14-bit CC pair ('cc14') or an NRPN ('nrpn') instead of a plain CC. relative:
+    // the knob is an endless encoder ('auto' to guess its encoding from the first turn).
+    // takeover: ignore the knob until it reaches the control's value.
+    this.learnOptions = on ? { kind, relative, takeover } : {};
     this.justLearned.clear(); // the settle guards only span one continuous learn
     this.justMapped = undefined;
     this.lastTouchPath = undefined;
     this.learning = on;
     this.learnMode = on ? mode : 'map';
-    // Latch: keep learning after each mapping, for several in a row. The Proxy is one knob, so
+    // Latch: keep learning after each mapping, for several in a row. Click & Turn is one knob, so
     // there is nothing to latch there.
     this.latch = on && latch && mode !== 'mighty';
-    // The Proxy needs only a source: its target is whatever gets touched later.
+    // Click & Turn needs only a source: its target is whatever gets touched later.
     this.pending = { target: on && mode === 'mighty' ? AddOnLogic.mightyTarget() : undefined, source: undefined };
     this.emit();
   }
 
   /**
    * Hold (called latch in code): keep learning after each mapping, so the user can map one
-   * control after another. Can be switched while learning. The Proxy is one knob: no hold.
+   * control after another. Can be switched while learning. Click & Turn is one knob: no hold.
    */
   setHold(on) {
     this.latch = !!on && this.learnMode !== 'mighty';
@@ -861,9 +1172,49 @@ class Mapper {
    */
   midi(msg, device) {
     if (!msg) return;
+    this.handle(msg, device);
+    for (const extra of this.decode(msg, device)) this.handle(extra, device);
+  }
+
+  /**
+   * 14-bit values from the CCs that carry them: a CC 0..31 (MSB) with its CC 32..63 (LSB), and
+   * NRPN (CC 99/98 pick the parameter, CC 6/38 carry the value). Each half arriving gives the
+   * joined value, so a source of type 'cc14' or 'nrpn' hears it. The plain CCs still go on to any
+   * 7-bit mapping.
+   */
+  decode(msg, device) {
+    if (msg.type !== 'cc') return [];
+    const key = `${device ?? ''}|${msg.channel}`;
+    let st = this.hires.get(key);
+    if (!st) this.hires.set(key, (st = { msb: new Map(), lsb: new Map(), nrpnMsb: undefined, nrpnLsb: undefined, dataMsb: 0, dataLsb: 0 }));
+    const n = msg.number;
+    const out = [];
+    const join = (type, number, msb, lsb) => out.push({ type, channel: msg.channel, number, value: ((msb << 7) | lsb) / 16383, raw: (msb << 7) | lsb });
+    if (n < 32) {
+      st.msb.set(n, msg.raw);
+      join('cc14', n, msg.raw, st.lsb.get(n + 32) ?? 0);
+    } else if (n < 64) {
+      st.lsb.set(n, msg.raw);
+      if (st.msb.has(n - 32)) join('cc14', n - 32, st.msb.get(n - 32), msg.raw);
+    }
+    if (n === 99) [st.nrpnMsb, st.nrpnLsb] = [msg.raw, undefined];
+    else if (n === 98) st.nrpnLsb = msg.raw;
+    else if (n === 101 || n === 100) [st.nrpnMsb, st.nrpnLsb] = [undefined, undefined]; // an RPN: not ours
+    else if ((n === 6 || n === 38) && st.nrpnMsb !== undefined && st.nrpnLsb !== undefined) {
+      if (n === 6) [st.dataMsb, st.dataLsb] = [msg.raw, 0];
+      else st.dataLsb = msg.raw;
+      join('nrpn', (st.nrpnMsb << 7) | st.nrpnLsb, st.dataMsb, st.dataLsb);
+    }
+    return out;
+  }
+
+  handle(msg, device) {
     const source = { device: device ?? null, type: msg.type, channel: msg.channel, number: msg.number };
     this.lastSource = { ...source, value: msg.value, raw: msg.raw, at: this.now() };
     if (this.learning) {
+      // A learn for a 14-bit pair or an NRPN hears only that; any other learn leaves them be.
+      const hires = msg.type === 'cc14' || msg.type === 'nrpn';
+      if (hires ? this.learnOptions.kind !== msg.type : this.learnOptions.kind) return;
       const now = this.now();
       // The rest of the turn that just made a mapping isn't the knob for the next one: a turn is
       // a stream of messages, and only a fresh turn (after a pause) or another knob counts.
@@ -885,6 +1236,7 @@ class Mapper {
       // A note-off or a button's release should not stand in for the press the user made.
       if (!echo && !(msg.type === 'note' && !msg.on)) {
         this.pending.source = source;
+        this.pending.raw = msg.raw;
         this.complete();
       }
       this.emit();
@@ -913,7 +1265,7 @@ class Mapper {
   }
 
   matches(a, b) {
-    return (a.device === null || a.device === b.device) && (a.channel === null || a.channel === b.channel) && a.type === b.type && a.number === b.number;
+    return (a.device === null || AddOnLogic.sameDevice(a.device, b.device)) && (a.channel === null || a.channel === b.channel) && a.type === b.type && a.number === b.number;
   }
 
   fail(mapping, e) {
@@ -958,6 +1310,7 @@ class Mapper {
       // different plugins, so only this plugin's map gives up the source.
       mapping.mode = entry?.switch ? 'toggle' : 'absolute';
       if (source.type === 'cc' || source.type === 'note') mapping.feedback = true;
+      this.learnOptionsInto(mapping);
       const key = AddOnLogic.sourceKey(source);
       this.pluginMappings = this.pluginMappings.filter((m) => !(m.target.pluginId === target.pluginId && (AddOnLogic.sourceKey(m.source) === key || m.target.param === target.param)));
       this.pluginMappings.push(mapping);
@@ -979,6 +1332,7 @@ class Mapper {
     }
     // Channel Focus is a dedicated channel controller: its knobs should follow the focused track.
     if (focus && (source.type === 'cc' || source.type === 'note')) mapping.feedback = true;
+    this.learnOptionsInto(mapping);
     // One source drives one target, across regular and Channel Focus mappings: learning a source
     // again moves it.
     const key = AddOnLogic.sourceKey(source);
@@ -1005,6 +1359,17 @@ class Mapper {
     if (focus) void this.ensure(this.pathFor(target)).catch(() => {});
   }
 
+  /** Carry the learn options (relative encoder, soft takeover) onto the mapping just made. */
+  learnOptionsInto(mapping) {
+    const { relative, takeover } = this.learnOptions;
+    if (relative && mapping.source.type === 'cc' && mapping.target.kind !== 'automation') {
+      mapping.mode = 'relative';
+      mapping.encoding = RELATIVE_ENCODINGS.includes(relative) ? relative : AddOnLogic.guessEncoding(this.pending.raw) ?? 'twos';
+      delete mapping.feedback; // an encoder has no position to light
+    }
+    if (takeover && mapping.mode === 'absolute') mapping.takeover = true;
+  }
+
   /** Session mappings shadow global ones on the same source. */
   all() {
     const keys = new Set(this.sessionMappings.map((m) => AddOnLogic.sourceKey(m.source)));
@@ -1022,11 +1387,20 @@ class Mapper {
 
   save() {
     this.refreshFeedback();
-    this.storage.set(this.sessionKey, this.sessionMappings);
+    if (this.sessionStore?.available) this.sessionStore.set('session', this.sessionMappings);
+    else this.storage.set(this.sessionKey, this.sessionMappings);
     this.storage.set(KEYS.globals, this.globalMappings);
-    this.storage.set(KEYS.focus, this.focusMappings);
-    this.storage.set(KEYS.mighty, this.mighty);
-    this.storage.set(KEYS.plugins, this.pluginMappings);
+    for (const kind of SESSION_KINDS) this.writeKind(kind);
+  }
+
+  writeKind(kind) {
+    if (this.savedWithSession(kind)) this.sessionStore.set(kind, this.kindValue(kind));
+    else this.storage.set(KEYS[kind], this.kindValue(kind));
+  }
+
+  /** Resolves when everything saved with the session has reached LUNA. */
+  flushSession() {
+    return this.sessionStore?.flush() ?? Promise.resolve();
   }
 
   /** Change a mapping's mode, min, max, invert, source device or scope ('session' | 'global'). */
@@ -1035,6 +1409,8 @@ class Mapper {
     if (!m) return;
     const { source, ...rest } = patch;
     Object.assign(m, rest);
+    this.pickup.delete(id); // a changed mapping picks its knob up afresh
+    if (m.mode === 'relative') delete m.feedback;
     if (source) m.source = { ...m.source, ...source };
     if (m.scope === 'plugin') {
       // Within one plugin's map, a source drives one parameter.
@@ -1202,7 +1578,9 @@ class Mapper {
     // A button target (a command, an automation mode) fires on the press in Follow, or on every
     // change in Toggle: a latching button sends 127 on one press and 0 on the next, and each of
     // those is a press. ('trigger', the older name, is Follow.)
-    const pressed = m.mode === 'toggle' ? msg.value !== prev : rising;
+    const relative = m.mode === 'relative';
+    const delta = relative ? AddOnLogic.relativeDelta(m.encoding ?? 'twos', msg.raw) : 0;
+    const pressed = relative ? delta * (m.invert ? -1 : 1) > 0 : m.mode === 'toggle' ? msg.value !== prev : rising;
     if (m.target.kind === 'command') {
       if (!pressed) return;
       const cmd = COMMANDS.find((c) => c.id === m.target.command);
@@ -1217,6 +1595,7 @@ class Mapper {
     }
     const control = entry.control;
     if (m.target.kind === 'mighty' || m.target.kind === 'focus') this.focusedPath = entry.path;
+    if (relative) return this.applyRelative(m, delta, entry);
     if (m.mode === 'toggle') {
       if (!rising) return;
       this.selfTouched.set(entry.path, this.now());
@@ -1231,7 +1610,49 @@ class Mapper {
       this.selfTouched.set(entry.path, this.now());
       return control.toggle();
     }
-    this.write(entry, AddOnLogic.scale(m, msg.value));
+    const v = AddOnLogic.scale(m, msg.value);
+    if (m.takeover && !this.hooked(m, entry, v)) return;
+    this.write(entry, v);
+  }
+
+  /**
+   * An endless encoder's turn: `delta` clicks, each a step of the control's travel (the mapping's
+   * `step`, default 1%) within its range. The target is tracked while the writer is open, so a
+   * fast turn adds up instead of reading the control before the last click landed.
+   */
+  applyRelative(m, delta, entry) {
+    if (!delta) return;
+    const control = entry.control;
+    const dir = m.invert ? -1 : 1;
+    if (control.isSwitch) {
+      const on = delta * dir > 0;
+      if (on === control.on) return;
+      this.selfTouched.set(entry.path, this.now());
+      return control.toggle();
+    }
+    const base = this.writers.has(entry.path) && this.relTarget.has(entry.path) ? this.relTarget.get(entry.path) : control.normalized.value;
+    if (typeof base !== 'number') return;
+    const lo = Math.min(m.min ?? 0, m.max ?? 1);
+    const hi = Math.max(m.min ?? 0, m.max ?? 1);
+    const next = Math.min(hi, Math.max(lo, base + delta * dir * (m.step ?? RELATIVE_STEP) * (hi - lo || 1)));
+    this.relTarget.set(entry.path, next);
+    this.write(entry, next);
+  }
+
+  /** Soft takeover: has the knob (at `v`, 0..1 of the control's travel) reached the control's value? */
+  hooked(m, entry, v) {
+    const cur = entry.control.normalized.value;
+    if (typeof cur !== 'number') return true;
+    const st = this.pickup.get(m.id);
+    const same = st?.path === entry.path;
+    if (same && st.hooked && (this.writers.has(entry.path) || Math.abs(cur - st.last) <= TAKEOVER_DRIFT)) {
+      st.last = v;
+      return true;
+    }
+    const before = same && !st.hooked ? st.pos : undefined;
+    const hooked = Math.abs(v - cur) <= TAKEOVER_NEAR || (before !== undefined && (before - cur) * (v - cur) <= 0);
+    this.pickup.set(m.id, { path: entry.path, pos: v, last: v, hooked });
+    return hooked;
   }
 
   /** Set a track's automation mode from a button (on the press) or a knob (when it enters a new zone). */
@@ -1285,6 +1706,7 @@ class Mapper {
     if (!w) return;
     clearTimeout(w.timer);
     this.writers.delete(path);
+    this.relTarget.delete(path);
     await w.busy;
     const entry = this.entries.find((e) => e.path === path);
     entry?.control.end();
@@ -1320,6 +1742,7 @@ class Mapper {
   /** Whether a mapping can send its value back: a control target driven by a CC or a note. */
   canFeedback(m) {
     if (m.target.kind === 'automation' && m.target.action === 'next') return false; // nothing to show
+    if (m.mode === 'relative') return false; // an endless encoder has no position to show
     return ['control', 'focus', 'mighty', 'automation', 'plugin'].includes(m.target.kind) && (m.source.type === 'cc' || m.source.type === 'note');
   }
 
@@ -1560,6 +1983,8 @@ class Mapper {
 }
 
 AddOnLogic.Mapper = Mapper;
+AddOnLogic.SessionSettings = SessionSettings;
+AddOnLogic.BalanceControl = BalanceControl;
 
 /** Storage over localStorage, which may be missing or throw (private windows, some webviews). */
 AddOnLogic.localStore = () => ({
