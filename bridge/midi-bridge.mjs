@@ -26,8 +26,10 @@ import { WebSocketServer } from 'ws';
 const PORT = Number(process.env.MIDI_LEARN_PORT ?? 8797);
 const SCAN_MS = 2000;
 
-// A disk copy of the page's settings (session mappings, globals, templates, prefs). LUNA's webview
-// storage is shared by every Add On and can be cleared; this file outlives it.
+// A disk copy of the page's settings (session mappings, globals, templates, prefs). LUNA keeps an
+// Add On's web storage to itself and across launches, but it starts empty when the `id` changes
+// or the Add On's data is cleared, and a browser on localhost has its own; this file outlives all
+// of those.
 const STATE_DIR = process.env.MIDI_LEARN_STATE_DIR ?? join(homedir(), 'Library/Application Support/MIDI Learn');
 const STATE_FILE = join(STATE_DIR, 'state.json');
 let state = {};

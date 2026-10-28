@@ -13,8 +13,10 @@ again when the session reopens.
 - When **another browser Add On** takes the panel, LUNA reloads MIDI Learn's page, and its
   mappings stop until you show MIDI Learn again.
 - After changing `manifest.json`, restart LUNA: this build doesn't rescan the Add Ons folder.
+  The manifest carries both `name` and the older `title` so LUNA builds from before the rename
+  still show it; `ua-builder pack` warns about `title`, and that's expected.
 
-**Learn:** each section (Proxy, Mappings, Channel Focus) has its own **Learn** button. Press it
+**Learn:** each section (Click & Turn, Mappings, Channel Focus) has its own **Learn** button. Press it
 (or `L` for Mappings), touch a control in LUNA or pick one from the Parameters list, then move a
 knob, fader or pad. You can do the last two in either order. A learn bar opens at the top of that
 section while it learns. Turn on **Hold** (next to **Learn** while it learns) (or Shift-click / right-click **Learn**) to keep
@@ -40,12 +42,19 @@ panel (the chevron).
 
 The Learn and Parameters sections fold away from their headers.
 
-- **Session mappings** are kept per session, keyed by LUNA's session package uid, so they come
-  back when you reopen the session.
+- **Session mappings** are saved inside the LUNA session itself (`session.preferences`), so they
+  come back when you reopen it, and travel with the session file to another machine. Mappings
+  made before 0.3.0 sat in this machine's storage, keyed by the session's package uid; the first
+  time such a session opens, they move into it.
+- **Save with this session:** Channel Focus, Plugins and Click & Turn are one layout shared by every
+  session until their **Save with this session** switch is on. Then that section's mappings live
+  in the session instead, so a different session can have a different layout. Switching it off
+  goes back to the shared layout (which takes the session's copy if it has none of its own).
+  Global mappings, templates and the other settings stay on the machine.
 - **Global mappings** work in every session. Open a mapping (the chevron) and switch on Global.
   A session mapping on the same MIDI source wins over a global one.
 - **Templates** (top bar) save your whole controller layout, every section: this session's
-  mappings, global mappings, Channel Focus, the Proxy and plugin maps. **Load** merges one in.
+  mappings, global mappings, Channel Focus, Click & Turn and plugin maps. **Load** merges one in.
   **Replace** clears those sections first. Session mappings are found again by track name, area
   (Strip, Send 2, Insert 1 · UA 1176) and control name. A target the session doesn't have stays
   listed, struck through, until a matching control appears. Export and Import move templates and
@@ -75,7 +84,7 @@ and the same knobs then control whichever track you select in LUNA.
   to two buttons to step the focus from your controller. They stop at the first and last track.
 - **Reset parameter to default** (a command) puts the parameter in focus back to LUNA's default,
   as one undo step. The parameter in focus is the one you last touched in LUNA, or last moved with
-  the Proxy or a Channel Focus knob. Use
+  Click & Turn or a Channel Focus knob. Use
   the header menu to **lock** the focus to one track; choose "Selected" to follow again.
 - **Plugin parameters** apply only when the focused track has the same plugin in the same insert
   slot. Otherwise the row is struck through, "not on <track>", and nothing on that track moves.
@@ -108,13 +117,13 @@ instance of it.
 - Maps are stored in `midilearn.plugins`, shared by every session, and included in templates and
   Export.
 
-## Proxy
+## Click & Turn
 
 One knob that drives **whatever you last clicked or dragged in LUNA**: a fader, a pan, a send,
 a mute or a plugin parameter.
 
-- **Learn:** press **Learn** in the Proxy header and move a knob, or type its CC in the learn bar
-  and press Assign. There's one Proxy, shared by every session.
+- **Learn:** press **Learn** in Click & Turn header and move a knob, or type its CC in the learn bar
+  and press Assign. There's one Click & Turn, shared by every session.
 - **Following:** each control you touch in LUNA becomes its target (LUNA reports touches,
   SDK fact 100). The card shows the control, where it is, and its live value. Changes MIDI Learn
   makes itself, through any mapping, never move it.
@@ -152,66 +161,100 @@ Roto-Control setup: use MIDI mode, set each knob's resolution to COARSE in Roto-
 its channel and CC to the mapping (or learn the mapping from the knob). The Roto-Control also
 checks touch on its own side; its LOCK button turns that off.
 
-## MIDI in
+## MIDI in and out
 
-The page uses Web MIDI where the browser has it (Chrome, Edge, LUNA on Windows). LUNA's macOS
-webview has no Web MIDI, and LUNA doesn't pass incoming MIDI to Add Ons, so on a Mac run the
-bridge next to LUNA:
+The page takes MIDI from the best source it finds, one at a time (the MIDI chip's tooltip says which):
 
-```sh
-npm run bridge:install     # once: runs the bridge now and at every login (a macOS login agent)
-npm run bridge:status      # is it running, which inputs it sees, which pages connected
-npm run bridge:uninstall   # stop it and remove the agent
-npm run bridge             # or run it in a terminal instead
-```
+1. **LUNA** (`Luna.MidiInput`, `Luna.SendMidi`): every message in order, and feedback out of the
+   device. Needs a LUNA that publishes MIDI ports to Add Ons (SDK facts 123 to 125); LUNA 3.1.1 does
+   not.
+2. **Web MIDI**, where the browser has it (Chrome, Edge, LUNA on Windows). LUNA's macOS webview has none.
+3. **The helper** (`npm run bridge`, or the macOS installer): carries every input and the feedback
+   out. This is what a Mac with LUNA 3.1.1 uses.
+4. **LUNA's last-controller values**, which every LUNA publishes for each device. Knobs and faders
+   work with nothing installed, but there is no feedback, LUNA coalesces fast moves, and a repeat of
+   an identical message (the same button value twice) is not a change, so it is missed.
 
-It relays every MIDI input to ws://127.0.0.1:8797 (loopback only). Its log is
-`~/Library/Logs/midi-learn-bridge.log`, and each page that connects logs a hello line saying
-whether it runs inside LUNA. The page finds the bridge by itself and reconnects if it restarts.
-Without the bridge, the MIDI menu reads "No MIDI: bridge not running" and the page explains the
-fix. The MIDI chip at top left
-picks one input, or listens to all of them.
+The MIDI chip at top left picks one input or listens to all of them. The same hardware has
+different names in different sources (LUNA says "Roto-Control (2)" and "IAC IAC Bus 1", the helper
+"Roto-Control" and "IAC Bus 1"), so a mapping's device matches on the name without the "(2)" and
+without a driver prefix: mappings keep working whichever source is live.
+
+Feedback goes out the same way: through LUNA's output port when it has one, else Web MIDI, else the
+helper.
+
+### The helper
+
+`npm run bridge` (and `npm run bridge:install`) start it. It also keeps a log
+(`~/Library/Logs/midi-learn-bridge.log`, since LUNA's window has no console) and a disk copy of the
+settings (`~/Library/Application Support/MIDI Learn/state.json`). Open the page with `?nobridge` to
+try it without the helper.
 
 ## Run
 
 ```sh
 npm install
 npm test                         # against Luna.MockEngine, no LUNA needed
-npm run bridge                   # MIDI for LUNA's macOS webview (and for plain browsers without Web MIDI)
+npm run bridge                   # optional: a log and a disk copy of the settings
 npx ua-builder serve             # http://localhost:8790/ ; LUNA must be running
 open "http://localhost:8790/?demo"   # an in-page mock session, to try the page without LUNA;
                                      # it never reads or writes your saved settings or sends MIDI out
-npx ua-builder install           # link into LUNA's Add Ons folder; appears in the Window menu
+npx ua-builder install           # link into LUNA's Add Ons folder; appears under Add Ons > Browsers
 ```
 
 | File | Purpose |
 |---|---|
 | `logic.js` | Parsing, the control catalog, learn mode, applying MIDI, storage, templates. No DOM. |
-| `main.js` | MIDI input (Web MIDI or the bridge), the page, the background picker. |
-| `bridge/midi-bridge.mjs` | The local MIDI relay. |
+| `main.js` | MIDI in and out (the SDK), the page, the background picker. |
+| `bridge/midi-bridge.mjs` | The optional local helper (log, disk copy of the settings). |
+| `installer/` | Builds the macOS `.pkg` (Add On + self-contained bridge). |
 | `tests/` | Vitest against the mock engine. |
 | `vendor/luna.global.js` | The SDK bundle, **patched** (see below). |
-| `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries. |
+| `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries, as a source diff. |
+| `scripts/vendor-sdk.mjs` | Vendors the installed SDK's bundle with that change applied. |
+
+## Share it (macOS installer)
+
+```sh
+npm run installer          # -> .build/MIDI Learn <version>.pkg
+```
+
+MIDI no longer needs the helper, so the `.lunaaddon` (`npm run pack`) is enough to share. The `.pkg`
+still installs the helper too, for its log and disk copy, without Node or npm. It puts the Add On in LUNA's Add Ons folder (replacing any earlier MIDI Learn, a
+`npm run install-addon` symlink included) and installs the bridge with its own Node runtime
+(official nodejs.org build, universal) in `/Library/Application Support/MIDI Learn`, started at
+every login by `/Library/LaunchAgents/com.uaudio.midi-learn.bridge.plist`. That agent has the same
+label as `npm run bridge:install`'s, so on a machine with both only one runs. To remove it:
+`sudo "/Library/Application Support/MIDI Learn/uninstall.sh"`.
+
+The package is not signed with a Developer ID, so macOS blocks it on first open: the recipient
+opens it, then clicks **Open Anyway** in System Settings > Privacy & Security. The build checks
+the vendored bundle still carries its patch and starts the packaged bridge on arm64 and x86_64.
+`installer/` holds the sources: `build.sh`, the pkg scripts, the agent and the uninstaller.
 
 ## The vendored SDK is patched
 
-`vendor/luna.global.js` is SDK 0.1.0-alpha.5 plus one fix that isn't in the SDK yet. In the
-released SDK, a load that fails is remembered: `Session.ready()`, `Node.load()` and
-`Collection.load()` keep returning the same error. LUNA can time a read out while it's still
-opening a session, so switching sessions could leave the page on "No session open" for good.
-With the patch, the next call tries again.
+`vendor/luna.global.js` is SDK 0.2.1 (`@uaudio/luna-builder-sdk`) plus one fix that
+isn't in the SDK yet. In the released SDK, a load that fails is remembered: `Session.ready()`,
+`Node.load()` and `Collection.load()` keep returning the same error. LUNA can time a read out
+while it's still opening a session, so switching sessions could leave the page on "No session
+open" for good. With the patch, the next call tries again.
 
-Don't refresh the bundle (`ua-builder pack` does) until the SDK includes this fix, or
-session switching breaks again. `npm test` checks that the bundle carries the patch and matches
-the manifest's `sdk_version`. To rebuild the patched bundle:
+Don't refresh the bundle until the SDK includes this fix, or session switching breaks again.
+`npx ua-builder pack` refreshes it unless given `--no-vendor`, so make the `.lunaaddon` with
+`npm run pack`, which passes that flag. `npm test` checks that the bundle carries the patch,
+matches the manifest's `sdk_version`, and that `npm run pack` keeps it.
+
+The SDK now ships prebuilt, in `~/Library/Application Support/LUNA Builder SDK` (set
+`LUNA_BUILDER_SDK` to use another folder), so the fix is applied to the built bundle:
 
 ```sh
-cd ../ua-builder-sdk && git worktree add --detach /tmp/sdk-patched HEAD && cd /tmp/sdk-patched
-git apply ~/src/midi-learn/patches/ua-builder-sdk-load-retry.patch
-ln -s ~/src/ua-builder-sdk/node_modules node_modules && npm run build
-cp plugins/ua-luna-builder/sdk/luna.global.js ~/src/midi-learn/vendor/luna.global.js
-cd ~/src/ua-builder-sdk && git worktree remove --force /tmp/sdk-patched   # the SDK checkout is untouched
+npm run vendor   # vendor/luna.global.js = the installed SDK's bundle + the fix
 ```
+
+It stops without writing if one of its three edits no longer finds its anchor, and says so
+when the SDK already forgets failed loads: then vendor the plain bundle and delete `patches/`
+and the script.
 
 ## How learning finds the control you touched
 
@@ -230,12 +273,12 @@ as "touch a knob in its window while learning", and a parameter joins the list o
   `touch_count` the way a mixer fader does. If one doesn't, its knobs can't be learned by touch.
 - Whether a single Qi parameter reads quickly. A read that takes more than 5 s is abandoned, and
   the page says so.
-- **Storage:** settings are kept in two places. The first is LUNA's webview `localStorage`,
-  which LUNA keeps on disk across restarts but shares among every Add On. The second is the
-  bridge's copy at `~/Library/Application Support/MIDI Learn/state.json`, which fills in anything
-  `localStorage` loses. Session mappings are keyed by the session's package uid, which stays
-  the same each time the session is opened. LUNA has no way to store an Add On's settings
-  inside the session file.
+- **Storage:** session mappings (and any section with Save with this session on) are in the
+  session, in the `com.uaudio.midi-learn` preference context. Everything else (global mappings,
+  templates, the shared layouts, the colour, the MIDI choice) is in the page's `localStorage`.
+  On macOS each Add On has its own, kept across launches while the manifest `id` stays the same;
+  the optional helper's disk copy fills in anything it loses. Session preferences need a LUNA that
+  has them; without, session mappings stay in `localStorage` as before.
 - Relative (endless) encoders, 14-bit CC pairs, NRPN and soft takeover are not supported yet.
   An endless encoder that sends 1 or 127 will jump.
 
