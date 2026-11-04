@@ -3,56 +3,17 @@
 // what logic.js's Mapper holds. Every listener is released when the session changes.
 
 const $ = (id) => document.getElementById(id);
-// Settings live in the webview's localStorage and are mirrored to the bridge's disk copy
-// (~/Library/Application Support/MIDI Learn/state.json), which fills in anything localStorage lost.
+// Settings live in the webview's localStorage.
 // A ?demo page runs on an in-page mock session. It must never touch the user's real setup, so
-// it doesn't read or write the bridge's disk copy and never sends MIDI out (feedback).
+// it never sends MIDI out (feedback).
 const DEMO = new URLSearchParams(location.search).has('demo');
-/** Which build of the page is running, reported to the bridge log, so a stale page is obvious. */
+/** Which build of the page is running, so a stale page is obvious. */
 const BUILD = '2026-10-26.1';
 const local = AddOnLogic.localStore();
 const store = {
   get: (key) => local.get(key),
-  set(key, value) {
-    local.set(key, value);
-    mirror(key, value);
-  },
+  set: (key, value) => local.set(key, value),
 };
-function mirror(key, value) {
-  if (DEMO) return;
-  try {
-    if (midiIn.ws?.readyState === 1) midiIn.ws.send(JSON.stringify({ type: 'save', key, value: value === undefined ? null : JSON.stringify(value) }));
-  } catch {}
-}
-function localKeys() {
-  try {
-    return Object.keys(globalThis.localStorage ?? {}).filter((k) => k.startsWith('midilearn.'));
-  } catch {
-    return [];
-  }
-}
-/** The bridge sent its disk copy: take what localStorage lacks, then send everything we hold. */
-function mergeState(items) {
-  if (DEMO) return;
-  const have = new Set(localKeys());
-  let restored = 0;
-  for (const [key, raw] of Object.entries(items ?? {})) {
-    if (have.has(key) || !key.startsWith('midilearn.')) continue;
-    try {
-      local.set(key, JSON.parse(raw));
-      restored++;
-    } catch {}
-  }
-  for (const key of localKeys()) mirror(key, local.get(key));
-  if (restored) {
-    report(`restored ${restored} setting(s) from the disk copy`);
-    if (mapper && !mapper.sessionMappings.length && !mapper.globalMappings.length) {
-      mapper.loadStored();
-      resetLists();
-      schedule();
-    }
-  }
-}
 const PREFS = 'midilearn.prefs';
 const prefs = { device: '', filter: 'all', fold: {}, ...(store.get(PREFS) ?? {}) };
 const savePrefs = () => store.set(PREFS, prefs);
@@ -102,13 +63,10 @@ function toast(text, error = false) {
 //   luna    LUNA publishes MIDI ports (Luna.MidiInput / Luna.SendMidi): every message, in order, and
 //           feedback out of the device. A LUNA release that has them is the way forward.
 //   webmidi the browser's Web MIDI (Chrome, Edge, LUNA on Windows). LUNA's macOS webview has none.
-//   bridge  the local helper on 127.0.0.1:8797 (npm run bridge), which
-//           carries every input and the feedback out.
 //   last    LUNA's per-device "last controller / last note" values, which every LUNA publishes. They
 //           are coalesced and a repeat of the same value is not a change, so a knob works but a
 //           repeated identical message can be missed. Input only: no feedback.
-const BRIDGE_URL = 'ws://127.0.0.1:8797';
-const midiIn = { via: 'none', inputs: [], lastHit: 0, ws: undefined, bridgeInputs: [], access: undefined, ready: false, stops: [], listeningTo: '', lastStops: [] };
+const midiIn = { via: 'none', inputs: [], lastHit: 0, access: undefined, ready: false, stops: [], listeningTo: '', lastStops: [] };
 
 /** A message from `source` counts only while that source is the live one. */
 const from = (source) => (data, device) => {
@@ -127,8 +85,7 @@ function outputDevice(name) {
 
 /**
  * MIDI out, for feedback to motorized controllers: out of the device LUNA lists with the input's
- * name (when LUNA has MIDI ports), else Web MIDI's output of that name, else the bridge, which finds
- * the output named like the input. Returns whether it went anywhere. LUNA answers a send to a port
+ * name (when LUNA has MIDI ports), else Web MIDI's output of that name. Returns whether it went anywhere. LUNA answers a send to a port
  * that has gone with success, so the device is looked up on every send.
  */
 function sendMidi(device, bytes) {
@@ -140,7 +97,7 @@ function sendMidi(device, bytes) {
       new Luna.SendMidi(luna).sendMidiToOutput(out, status, data1, data2).catch((e) => report(`feedback to ${device} failed: ${e.code ?? ''} ${e.message}`));
       return true;
     }
-    // Web MIDI and the helper name the hardware without LUNA's " (2)" suffix.
+    // Web MIDI names the hardware without LUNA's " (2)" suffix.
     const plain = String(device).replace(/\s*\(\d+\)$/, '');
     if (midiIn.access) {
       const outs = [...midiIn.access.outputs.values()];
@@ -150,22 +107,15 @@ function sendMidi(device, bytes) {
         return true;
       }
     }
-    if (midiIn.ws?.readyState === 1) {
-      midiIn.ws.send(JSON.stringify({ type: 'send', device: plain, data: bytes }));
-      return true;
-    }
   } catch (e) {
     report(`feedback to ${device} failed: ${e.message}`);
   }
   return false;
 }
 
-/** Send a line to the helper's log (~/Library/Logs/midi-learn-bridge.log), when it runs: LUNA's window has no console. */
+/** A line for the console. */
 function report(text) {
   console.log(text);
-  try {
-    if (midiIn.ws?.readyState === 1) midiIn.ws.send(JSON.stringify({ type: 'log', text: String(text) }));
-  } catch {}
 }
 window.addEventListener('error', (e) => report(`error: ${e.message} at ${e.filename}:${e.lineno}`));
 window.addEventListener('unhandledrejection', (e) => report(`unhandled: ${e.reason?.code ?? ''} ${e.reason?.message ?? e.reason}`));
@@ -194,7 +144,6 @@ function chooseVia() {
   let names = [];
   if (midiIn.ready && portDevices().length) [via, names] = ['luna', portDevices().map((d) => d.name.value)];
   else if (midiIn.access?.inputs.size > 0) [via, names] = ['webmidi', [...midiIn.access.inputs.values()].map((i) => i.name)];
-  else if (midiIn.bridgeInputs.length) [via, names] = ['bridge', midiIn.bridgeInputs];
   else if (midiIn.ready && realDevices().length) [via, names] = ['last', realDevices().map((d) => d.name.value)];
   midiIn.via = via;
   midiIn.inputs = [...new Set(names)];
@@ -252,7 +201,7 @@ function devicesChanged() {
 
 async function startMidi() {
   // Web MIDI, where the page has it. WebKit (LUNA's window on macOS) has none; where it exists it
-  // can still refuse, hang, or see no devices, and then LUNA's own list or the bridge is used.
+  // can still refuse, hang, or see no devices, and then LUNA's own list is used.
   if (navigator.requestMIDIAccess && !DEMO) {
     Promise.race([navigator.requestMIDIAccess({ sysex: false }), new Promise((_, no) => setTimeout(() => no(new Error('Web MIDI did not answer')), 3000))])
       .then((access) => {
@@ -284,35 +233,6 @@ async function startMidi() {
   devicesChanged();
 }
 
-/** The local helper (npm run bridge): carries MIDI when LUNA doesn't publish it, and keeps a log and a disk copy of the settings. */
-function connectBridge() {
-  let ws;
-  try {
-    ws = new WebSocket(BRIDGE_URL);
-  } catch {
-    return setTimeout(connectBridge, 5000);
-  }
-  ws.onopen = () => {
-    midiIn.ws = ws;
-    ws.send(JSON.stringify({ type: 'hello', build: BUILD, ua: navigator.userAgent, webmidi: !!navigator.requestMIDIAccess, inLuna: Luna.isEmbeddedInLuna(), url: location.href }));
-  };
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'state') mergeState(msg.items);
-    else if (msg.type === 'diag') report(`diag ${JSON.stringify(healthSnapshot())}`);
-    else if (msg.type === 'inputs') {
-      midiIn.bridgeInputs = msg.inputs;
-      chooseVia();
-    } else if (msg.type === 'midi') from('bridge')(msg.data, msg.device);
-  };
-  ws.onclose = () => {
-    if (midiIn.ws === ws) midiIn.ws = undefined;
-    midiIn.bridgeInputs = [];
-    chooseVia();
-    setTimeout(connectBridge, 5000);
-  };
-}
-
 function renderDevices() {
   const sel = $('device');
   const known = (n) => midiIn.inputs.some((i) => AddOnLogic.sameDevice(i, n));
@@ -323,7 +243,7 @@ function renderDevices() {
     names.map((n) => `<option value="${esc(n)}">${esc(n)}${known(n) ? '' : ' (offline)'}</option>`).join('');
   sel.value = names.find((n) => AddOnLogic.sameDevice(n, prefs.device)) ?? '';
   $('midi-dot').classList.toggle('live', midiIn.inputs.length > 0);
-  $('midi-chip').title = { luna: 'MIDI from LUNA', webmidi: 'MIDI from the browser (Web MIDI)', bridge: 'MIDI from the MIDI Learn helper', last: "MIDI from LUNA's last-controller values: knobs work; no feedback, and an identical repeat can be missed. Run the helper (npm run bridge) for full MIDI.", none: 'Which MIDI input MIDI Learn listens to' }[midiIn.via];
+  $('midi-chip').title = { luna: 'MIDI from LUNA', webmidi: 'MIDI from the browser (Web MIDI)', last: "MIDI from LUNA's last-controller values: knobs work; no feedback, and an identical repeat can be missed.", none: 'Which MIDI input MIDI Learn listens to' }[midiIn.via];
 }
 $('device').onchange = () => {
   prefs.device = $('device').value;
@@ -1750,9 +1670,9 @@ async function connect() {
 }
 
 // ---- Staying healthy over hours ------------------------------------------------------------
-// LUNA keeps this page loaded for hours, through engine reconnects, bridge restarts and the window
+// LUNA keeps this page loaded for hours, through engine reconnects and the window
 // being hidden. Every 30 s, check what should always hold, repair it, and log anything that
-// was wrong to the bridge, so a slow failure can be traced (npm run bridge:status).
+// was wrong, so a slow failure can be traced.
 function healthSnapshot() {
   const sw = $('open-colors').getBoundingClientRect();
   const atSwatch = document.elementFromPoint(sw.left + sw.width / 2, sw.top + sw.height / 2);
@@ -1771,7 +1691,6 @@ function healthSnapshot() {
     viewport: [innerWidth, innerHeight],
     focus: document.activeElement ? `${document.activeElement.tagName.toLowerCase()}#${document.activeElement.id}` : null,
     luna: luna?.status.value,
-    bridge: midiIn.ws?.readyState,
     midi: midiIn.via,
     midiInputs: midiIn.inputs.length,
     session: session?.name.value,
@@ -1808,6 +1727,5 @@ function healthCheck() {
 setInterval(healthCheck, 30000);
 
 renderDevices();
-if (!new URLSearchParams(location.search).has('nobridge')) connectBridge(); // ?nobridge: try the page without the helper
 connect();
 

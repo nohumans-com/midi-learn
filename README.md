@@ -169,33 +169,22 @@ The page takes MIDI from the best source it finds, one at a time (the MIDI chip'
    device. Needs a LUNA that publishes MIDI ports to Add Ons (SDK facts 123 to 125); LUNA 3.1.1 does
    not.
 2. **Web MIDI**, where the browser has it (Chrome, Edge, LUNA on Windows). LUNA's macOS webview has none.
-3. **The helper** (`npm run bridge`): carries every input and the feedback
-   out. This is what a Mac with LUNA 3.1.1 uses.
-4. **LUNA's last-controller values**, which every LUNA publishes for each device. Knobs and faders
+3. **LUNA's last-controller values**, which every LUNA publishes for each device. Knobs and faders
    work with nothing installed, but there is no feedback, LUNA coalesces fast moves, and a repeat of
    an identical message (the same button value twice) is not a change, so it is missed.
 
 The MIDI chip at top left picks one input or listens to all of them. The same hardware has
-different names in different sources (LUNA says "Roto-Control (2)" and "IAC IAC Bus 1", the helper
+different names in different sources (LUNA says "Roto-Control (2)" and "IAC IAC Bus 1", Web MIDI
 "Roto-Control" and "IAC Bus 1"), so a mapping's device matches on the name without the "(2)" and
 without a driver prefix: mappings keep working whichever source is live.
 
-Feedback goes out the same way: through LUNA's output port when it has one, else Web MIDI, else the
-helper.
-
-### The helper
-
-`npm run bridge` (and `npm run bridge:install`) start it. It also keeps a log
-(`~/Library/Logs/midi-learn-bridge.log`, since LUNA's window has no console) and a disk copy of the
-settings (`~/Library/Application Support/MIDI Learn/state.json`). Open the page with `?nobridge` to
-try it without the helper.
+Feedback goes out the same way: through LUNA's output port when it has one, else Web MIDI.
 
 ## Run
 
 ```sh
 npm install
 npm test                         # against Luna.MockEngine, no LUNA needed
-npm run bridge                   # optional: a log and a disk copy of the settings
 npx ua-builder serve             # http://localhost:8790/ ; LUNA must be running
 open "http://localhost:8790/?demo"   # an in-page mock session, to try the page without LUNA;
                                      # it never reads or writes your saved settings or sends MIDI out
@@ -206,7 +195,6 @@ npx ua-builder install           # link into LUNA's Add Ons folder; appears unde
 |---|---|
 | `logic.js` | Parsing, the control catalog, learn mode, applying MIDI, storage, templates. No DOM. |
 | `main.js` | MIDI in and out (the SDK), the page, the background picker. |
-| `bridge/midi-bridge.mjs` | The optional local helper (log, disk copy of the settings). |
 | `tests/` | Vitest against the mock engine. |
 | `vendor/luna.global.js` | The SDK bundle, **patched** (see below). |
 | `patches/ua-builder-sdk-load-retry.patch` | The SDK change that bundle carries, as a source diff. |
@@ -218,7 +206,7 @@ npx ua-builder install           # link into LUNA's Add Ons folder; appears unde
 npm run pack               # -> midi-learn.lunaaddon
 ```
 
-MIDI no longer needs the helper, so the `.lunaaddon` is all you hand out. The recipient double-clicks it to install it in LUNA.
+The `.lunaaddon` is all you hand out. The recipient double-clicks it to install it in LUNA.
 
 ## The vendored SDK is patched
 
@@ -264,11 +252,8 @@ as "touch a knob in its window while learning", and a parameter joins the list o
 - **Storage:** session mappings (and any section with Save with this session on) are in the
   session, in the `com.uaudio.midi-learn` preference context. Everything else (global mappings,
   templates, the shared layouts, the colour, the MIDI choice) is in the page's `localStorage`.
-  On macOS each Add On has its own, kept across launches while the manifest `id` stays the same;
-  the optional helper's disk copy fills in anything it loses. Session preferences need a LUNA that
+  On macOS each Add On has its own, kept across launches while the manifest `id` stays the same.
+  Session preferences need a LUNA that
   has them; without, session mappings stay in `localStorage` as before.
 - Relative (endless) encoders, 14-bit CC pairs, NRPN and soft takeover are not supported yet.
   An endless encoder that sends 1 or 127 will jump.
-
-The page logs to the bridge (`npm run bridge:status`): learn on and off, the scan result, and
-any error. LUNA's window has no console, so this log is the way to see what it's doing.
