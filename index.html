@@ -1,9 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-skin="luna" data-tone="dark" data-panel="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>MIDI Learn</title>
+  <link rel="stylesheet" href="luna-skin.css">
   <style>
     /* Vocal Booth's tokens. The room (--tape) is any colour; on dark ones the ink flips to white. */
     :root {
@@ -371,6 +372,30 @@
     :root[data-tone="dark"] .note.banner code { background: rgba(0, 0, 0, 0.08); }
 
     /* ---- Popovers: background colour, templates -------------------------------------- */
+    /* ---- Licence screen: shown in place of the board until a Gumroad key is accepted ---- */
+    body.locked .board { display: none; }
+    .lic { margin: 8px 16px 16px; padding: 22px 20px 18px; border-radius: 16px; background: linear-gradient(var(--card-hi), var(--card-hi)), var(--tape); box-shadow: 0 0 0 1px var(--line); }
+    .lic[hidden] { display: none; }
+    .lic h2 { margin: 0 0 6px; font-size: 20px; font-weight: 800; letter-spacing: -0.01em; }
+    .lic p { margin: 0 0 14px; font-size: 13px; line-height: 1.45; color: var(--fg-2); }
+    .lic form { display: flex; flex-direction: column; gap: 10px; }
+    .lic input { width: 100%; box-sizing: border-box; padding: 11px 12px; border-radius: 10px; border: 0; background: var(--well); color: var(--fg); font: 600 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 0.02em; outline: none; }
+    .lic input:focus { box-shadow: 0 0 0 2px var(--ink); }
+    :root[data-tone="dark"] .lic input:focus { box-shadow: 0 0 0 2px #fff; }
+    .lic button[type="submit"] { padding: 11px 14px; border-radius: 12px; background: var(--ink); color: #fff; font-size: 13px; font-weight: 800; }
+    :root[data-tone="dark"] .lic button[type="submit"] { background: #fff; color: #000; }
+    .lic button[disabled] { opacity: 0.5; }
+    .lic .lic-msg { min-height: 18px; margin: 10px 0 0; color: var(--red); font-weight: 600; }
+    .lic .lic-msg.ok { color: var(--green); }
+    .lic .lic-foot { margin: 6px 0 0; font-size: 12px; }
+    .lic .lic-foot a { color: var(--fg); font-weight: 700; }
+    .lic .lic-preview { margin: 10px 0 0; padding: 8px 10px; border-radius: 10px; background: var(--well); font-size: 12px; }
+    :root[data-skin="luna"] .lic { margin: 0; border-radius: 0; background: var(--luna-body); box-shadow: 0 1px 0 var(--luna-edge); }
+    :root[data-skin="luna"] .lic input { border-radius: 2px; background: #17181A; box-shadow: inset 0 0 0 1px var(--luna-inset); }
+    :root[data-skin="luna"] .lic input:focus { box-shadow: inset 0 0 0 1px var(--luna-amber); }
+    :root[data-skin="luna"] .lic button[type="submit"] { border-radius: 3px; background: var(--luna-amber); color: #1B1B1B; }
+    :root[data-skin="luna"] .lic .lic-foot a { color: var(--luna-amber); }
+    :root[data-skin="luna"] .lic .lic-preview { border-radius: 2px; background: #17181A; }
     .pop { position: fixed; top: 72px; right: 16px; z-index: 40; background: var(--chalk); color: #000; border-radius: 16px; padding: 14px; width: max-content; max-width: calc(100vw - 32px);
       box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22); animation: rise 260ms var(--spring) both; --fg: #000; --fg-2: rgba(0, 0, 0, 0.5); --well: rgba(0, 0, 0, 0.07); --rule: rgba(0, 0, 0, 0.12); --solid: #000; --on-solid: #fff; }
     .pop h4 { margin: 0 0 10px; font-size: 13px; }
@@ -442,6 +467,79 @@
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { transition-duration: 1ms !important; animation-duration: 1ms !important; }
     }
+    /* ---- LUNA look: MIDI Learn's own pieces (the shared sheet, luna-skin.css, covers the rest) ---- */
+    :root[data-skin="luna"] body { background: var(--luna-bg); }
+    :root[data-skin="luna"] .sect > .body, :root[data-skin="luna"] .col > .body, :root[data-skin="luna"][data-tone="dark"] .sect > .body, :root[data-skin="luna"][data-tone="dark"] .col > .body { background: var(--luna-body); box-shadow: none; border-radius: 0; }
+    :root[data-skin="luna"] .sect, :root[data-skin="luna"] .col { gap: 0; margin-top: 0; box-shadow: none; background: var(--luna-body); }
+    /* sections stack flush like LUNA's panels: one hairline between them, no gaps */
+    :root[data-skin="luna"] .board { gap: 0 var(--gap); padding: 0 0 20px; }
+    :root[data-skin="luna"] .sect > .body, :root[data-skin="luna"] .col > .body { padding: 8px 10px; }
+    :root[data-skin="luna"] .col { padding-bottom: 0; }
+    :root[data-skin="luna"] .col, :root[data-skin="luna"] .col > .sect, :root[data-skin="luna"] .sect { gap: 0 !important; row-gap: 0 !important; }
+    /* title bars: one nowrap line, everything centred on it, Learn pinned right whether open or closed */
+    :root[data-skin="luna"] .head { align-items: center; flex-wrap: nowrap; gap: 8px; min-height: 32px; padding: 0 12px; }
+    :root[data-skin="luna"] .head .fold { display: flex; align-items: center; align-self: center; gap: 8px; margin: 0; padding: 0; line-height: 1; flex: 0 0 auto; }
+    :root[data-skin="luna"] .head .fold h3 { margin: 0; line-height: 1; }
+    :root[data-skin="luna"] .head .fold::before { align-self: center; margin: 0; flex: none; }
+    :root[data-skin="luna"] .head .fold-sum { flex: 1 1 0; min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    :root[data-skin="luna"] .head .chip, :root[data-skin="luna"] .head .focus-chip { flex: 0 1 150px; min-width: 40px; margin: 0; }
+    :root[data-skin="luna"] .head .chip select { min-width: 0; width: 100%; text-overflow: ellipsis; }
+    :root[data-skin="luna"] .head .switch { flex: none; margin: 0; }
+    :root[data-skin="luna"] .head .learn-pill, :root[data-skin="luna"] .head .pill { flex: none; margin: 0; align-self: center; }
+    :root[data-skin="luna"] .head .fold + *:not(.fold-sum), :root[data-skin="luna"] .head .fold-sum + * { margin-left: auto; }
+    /* learned-parameter rows: breathing room at the edges, tidy CC boxes */
+    :root[data-skin="luna"] .map .row { padding: 6px 10px; gap: 12px; }
+    :root[data-skin="luna"] .src { min-width: 64px; height: 30px; padding: 0 10px; border-radius: 2px; background: var(--luna-well); color: var(--luna-amber); box-shadow: inset 0 0 0 1px var(--luna-inset); font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+    :root[data-skin="luna"] .map.open { margin: 6px 0; padding: 0 10px 4px; }
+    :root[data-skin="luna"] .col > .sect + .sect, :root[data-skin="luna"] .col > .sect + .col, :root[data-skin="luna"] .col > .col + .sect { margin-top: 0; }
+    :root[data-skin="luna"] .sect > .head, :root[data-skin="luna"] .col > .head { border-top: 0; border-bottom: 1px solid var(--luna-edge); }
+    :root[data-skin="luna"] .sect.folded > .head, :root[data-skin="luna"] .col.folded > .head { border-bottom: 1px solid var(--luna-edge); }
+    :root[data-skin="luna"] .mighty, :root[data-skin="luna"] .slot { background: var(--luna-row); box-shadow: inset 0 0 0 1px #2F3034; border-radius: 2px; }
+    :root[data-skin="luna"] .slot .n i { background: var(--luna-inset); border-radius: 50%; }
+    :root[data-skin="luna"] .slot .n { text-transform: uppercase; letter-spacing: 0.05em; font-size: 11px; color: var(--luna-fg-2); }
+    :root[data-skin="luna"] .slot.got { background: var(--luna-steel); box-shadow: inset 0 0 0 1px var(--luna-steel-edge); color: #fff; }
+    :root[data-skin="luna"] .slot .mode-note { background: var(--luna-amber); color: #1B1B1B; border-radius: 2px; }
+    :root[data-skin="luna"] .slot.got .mode-note { background: var(--luna-amber); color: #000; }
+    :root[data-skin="luna"] .slot.got .segments button[aria-pressed="true"] { background: var(--luna-steel-edge); color: #fff; }
+    :root[data-skin="luna"] .slot.got #src-assign { background: var(--luna-btn); color: var(--luna-btn-ink); }
+    :root[data-skin="luna"] .src-edit .num, :root[data-skin="luna"] .src-edit .ch select, :root[data-skin="luna"] .src-line select, :root[data-skin="luna"] .src-line input { border-radius: 2px; background: var(--luna-well); box-shadow: inset 0 0 0 1px var(--luna-inset); color: var(--luna-fg); }
+    :root[data-skin="luna"] .src-edit .num:focus, :root[data-skin="luna"] .src-line input:focus { box-shadow: inset 0 0 0 1px var(--luna-focus); }
+    :root[data-skin="luna"] .slot.got .num, :root[data-skin="luna"] .slot.got .ch select { background: var(--luna-well); }
+    :root[data-skin="luna"] .slot.got .segments { background: var(--luna-well); }
+    :root[data-skin="luna"] .cmd-list { border-radius: 2px; background: var(--luna-well); box-shadow: inset 0 0 0 1px var(--luna-inset); }
+    :root[data-skin="luna"] .cmd-toggle, :root[data-skin="luna"] .slot.got .cmd-toggle { background: var(--btn); color: var(--luna-fg); }
+    :root[data-skin="luna"] .src { border-radius: 2px; background: var(--luna-well); box-shadow: inset 0 0 0 1px var(--luna-inset); color: var(--luna-amber); }
+    :root[data-skin="luna"] .map.hit .src, :root[data-skin="luna"] .mighty.hit .src { background: var(--luna-amber); color: #000; }
+    :root[data-skin="luna"] .map.learned .src { background: var(--luna-steel); color: #fff; }
+    :root[data-skin="luna"] .tag.global { background: var(--luna-steel); color: #fff; }
+    :root[data-skin="luna"] .map { border-bottom-color: var(--luna-rule); }
+    :root[data-skin="luna"] .map.open { border-radius: 2px; background: var(--luna-row); box-shadow: inset 0 0 0 1px var(--luna-steel-edge); }
+    :root[data-skin="luna"] .edit select { border-bottom-color: var(--luna-rule); color: var(--luna-fg); }
+    :root[data-skin="luna"] .meter { border-radius: 1px; background: var(--luna-well); }
+    :root[data-skin="luna"] .meter i, :root[data-skin="luna"] .rail .fill { background: var(--luna-amber); }
+    :root[data-skin="luna"] .rail .track::before { background: var(--luna-fg-2); opacity: 0.5; }
+    :root[data-skin="luna"] .rail .cap { width: 10px; height: 18px; margin: -9px 0 0 -5px; border-radius: 2px; background: #C9CBD0; box-shadow: 0 0 0 1px var(--luna-edge); }
+    :root[data-skin="luna"] .rail .cap:focus-visible { outline-color: var(--luna-focus); }
+    :root[data-skin="luna"] .x:hover { background: var(--luna-row-hi); }
+    :root[data-skin="luna"] .learn-pill { background: var(--luna-btn); color: var(--luna-btn-ink); font-weight: 700; }
+    :root[data-skin="luna"] .learn-pill:hover { background: var(--luna-btn-hi); }
+    :root[data-skin="luna"] .learn-pill[aria-pressed="true"] { background: var(--luna-steel); color: #fff; }
+    :root[data-skin="luna"] .pill.solid { background: var(--luna-btn); color: var(--luna-btn-ink); }
+    :root[data-skin="luna"] .saved-maps .map-chip { border-radius: 2px; background: var(--luna-well); box-shadow: inset 0 0 0 1px var(--luna-inset); }
+    :root[data-skin="luna"] .saved-maps .map-chip.on { background: var(--luna-steel); color: #fff; }
+    :root[data-skin="luna"] .note.banner, :root[data-skin="luna"][data-tone="dark"] .note.banner { background: var(--luna-row-hi); color: var(--luna-fg); border-radius: 2px; box-shadow: inset 0 0 0 1px var(--luna-rule); }
+    :root[data-skin="luna"] .note.banner code { background: var(--luna-well); }
+    :root[data-skin="luna"] .device-menu, :root[data-skin="luna"] .learn-menu { background: #2A2B2E; color: var(--luna-fg); border-radius: 4px; box-shadow: 0 0 0 1px var(--luna-edge), 0 14px 34px rgba(0,0,0,0.55); }
+    :root[data-skin="luna"] .device-menu button:hover, :root[data-skin="luna"] .device-menu button:focus-visible, :root[data-skin="luna"] .learn-menu button:hover, :root[data-skin="luna"] .learn-menu button:focus-visible { background: var(--luna-steel); color: #fff; }
+    :root[data-skin="luna"] .pop.colors { background: #2A2B2E; }
+    /* the mascot on the white guide: white head, light body, dark outline (his fills follow the panel colour otherwise) */
+    :root[data-skin="luna"] .help-title .plug { --tape: #FFFFFF; --well: #E9EBEE; --solid: #1B1C1E; --on-solid: #FFFFFF; color: #111214; }
+    :root[data-skin="luna"] .swatch-dot { box-shadow: 0 0 0 1px rgba(255,255,255,0.25); }
+    :root[data-skin="luna"] .mast .logo, :root[data-skin="luna"] .mast .logo svg { color: var(--luna-fg); }
+    :root[data-skin="luna"] .mast h1 .w2 { color: var(--luna-amber); }
+    :root[data-skin="luna"] .fold-sum { color: var(--luna-fg-2); }
+    :root[data-skin="luna"] .chip select { background: transparent; box-shadow: none; color: var(--luna-fg); text-transform: none; letter-spacing: 0; font-size: 12.5px; height: 24px; padding: 0 14px 0 0; min-width: 0; }
+    :root[data-skin="luna"] .focus-chip { min-width: 0; max-width: min(200px, 46%); }
   </style>
 </head>
 <body>
@@ -468,6 +566,18 @@
     <button class="pill" id="open-templates" aria-haspopup="dialog" title="Save or load your whole controller layout: every section">Templates</button>
     </div>
   </header>
+
+  <section class="lic" id="license" hidden aria-label="Activate MIDI Learn">
+    <h2>Activate MIDI Learn</h2>
+    <p>Enter the license key from your Gumroad receipt. You only do this once on this computer.</p>
+    <form id="lic-form" autocomplete="off">
+      <input id="lic-key" type="text" placeholder="License key" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="License key">
+      <button type="submit" id="lic-go">Activate</button>
+    </form>
+    <p class="lic-msg" id="lic-msg" role="status"></p>
+    <p class="lic-foot">No key yet? <a id="lic-buy" href="#" target="_blank" rel="noopener">Get MIDI Learn on Gumroad</a></p>
+    <p class="lic-preview" id="lic-preview" hidden>Preview: no Gumroad product is set up yet. The key <b>TEST-1234</b> activates it.</p>
+  </section>
 
   <main class="board" id="board">
     <section class="col" id="col-maps" aria-label="Mappings">
@@ -707,7 +817,10 @@
   <div class="toast" id="message" role="status" aria-live="polite"></div>
   <input type="file" id="import-file" accept="application/json,.json" hidden>
 
+  <script src="luna-skin.js"></script>
   <script>
+    /* The look is applied before first paint (same localStorage key main.js's store uses; it holds JSON). */
+    try { LunaSkin.init({ key: 'midilearn.skin', get: (k) => JSON.parse(localStorage.getItem(k)), set: () => {} }); } catch {}
     /* Folding works from the first paint, before the SDK and main.js (500 KB+) have loaded and run:
        it flips the section now and notes the flip for main.js to fold into its saved prefs. */
     window.__earlyFolds = {};
@@ -731,6 +844,7 @@
   </script>
   <script src="vendor/luna.global.js"></script>
   <script src="logic.js"></script>
+  <script src="license.js"></script>
   <script src="main.js"></script>
 </body>
 </html>

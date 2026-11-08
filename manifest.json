@@ -5,7 +5,7 @@
     "title": "MIDI Learn",
     "manufacturer": "No Humans",
     "version": "0.3.0",
-    "sdk_version": "0.2.1",
+    "sdk_version": "3.1.1",
     "min_luna_version": "3.1.1",
     "engines": [
         "luna"

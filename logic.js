@@ -17,44 +17,157 @@ const KEYS = {
   templates: 'midilearn.templates',
 };
 
-/** The preference context MIDI Learn keeps in a session (the Add On's id, as LUNA's docs advise). */
+/** The storage context MIDI Learn keeps in a session (the Add On's id, as LUNA's docs advise). */
 const SESSION_CONTEXT = 'com.uaudio.midi-learn';
-const SESSION_PREFERENCE = 'settings';
-/** The settings that can be saved with a session: one session preference property each. */
+/** The record inside that context (a "preference" before SDK 3.x). */
+const SESSION_RECORD = 'settings';
+/** The settings that can be saved with a session: one field of that record each. */
 const SESSION_KINDS = ['focus', 'plugins', 'mighty'];
 
 /**
- * Settings saved inside the LUNA session (`session.preferences`, SDK fact 110), so they travel with
- * the session file. Reads are synchronous once `load()` resolves; writes update the cache at once
- * and reach LUNA in order, in the background (`flush()` waits for them). Values are wrapped,
- * since a property that reads null is one that was never added.
+ * A LUNA from before session storage keeps the same data under `/sessions/<uid>/preferences`
+ * (commands add_preference / set_preference / remove_preference, arguments {context, preference,
+ * property}). SDK 3.x no longer has a model for that node, so this speaks to it directly, with the
+ * same `load / value / add / set / remove` surface as the SDK's storage context. It is only used
+ * when the session has no `/storage` node, and to read (never delete) data an older LUNA saved.
+ */
+class LegacyPreferences {
+  constructor(session, contextName) {
+    this.client = session.client;
+    this.path = `${session.path}/preferences/${contextName}`;
+    this.contextName = contextName;
+    this.base = `${session.path}/preferences`;
+  }
+
+  async load() {
+    await this.client.store.load(this.path, { levels: 2, commands: false, flatvalue: true });
+  }
+
+  value(record, field) {
+    const cell = this.client.store.cell(`${this.path}/${record}`, field);
+    return { get value() { return cell.value; } };
+  }
+
+  async post(command, body) {
+    await this.client.raw.post(`${this.base}/${command}`, { context: this.contextName, undoable: false, ...body });
+  }
+
+  async add(record, field, value) {
+    await this.post('add_preference', { preference: record, property: field, value });
+    await this.reread();
+  }
+
+  async set(record, field, value) {
+    await this.post('set_preference', { preference: record, property: field, value });
+    await this.reread();
+  }
+
+  async remove(record, field) {
+    await this.post('remove_preference', { preference: record, property: field });
+    this.client.store.cell(`${this.path}/${record}`, field).update(undefined);
+  }
+
+  async reread() {
+    await this.client.store.load(this.path, { levels: 2, commands: false, flatvalue: true });
+  }
+}
+
+/**
+ * Settings saved inside the LUNA session (`session.storage`, SDK fact 110; `session.preferences`
+ * before SDK 3.x), so they travel with the session file. Reads are synchronous once `load()`
+ * resolves; writes update the cache at once and reach LUNA in order, in the background (`flush()`
+ * waits for them). Values are wrapped, since a field that reads null is one that was never added.
+ *
+ * Which node is used is detected at load(): `/storage` when the session has one; otherwise the
+ * older `/preferences` node (through LegacyPreferences). Settings found only in the old node are
+ * adopted and, when `/storage` exists, copied there, so nothing a session saved is lost.
  */
 class SessionSettings {
   constructor(session, { onError } = {}) {
-    this.ctx = session.preferences.context(SESSION_CONTEXT);
+    this.session = session;
+    this.ctx = session.storage?.context(SESSION_CONTEXT);
     this.onError = onError;
-    this.available = false; // false on a LUNA without session preferences
+    this.available = false; // false on a LUNA with neither session storage nor preferences
+    this.legacy = false; // true when the settings live in the older /preferences node
     this.cache = new Map(); // key -> value, or undefined once removed
     this.queue = new Map(); // key -> { value } | { remove: true }, the writes still to send
     this.running = undefined;
   }
 
-  /** Read the saved settings. Resolves to whether this LUNA keeps session preferences. */
+  /** Read the saved settings. Resolves to whether this LUNA keeps them in the session. */
   async load() {
-    try {
-      await this.ctx.load();
-      this.available = true;
-    } catch (e) {
-      this.available = false;
-      this.onError?.(e);
+    this.available = false;
+    this.legacy = false;
+    let failure;
+    if (this.ctx) {
+      try {
+        await this.ctx.load();
+        this.available = true;
+      } catch (e) {
+        failure = e;
+      }
+    }
+    if (!this.available) {
+      // A LUNA without /storage: use the older /preferences node, if it has one.
+      const old = this.openLegacy();
+      try {
+        await old.load();
+        this.ctx = old;
+        this.available = true;
+        this.legacy = true;
+      } catch (e) {
+        this.onError?.(failure ?? e);
+      }
+    } else {
+      await this.adoptLegacy();
     }
     return this.available;
   }
 
+  openLegacy() {
+    return this.session.client ? new LegacyPreferences(this.session, SESSION_CONTEXT) : { load: () => Promise.reject(new Error('no session storage')) };
+  }
+
+  /** Switch to the older /preferences node; true when this LUNA has it. */
+  async useLegacy() {
+    const old = this.openLegacy();
+    try {
+      await old.load();
+    } catch {
+      return false;
+    }
+    this.ctx = old;
+    this.legacy = true;
+    return true;
+  }
+
+  /**
+   * Settings an older LUNA saved under /preferences, when /storage holds none of ours yet: keep
+   * them. (Only while the context is empty, so a setting removed later is not brought back.)
+   */
+  async adoptLegacy() {
+    if ((this.ctx.records?.value ?? []).length) return;
+    const old = this.openLegacy();
+    try {
+      await old.load();
+    } catch {
+      return; // no such node: nothing to carry over
+    }
+    for (const key of SESSION_KINDS) {
+      if (this.readRaw(key) !== undefined) continue;
+      const raw = old.value(SESSION_RECORD, key).value;
+      if (raw && typeof raw === 'object' && 'v' in raw) this.set(key, raw.v);
+    }
+  }
+
+  readRaw(key) {
+    const raw = this.available ? this.ctx.value(SESSION_RECORD, key).value : undefined;
+    return raw && typeof raw === 'object' && 'v' in raw ? raw.v : undefined;
+  }
+
   get(key) {
     if (this.cache.has(key)) return this.cache.get(key);
-    const raw = this.available ? this.ctx.value(SESSION_PREFERENCE, key).value : undefined;
-    return raw && typeof raw === 'object' && 'v' in raw ? raw.v : undefined;
+    return this.readRaw(key);
   }
 
   has(key) {
@@ -84,13 +197,20 @@ class SessionSettings {
         const [key, job] = this.queue.entries().next().value;
         this.queue.delete(key);
         try {
-          if (job.remove) await this.ctx.remove(SESSION_PREFERENCE, key);
+          if (job.remove) await this.ctx.remove(SESSION_RECORD, key);
           else {
-            const exists = this.ctx.value(SESSION_PREFERENCE, key).value != null;
-            if (exists) await this.ctx.set(SESSION_PREFERENCE, key, { v: job.value });
-            else await this.ctx.add(SESSION_PREFERENCE, key, { v: job.value });
+            const exists = this.ctx.value(SESSION_RECORD, key).value != null;
+            if (exists) await this.ctx.set(SESSION_RECORD, key, { v: job.value });
+            else await this.ctx.add(SESSION_RECORD, key, { v: job.value });
           }
         } catch (e) {
+          // A LUNA that answered a read of /storage but rejects its writes has no session
+          // storage: move to its older /preferences node, or stay local if it has none either.
+          if (!this.legacy && (await this.useLegacy())) {
+            if (!this.queue.has(key)) this.queue.set(key, job); // retry there, unless a newer write to the key is waiting
+            continue;
+          }
+          if (!this.legacy) this.available = false;
           this.onError?.(e);
         }
       }

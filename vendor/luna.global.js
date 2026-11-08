@@ -86,7 +86,6 @@ var Luna = (() => {
     Playlist: () => Playlist,
     Plugin: () => Plugin,
     Plugins: () => Plugins,
-    PreferenceContext: () => PreferenceContext,
     Preferences: () => Preferences,
     PresetSelection: () => PresetSelection,
     Presets: () => Presets,
@@ -103,16 +102,19 @@ var Luna = (() => {
     SendMidi: () => SendMidi,
     Session: () => Session,
     SessionPackage: () => SessionPackage,
-    SessionPreferences: () => SessionPreferences,
+    SessionStorage: () => SessionStorage,
     Sessions: () => Sessions,
     Shortcuts: () => Shortcuts,
+    StorageContext: () => StorageContext,
     Store: () => Store,
     TICKS_PER_BEAT: () => TICKS_PER_BEAT,
     TICKS_PER_DISPLAY_TICK: () => TICKS_PER_DISPLAY_TICK,
+    TRACK_PRESET_CATEGORIES: () => TRACK_PRESET_CATEGORIES,
     TempoEvent: () => TempoEvent,
     TimeSignature: () => TimeSignature,
     Timeline: () => Timeline,
     Track: () => Track,
+    TrackPresetSelection: () => TrackPresetSelection,
     Transport: () => Transport,
     Unsupported: () => Unsupported,
     VERSION: () => VERSION,
@@ -967,34 +969,11 @@ var Luna = (() => {
           }
         }
       });
-      this.addNode("/plugins", { properties: { type: "folder" }, commands: { rescan: () => null } });
+      this.addNode("/plugins", { properties: { type: "folder" }, commands: { rescan: () => null, query: (data, engine) => engine.queryPlugins(data) } });
       this.addNode("/presets", {
         properties: { type: "folder" },
         commands: {
-          query: (data, engine) => {
-            const body = data ?? {};
-            if (!body.plugin_id && !body.device_type_id) throw new UAError("uasrv.invalid_type", "query: plugin_id or device_type_id required", { cmd: "post", path: "/presets/query" });
-            const root = `/presets/plugins/${body.plugin_id ?? ""}/presets`;
-            let rows = engine.children(root).map((uid) => ({
-              uid,
-              name: String(engine.value(`${root}/${uid}`, "preset_name") ?? uid),
-              version: Number(engine.value(`${root}/${uid}`, "version") ?? 1),
-              favorite: engine.value(`${root}/${uid}`, "favorite") ? 1 : 0,
-              factory: engine.value(`${root}/${uid}`, "factory") ? 1 : 0,
-              path: String(engine.value(`${root}/${uid}`, "path") ?? ""),
-              tags: engine.presetTags(body.plugin_id ?? "", uid)
-            }));
-            const wanted = (Array.isArray(body.tag) ? body.tag : body.tag !== void 0 ? [body.tag] : []).filter((t) => t !== "");
-            const any = Array.isArray(body.tag) && body.union === true;
-            if (wanted.length > 0) rows = rows.filter((r) => any ? wanted.some((t) => r.tags.includes(t)) : wanted.every((t) => r.tags.includes(t)));
-            if (body.search) rows = rows.filter((r) => r.name.toLowerCase().includes(body.search.toLowerCase()));
-            if (body.favorite) rows = rows.filter((r) => r.favorite === 1);
-            if (body.limit !== void 0 && body.limit > 0) rows = rows.slice(0, body.limit);
-            const results = { num_rows: rows.length };
-            for (const k of ["uid", "name", "version", "favorite", "factory", "path"]) results[k] = rows.map((r) => r[k]);
-            if (body.tags) results["tags"] = rows.map((r) => r.tags);
-            return { results, folders: [] };
-          },
+          query: (data, engine) => engine.queryPresets(data),
           // Fact 121: deviced forwards to UA Assistant's hybrid search; with the assistant not
           // connected it answers `ua.unknown`, and the assistant refuses empty text.
           preset_recommendations: (data, engine) => {
@@ -1006,6 +985,9 @@ var Luna = (() => {
           }
         }
       });
+      this.addNode("/presets/devices/track", { properties: { device_type_id: "track" }, commands: { load: (data, engine) => engine.loadTrackPreset(data) } });
+      this.addNode("/presets/devices/track/presets", { properties: { type: "presets" } });
+      this.addNode("/presets/devices/track/categories", { properties: { type: "categories" } });
       this.addNode("/assistant", { properties: { enabled: false }, readOnly: ["enabled"] });
       this.addNode("/drivers", { properties: { connected: [{ id: "mock", name: "Mock Device", type: "built_in", num_inputs: 2, num_outputs: 2 }], unsupported: [], sample_rates: [44100, 48e3] } });
       this.addNode("/preferences", { properties: { io_buffer_size: 256, play_from_stop_location: false, record_mute: false, metronome_sound: "click", metronome_sounds: ["click", "beep"] } });
@@ -1069,6 +1051,67 @@ var Luna = (() => {
           show_feedback: () => null,
           show_session_in_finder: () => null,
           show_add_on: () => null,
+          // Fact 128: install_add_on's checks and codes as LUNA's. It records the request
+          // instead of downloading and installing anything.
+          install_add_on: (data, engine) => {
+            const fail = (code, why) => new UAError(code, `install_add_on: ${why}`, { cmd: "post", path: "/gui/install_add_on" });
+            const body = typeof data === "object" && data !== null ? data : {};
+            const hasId = typeof body.id === "string";
+            const hasUrl = typeof body.url === "string";
+            if (hasId === hasUrl) throw hasId ? fail("uasrv.invalid_value", "give id or url, not both") : fail("uasrv.missing_field", "id or url is required");
+            if (hasUrl) {
+              const target = githubRepoUrl(body.url) ?? driveDownloadUrl(body.url) ?? iCloudShareUrl(body.url) ?? dropboxDownloadUrl(body.url);
+              if (!target) throw fail("uasrv.invalid_value", "url is not a GitHub repo, or a Google Drive, iCloud Drive or Dropbox share");
+              engine.addOnInstalls.push({ url: target });
+              return null;
+            }
+            const id = body.id.toLowerCase();
+            const pkg = engine.marketplace[id] !== void 0 ? id : Object.keys(engine.marketplace).find((p) => engine.marketplace[p]?.includes(id));
+            if (pkg === void 0) throw fail("uasrv.invalid_value", `no marketplace package or Add On ${id}`);
+            if (engine.installingPackages.includes(pkg)) throw fail("uasrv.too_many_requests", `${pkg} is already installing`);
+            engine.addOnInstalls.push({ id: pkg });
+            return null;
+          },
+          // Fact 128: remove_imported_add_on's checks and codes as LUNA's.
+          remove_imported_add_on: (data, engine) => {
+            const fail = (code, why) => new UAError(code, `remove_imported_add_on: ${why}`, { cmd: "post", path: "/gui/remove_imported_add_on" });
+            const body = typeof data === "object" && data !== null ? data : {};
+            if (typeof body.id !== "string") throw fail("uasrv.missing_field", "id is required");
+            const id = body.id.toLowerCase();
+            const pkg = engine.marketplace[id] !== void 0 ? id : Object.keys(engine.marketplace).find((p) => engine.marketplace[p]?.includes(id));
+            if (pkg === void 0) throw fail("uasrv.invalid_value", `no marketplace package or Add On ${id}`);
+            if (!engine.importedPackages.includes(pkg)) throw fail("uasrv.not_permitted", `${pkg} is the marketplace's own`);
+            engine.importedPackages = engine.importedPackages.filter((p) => p !== pkg);
+            delete engine.marketplace[pkg];
+            return null;
+          },
+          // Fact 130: uninstall_add_on's checks and codes as LUNA's. LUNA's prompt is answered
+          // with uninstallAnswer; on 'remove' the Add On leaves /gui/add_ons.
+          uninstall_add_on: (data, engine) => {
+            const fail = (code, why) => new UAError(code, `uninstall_add_on: ${why}`, { cmd: "post", path: "/gui/uninstall_add_on" });
+            const body = typeof data === "object" && data !== null ? data : {};
+            if (typeof body.id !== "string") throw fail("uasrv.missing_field", "id is required");
+            const id = body.id.toLowerCase();
+            if (!engine.has(`/gui/add_ons/${id}`)) throw fail("uasrv.invalid_value", `no Add On ${id}`);
+            if (engine.builtInAddOns.includes(id)) throw fail("uasrv.not_permitted", `${id} is built into LUNA`);
+            engine.addOnUninstalls.push(id);
+            if (engine.uninstallAnswer === "remove") engine.removeNode(`/gui/add_ons/${id}`);
+            return null;
+          },
+          // Fact 126: what LUNA's show_plugin / hide_plugin check and do. LUNA opens a window
+          // only for a slot with a plugin, and lists it in /gui/plugin_windows by uid.
+          show_plugin: (data, engine) => {
+            const { slot, key } = engine.pluginWindowTarget(data, "show_plugin");
+            const open = engine.pluginWindowsOpen();
+            if (engine.value(slot, "plugin_id") && !open.some((w) => sameWindow(w, key))) engine.setValue("/gui/plugin_windows", "open", [...open, key]);
+            return null;
+          },
+          hide_plugin: (data, engine) => {
+            const { key } = engine.pluginWindowTarget(data, "hide_plugin");
+            const open = engine.pluginWindowsOpen();
+            if (open.some((w) => sameWindow(w, key))) engine.setValue("/gui/plugin_windows", "open", open.filter((w) => !sameWindow(w, key)));
+            return null;
+          },
           execute: () => null,
           add_task: () => null,
           update_task: () => null,
@@ -1125,7 +1168,7 @@ var Luna = (() => {
             if (!/^(\/|[A-Za-z]:[\\/])/.test(path)) throw fail("uasrv.invalid_value", "path must be absolute");
             const file = engine.mediaFiles[path];
             if (file === void 0) throw fail("uasrv.filesystem_error", "no file at path");
-            if (file === null) throw fail("uasrv.invalid_value", "not an audio or video file");
+            if (file === null) throw fail("uasrv.invalid_value", "not an audio, video or MIDI file");
             const id = body.add_on_id.toLowerCase();
             if (!engine.has(`/gui/add_ons/${id}`)) throw fail("uasrv.not_installed", `no Add On ${id}`);
             const target = file === true ? path : file;
@@ -1146,15 +1189,34 @@ var Luna = (() => {
       });
       this.addNode("/gui/windows/main", { properties: { page: "timeline" } });
       this.addNode("/gui/transport", { properties: { arm_mode: false } });
-      this.addNode("/gui/add_ons/com.example.demo", { properties: { id: "com.example.demo", name: "Demo", target: "window", icon: "", floating: true, show_with_session: false, manufacturer: "Example Co", description: "A demo Add On." } });
+      this.addNode("/gui/add_ons/com.example.demo", { properties: { id: "com.example.demo", name: "Demo", target: "window", icon: "", floating: true, show_with_session: false, manufacturer: "Example Co", description: "A demo Add On.", version: "1.0.0", installed_from: "folder" } });
       this.addNode("/gui/file_chooser");
+      this.addNode("/gui/plugin_windows", { properties: { open: [] }, readOnly: ["open"] });
       if (options.gui === false) this.removeNode("/gui");
+    }
+    /** @internal The windows listed in `/gui/plugin_windows`. */
+    pluginWindowsOpen() {
+      const open = this.value("/gui/plugin_windows", "open");
+      return Array.isArray(open) ? open : [];
+    }
+    /** @internal Validate a show_plugin / hide_plugin payload as LUNA does (fact 126). */
+    pluginWindowTarget(data, command) {
+      const fail = (code, why) => new UAError(code, `${command}: ${why}`, { cmd: "post", path: `/gui/${command}` });
+      const body = typeof data === "object" && data !== null ? data : {};
+      if (typeof body.channel_uid !== "string") throw fail("uasrv.missing_field", "channel_uid is required");
+      if (typeof body.insert_type !== "string") throw fail("uasrv.missing_field", "insert_type is required");
+      if (!/^(effect_\d+|record_fx_\d+|midi_\d+|console|tape|bus_input|instrument|sidechain_filter)$/.test(body.insert_type)) throw fail("uasrv.invalid_value", `unknown insert_type ${body.insert_type}`);
+      const sessionUid = typeof body.session_uid === "string" ? body.session_uid : this.children("/sessions")[0];
+      if (sessionUid === void 0 || !this.has(`/sessions/${sessionUid}`)) throw fail("uasrv.invalid_value", "no such open session");
+      const base = `/sessions/${sessionUid}`;
+      const channel = this.has(`${base}/tracks/${body.channel_uid}`) ? `${base}/tracks/${body.channel_uid}` : `${base}/buses/${body.channel_uid}`;
+      return { slot: `${channel}/effects/${body.insert_type}`, key: { session_uid: sessionUid, channel_uid: body.channel_uid, insert_type: body.insert_type } };
     }
     /** What the next mock file dialog "selects"; empty means the user cancelled. */
     nextDialogFiles = [];
     /**
-     * The files `/gui/serve_media_file` finds, by absolute path: `true` for an audio or video
-     * file it serves, `null` for one it refuses (not media, or media in name only), or the
+     * The files `/gui/serve_media_file` finds, by absolute path: `true` for an audio, video or
+     * MIDI file it serves, `null` for one it refuses (not media, or media in name only), or the
      * path a link leads to, which is served under that path. A path not listed is missing.
      *
      * @example
@@ -1165,6 +1227,37 @@ var Luna = (() => {
     mediaFiles = {};
     /** Every file `/gui/serve_media_file` served, in order, by lowercase Add On id. */
     mediaServed = [];
+    /**
+     * The marketplace `/gui/install_add_on` installs from: each package id to the ids of the
+     * Add Ons in it, all lowercase.
+     *
+     * @example
+     * engine.marketplace['uaudio-labs.midi-notation'] = ['com.uaudio.midi-notation', 'com.uaudio.score-view'];
+     */
+    marketplace = {};
+    /** Package ids `/gui/install_add_on` treats as already installing. */
+    installingPackages = [];
+    /**
+     * Package ids in {@link marketplace} that were imported from a link, which
+     * `/gui/remove_imported_add_on` removes (from here and from `marketplace`); any other
+     * package is the marketplace's own and is refused.
+     */
+    importedPackages = [];
+    /**
+     * Every install `/gui/install_add_on` started, in order: `{ id }` with the package id, or
+     * `{ url }` with what LUNA fetches: a repo's URL (`https://github.com/<owner>/<repo>`), or
+     * a Drive file's direct download
+     * (`https://drive.usercontent.google.com/download?id=<id>&export=download&confirm=t`), or
+     * an iCloud Drive share as `https://www.icloud.com/iclouddrive/<id>`, which LUNA resolves,
+     * or a Dropbox file's download (`https://www.dropbox.com/scl/fi/<id>/<name>?rlkey=<key>&dl=1`).
+     */
+    addOnInstalls = [];
+    /** Add On ids (lowercase) under `/gui/add_ons` that are built into LUNA, which `/gui/uninstall_add_on` refuses. */
+    builtInAddOns = [];
+    /** How the user answers LUNA's prompt for `/gui/uninstall_add_on`: `'remove'` (the default) takes the Add On out of `/gui/add_ons`, `'cancel'` leaves it. */
+    uninstallAnswer = "remove";
+    /** Every Add On id (lowercase) `/gui/uninstall_add_on` asked the user about, in order, whatever the answer. */
+    addOnUninstalls = [];
     /**
      * The disk `/gui/list_files` reads: each folder's absolute path to the names inside it,
      * a trailing `/` marking a subfolder. A name starting with `.` is hidden, as in LUNA.
@@ -1250,8 +1343,14 @@ var Luna = (() => {
       }
       return void 0;
     }
-    /** Add a plugin to the catalog. */
+    /**
+     * Add a plugin to the catalog. `effectType` is the manifest's (comma separated, `effect`
+     * when absent); `formats` the `[input, output]` stem formats it runs in (any when absent).
+     */
     addPlugin(pluginId, options = {}) {
+      const manifest = { manufacturer: options.manufacturer ?? "Mock", name: options.name ?? pluginId, plugin_id: pluginId, categories: options.categories ?? [], short_names: [] };
+      if (options.effectType !== void 0) manifest["effect_type"] = options.effectType;
+      if (options.formats !== void 0) manifest["supported_stream_formats"] = { primary: options.formats };
       this.addNode(`/plugins/${pluginId}`, {
         properties: {
           plugin_id: pluginId,
@@ -1259,12 +1358,61 @@ var Luna = (() => {
           version: "1.0.0",
           description: "",
           installed: true,
-          favorite: false,
+          favorite: options.favorite ?? false,
           authorized: null,
           default_preset_uid: null,
-          manifest: { manufacturer: options.manufacturer ?? "Mock", name: options.name ?? pluginId, plugin_id: pluginId, categories: options.categories ?? [], short_names: [] }
+          manifest
         }
       });
+    }
+    /** `/plugins/query` (fact 127), with LUNA's slot rules. Categories pass through untranslated. */
+    queryPlugins(data) {
+      const body = data ?? {};
+      const fail = (msg, code = "uasrv.invalid_value") => new UAError(code, `query: ${msg}`, { cmd: "post", path: "/plugins/query" });
+      const visible = ["effect", "instrument", "midi", "unison"];
+      let slotType;
+      let checksFormat = false;
+      if (body.insert_type !== void 0) {
+        const slot = body.insert_type;
+        if (/^(effect|record_fx)_\d+$/.test(slot)) [slotType, checksFormat] = ["effect", true];
+        else if (/^midi_\d+$/.test(slot)) slotType = "midi";
+        else if (slot === "instrument") [slotType, checksFormat] = ["instrument", true];
+        else if (slot === "tape") slotType = "tape";
+        else if (slot === "bus_input") slotType = "console";
+        else if (slot === "console") slotType = "console_ext";
+        else if (slot === "sidechain_filter") slotType = "";
+        else if (["reserved_0", "bus_compressor", "ara_editor_renderer"].includes(slot)) slotType = "none";
+        else throw fail(`unknown insert_type ${slot}`);
+      }
+      let channelFormat;
+      if (body.channel_uid !== void 0) {
+        const base = `/sessions/${body.session_uid ?? ""}`;
+        if (!body.session_uid || !this.has(base)) throw fail("unknown session", "error_code.session_missing");
+        const channel = [`${base}/tracks/${body.channel_uid}`, `${base}/buses/${body.channel_uid}`].find((p) => this.has(p));
+        if (!channel) throw fail("unknown channel");
+        channelFormat = String(this.value(channel, "stem_format") ?? "");
+      }
+      const search2 = (body.search ?? "").toLowerCase();
+      const rows = this.children("/plugins").map((id) => {
+        const path = `/plugins/${id}`;
+        const manifest = this.value(path, "manifest") ?? {};
+        return {
+          plugin_id: id,
+          name: String(this.value(path, "name") ?? ""),
+          manufacturer: manifest.manufacturer ?? "",
+          categories: manifest.categories ?? [],
+          favorite: this.value(path, "favorite") === true,
+          installed: this.value(path, "installed") !== false,
+          effectTypes: (manifest.effect_type || "effect").split(","),
+          formats: manifest.supported_stream_formats?.primary
+        };
+      }).filter((p) => p.installed && p.name !== "").filter((p) => !body.favorite || p.favorite).filter((p) => !search2 || p.name.toLowerCase().includes(search2) || p.manufacturer.toLowerCase().includes(search2)).filter((p) => !body.categories?.length || p.categories.some((c) => body.categories.includes(c))).filter((p) => {
+        if (slotType === "none") return false;
+        if (checksFormat && channelFormat && p.formats && !p.formats.some(([i, o]) => (i === channelFormat || i === "any") && (o === channelFormat || o === "any"))) return false;
+        return slotType ? p.effectTypes.includes(slotType) : p.effectTypes.some((t) => visible.includes(t));
+      }).sort((a, b) => a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0);
+      const limited = body.limit && body.limit > 0 ? rows.slice(0, body.limit) : rows;
+      return { plugins: limited.map(({ plugin_id, name, manufacturer, categories, favorite }) => ({ plugin_id, name, manufacturer, categories, favorite })) };
     }
     /**
      * Add a preset for a plugin to the library (fact 98), with any `tags` (fact 120). Returns
@@ -1274,8 +1422,9 @@ var Luna = (() => {
       this.ensurePresetPlugin(pluginId);
       const root = `/presets/plugins/${pluginId}/presets`;
       const uid = options.uid ?? `preset_${this.children(root).length + 1}_${pluginId}`;
+      const folder = this.value(`/presets/plugins/${pluginId}`, options.factory ? "factory_root" : "user_root");
       this.addNode(`${root}/${uid}`, {
-        properties: { uid, preset_name: name, version: options.version ?? 1, favorite: options.favorite ?? false, factory: options.factory ?? false, path: "" }
+        properties: { uid, preset_name: name, version: options.version ?? 1, favorite: options.favorite ?? false, factory: options.factory ?? false, path: folder }
       });
       this.addNode(`${root}/${uid}/tags`, { properties: { type: "tags" } });
       for (const tag of options.tags ?? []) {
@@ -1285,13 +1434,132 @@ var Luna = (() => {
       return uid;
     }
     /**
+     * `/presets/query` (facts 98, 120, 132). A plugin's presets, or a device type's; with
+     * `device_type_id: "track"` and `include_instrument_presets`, also every installed instrument
+     * plugin's presets, with `Instrument` dropped from the tags they must match and added to the
+     * tags they report, and an `is_instrument_preset` column.
+     */
+    queryPresets(data) {
+      const body = data ?? {};
+      if (!body.plugin_id && !body.device_type_id) throw new UAError("uasrv.invalid_type", "query: plugin_id or device_type_id required", { cmd: "post", path: "/presets/query" });
+      const wanted = (Array.isArray(body.tag) ? body.tag : body.tag !== void 0 ? [body.tag] : []).filter((t) => t !== "");
+      const any = Array.isArray(body.tag) && body.union === true;
+      const search2 = (body.search ?? "").toLowerCase();
+      const list = (root, tagsOf, tags) => this.children(root).map((uid) => ({
+        uid,
+        name: String(this.value(`${root}/${uid}`, "preset_name") ?? uid),
+        version: Number(this.value(`${root}/${uid}`, "version") ?? 1),
+        favorite: this.value(`${root}/${uid}`, "favorite") ? 1 : 0,
+        factory: this.value(`${root}/${uid}`, "factory") ? 1 : 0,
+        path: String(this.value(`${root}/${uid}`, "path") ?? ""),
+        tags: tagsOf(uid),
+        instrument: false
+      })).filter((r) => tags.length === 0 || (any ? tags.some((t) => r.tags.includes(t)) : tags.every((t) => r.tags.includes(t)))).filter((r) => !search2 || r.name.toLowerCase().includes(search2)).filter((r) => !body.favorite || r.favorite === 1);
+      const limit = (rows2) => body.limit !== void 0 && body.limit > 0 ? rows2.slice(0, body.limit) : rows2;
+      let rows = body.plugin_id ? limit(list(`/presets/plugins/${body.plugin_id}/presets`, (uid) => this.presetTags(body.plugin_id, uid), wanted)) : limit(list(`/presets/devices/${body.device_type_id}/presets`, (uid) => this.presetTagsAt(`/presets/devices/${body.device_type_id}/presets/${uid}/tags`), wanted));
+      const merge = !body.plugin_id && body.device_type_id === "track" && body.include_instrument_presets === true;
+      if (merge) {
+        const pluginTags = wanted.filter((t) => t !== "Instrument");
+        for (const pluginId of this.instrumentPluginIds()) {
+          const found = limit(list(`/presets/plugins/${pluginId}/presets`, (uid) => this.presetTags(pluginId, uid), pluginTags));
+          rows = rows.concat(found.map((r) => ({ ...r, instrument: true, tags: r.tags.includes("Instrument") ? r.tags : [...r.tags, "Instrument"] })));
+        }
+      }
+      const results = { num_rows: rows.length };
+      for (const k of ["uid", "name", "version", "favorite", "factory", "path"]) results[k] = rows.map((r) => r[k]);
+      if (body.tags) results["tags"] = rows.map((r) => r.tags);
+      if (merge) results["is_instrument_preset"] = rows.map((r) => r.instrument);
+      return { results, folders: [] };
+    }
+    /** @internal Installed plugins whose manifest makes them instruments. */
+    instrumentPluginIds() {
+      return this.children("/plugins").filter((id) => {
+        const manifest = this.value(`/plugins/${id}`, "manifest") ?? {};
+        return this.value(`/plugins/${id}`, "installed") !== false && (manifest.effect_type ?? "").split(",").includes("instrument");
+      });
+    }
+    /**
+     * Add a track preset to the library (fact 132). Like LUNA when it saves one, it is tagged
+     * with its category (`Audio`, `Instrument`, `Bus`, or `Multi-Track` for more than one
+     * track) besides any `tags`. `new_track` with it makes one track of `trackType` named after
+     * it, or, with `trackNames`, a track per name, named as the preset saved them. Returns its uid.
+     */
+    addTrackPreset(name, options = {}) {
+      const root = "/presets/devices/track/presets";
+      const uid = options.uid ?? `track_preset_${this.children(root).length + 1}`;
+      const trackType = options.trackType ?? "audio";
+      const count = options.trackNames?.length ?? 1;
+      this.addNode(`${root}/${uid}`, {
+        properties: { uid, preset_name: name, version: 1, favorite: options.favorite ?? false, factory: options.factory ?? false, path: "", track_type: trackType, track_names: options.trackNames ?? null }
+      });
+      this.addNode(`${root}/${uid}/tags`, { properties: { type: "tags" } });
+      const category = count > 1 ? "Multi-Track" : { audio: "Audio", instrument: "Instrument", bus: "Bus" }[trackType];
+      for (const tag of [category, ...options.tags ?? []]) {
+        const rowid = this.nextRow();
+        this.addNode(`${root}/${uid}/tags/${rowid}`, { properties: { type: "tag", rowid, tag } });
+      }
+      return uid;
+    }
+    /** Add a group of track preset tags, as {@link addPresetTagGroup} does for a plugin. */
+    addTrackPresetTagGroup(name, tags, options = {}) {
+      return this.addTagGroupAt("/presets/devices/track/categories", name, tags, options);
+    }
+    /** @internal The preset `uid` names: a track preset, or a plugin preset with its plugin. */
+    findPreset(uid) {
+      const track = `/presets/devices/track/presets/${uid}`;
+      if (this.has(track)) return { kind: "track", path: track };
+      for (const pluginId of this.children("/presets/plugins")) {
+        const path = `/presets/plugins/${pluginId}/presets/${uid}`;
+        if (this.has(path)) return { kind: "plugin", path, pluginId };
+      }
+      return void 0;
+    }
+    /** @internal Put a plugin on a track's instrument slot (or first effect slot), on a preset. */
+    putPluginPreset(track, pluginId, presetPath) {
+      const instrument = this.instrumentPluginIds().includes(pluginId);
+      const slot = `${track}/effects/${instrument ? "instrument" : "effect_0"}`;
+      if (!this.has(slot)) {
+        this.addNode(slot, { properties: { uid: `${track}_instrument`, insert_type: "instrument", plugin_id: null, plugin_name: null, external_sdk_instance_id: null, enabled: true, plugin_power: true, preset_name: null, preset_uid: null, preset_uid_dirty: false }, readOnly: ["uid", "insert_type", "plugin_id", "plugin_name"] });
+        this.addNode(`${slot}/controls`);
+      }
+      this.setValue(slot, "plugin_id", pluginId);
+      this.setValue(slot, "plugin_name", this.value(`/plugins/${pluginId}`, "name") ?? pluginId);
+      this.setValue(slot, "preset_uid", this.value(presetPath, "uid"));
+      this.setValue(slot, "preset_name", this.value(presetPath, "preset_name"));
+      this.setValue(slot, "preset_uid_dirty", false);
+    }
+    /**
+     * `post /presets/devices/track/load` (fact 132): a track preset or an instrument plugin's
+     * preset onto a track. The track records the preset and takes its name unless its
+     * `name_modified` is true; a name set through `set` does not make it so.
+     */
+    loadTrackPreset(data) {
+      const body = data ?? {};
+      const where = { cmd: "post", path: "/presets/devices/track/load" };
+      const track = `/sessions/${body.session_uid ?? ""}/tracks/${body.uid ?? ""}`;
+      if (!body.session_uid || !body.preset_uid) throw new UAError("uasrv.invalid_property", "load: session_uid and preset_uid required", where);
+      const preset = this.findPreset(body.preset_uid);
+      if (!preset || !this.has(track)) throw new UAError("device.database_error", "load: no such track or preset", where);
+      if (preset.kind === "plugin") {
+        if (this.instrumentPluginIds().includes(preset.pluginId) && this.value(track, "track_type") !== "instrument") throw new UAError("uasrv.invalid_value", "load: an instrument preset needs an instrument track", where);
+        this.putPluginPreset(track, preset.pluginId, preset.path);
+      }
+      const name = this.value(preset.path, "preset_name");
+      this.setValue(track, "preset_uid", body.preset_uid);
+      this.setValue(track, "preset_name", name);
+      if (this.value(track, "name_modified") !== true) this.setValue(track, "name", name);
+      return null;
+    }
+    /**
      * Add a group of preset tags for a plugin, as LUNA keeps them: a sub-category named `name`
      * under the category `category` (default `Default`) holding the tags (fact 120). Returns
      * the sub-category uid.
      */
     addPresetTagGroup(pluginId, name, tags, options = {}) {
       this.ensurePresetPlugin(pluginId);
-      const categories = `/presets/plugins/${pluginId}/categories`;
+      return this.addTagGroupAt(`/presets/plugins/${pluginId}/categories`, name, tags, options);
+    }
+    addTagGroupAt(categories, name, tags, options) {
       const categoryName = options.category ?? "Default";
       let categoryUid = this.children(categories).find((c) => this.value(`${categories}/${c}`, "name") === categoryName);
       if (!categoryUid) {
@@ -1322,7 +1590,10 @@ var Luna = (() => {
     }
     /** @internal */
     presetTags(pluginId, uid) {
-      const folder = `/presets/plugins/${pluginId}/presets/${uid}/tags`;
+      return this.presetTagsAt(`/presets/plugins/${pluginId}/presets/${uid}/tags`);
+    }
+    /** @internal */
+    presetTagsAt(folder) {
       return this.children(folder).map((t) => String(this.value(`${folder}/${t}`, "tag") ?? "")).filter((t) => t !== "");
     }
     /** @internal */
@@ -1346,7 +1617,7 @@ var Luna = (() => {
       const path = `/presets/plugins/${pluginId}`;
       if (this.has(path)) return;
       this.addNode(path, {
-        properties: { plugin_id: pluginId },
+        properties: { plugin_id: pluginId, factory_root: `/Mock/factory_presets/${pluginId}`, user_root: `/Mock/Presets/Plug-Ins/${pluginId}` },
         commands: {
           load: (data, engine) => {
             const body = data ?? {};
@@ -1982,6 +2253,7 @@ var Luna = (() => {
       const sessionCommands = {
         new_track: (data, engine) => {
           const body = data ?? {};
+          if (body.preset_uid !== void 0) return engine.newTrackFromPreset(uid, body.preset_uid, body.name, body.stem_format);
           if (body.track_type === "bus") {
             const id2 = `bus${engine.children(`${base}/buses`).length + 1}`;
             engine.addBus(uid, id2, { name: body.name ?? "Bus", busType: "aux", stemFormat: body.stem_format ?? "stereo" });
@@ -2508,7 +2780,7 @@ var Luna = (() => {
       this.addNode(`${base}/key_signatures`);
       this.addNode(`${base}/markers`);
       this.addNode(`${base}/chords`);
-      this.addNode(`${base}/preferences`, { commands: preferenceCommands(`${base}/preferences`) });
+      this.addNode(`${base}/storage`, { commands: storageCommands(`${base}/storage`) });
       this.addPackage(pkg, { name: options.name ?? uid, lastOpened: Date.now() });
       for (let i = 0; i < 4; i++) this.addBus(uid, `cue${i + 1}_${uid}`, { name: `CUE ${i + 1}`, busType: `cue_${i}`, stemFormat: "stereo" });
       this.addBus(uid, `master_${uid}`, { name: "Main Output", busType: "master", stemFormat: "stereo", color: 4294948970 });
@@ -2517,6 +2789,33 @@ var Luna = (() => {
       if (options.focused ?? true) this.setValue("/sessions", "focused_session", uid);
     }
     /** Add a track with the standard control layout and one playlist. */
+    /** @internal `new_track` with `preset_uid` (fact 132). */
+    newTrackFromPreset(sessionUid, presetUid, name, stemFormat) {
+      const base = `/sessions/${sessionUid}`;
+      const preset = this.findPreset(presetUid);
+      if (!preset) throw new UAError("device.database_error", "new_track: no such preset", { cmd: "post", path: `${base}/new_track` });
+      const presetName = String(this.value(preset.path, "preset_name") ?? "");
+      const made = [];
+      const make = (trackName, trackType, format) => {
+        const id = `t${this.children(`${base}/tracks`).length + 1}`;
+        this.addTrack(sessionUid, id, { name: trackName, trackType, stemFormat: format });
+        this.setValue(`${base}/tracks/${id}`, "preset_uid", presetUid);
+        this.setValue(`${base}/tracks/${id}`, "preset_name", presetName);
+        made.push(id);
+        return `${base}/tracks/${id}`;
+      };
+      if (preset.kind === "plugin") {
+        const instrument = this.instrumentPluginIds().includes(preset.pluginId);
+        const track = make(name ?? presetName, instrument ? "instrument" : "audio", instrument ? "stereo" : stemFormat ?? "mono");
+        this.putPluginPreset(track, preset.pluginId, preset.path);
+      } else {
+        const saved = this.value(preset.path, "track_names") ?? [];
+        const trackType = String(this.value(preset.path, "track_type") ?? "audio");
+        const names = saved.length > 1 ? saved : [name ?? presetName];
+        for (const trackName of names) make(trackName, trackType, trackType === "instrument" ? "stereo" : "mono");
+      }
+      return made.length === 1 ? { uid: made[0] } : made.map((uid) => ({ uid }));
+    }
     addTrack(sessionUid, id, options = {}) {
       const base = `/sessions/${sessionUid}`;
       const order = this.children(`${base}/tracks`).length;
@@ -2544,7 +2843,9 @@ var Luna = (() => {
           input_node_uid: null,
           playlist_uid: playlist,
           has_preamp: false,
-          record_mute: false
+          record_mute: false,
+          preset_uid: null,
+          preset_name: null
         },
         options.stemFormat === "stereo"
       );
@@ -3224,6 +3525,62 @@ var Luna = (() => {
       for (const listener of this.statusListeners) listener(status);
     }
   };
+  function githubRepoUrl(input) {
+    const url = input.trim().replace(/^https?:\/\//i, "").replace(/^www\./i, "");
+    if (!/^github\.com\//i.test(url)) return void 0;
+    const [owner = "", rawName = ""] = (url.slice(11).split(/[?#]/)[0] ?? "").split("/");
+    const name = rawName.replace(/\.git$/i, "");
+    const ok = (part) => /^[A-Za-z0-9._-]+$/.test(part) && !/^\.+$/.test(part);
+    return ok(owner) && ok(name) ? `https://github.com/${owner}/${name}` : void 0;
+  }
+  function driveDownloadUrl(input) {
+    const url = input.trim().replace(/^https?:\/\//i, "");
+    const slash = url.indexOf("/");
+    if (slash < 0) return void 0;
+    const host = url.slice(0, slash).toLowerCase();
+    if (!["drive.google.com", "docs.google.com", "drive.usercontent.google.com"].includes(host)) return void 0;
+    const rest = url.slice(slash + 1).split("#")[0] ?? "";
+    const [path = "", query = ""] = rest.split("?");
+    const param = (name) => {
+      const hit = query.split("&").find((p) => p.split("=")[0] === name);
+      return hit === void 0 ? "" : decodeURIComponent(hit.slice(name.length + 1));
+    };
+    const file = /^(?:u\/[^/]+\/)?file\/d\/([^/]*)/.exec(path);
+    const id = file ? file[1] ?? "" : ["open", "uc", "download"].includes(path) ? param("id") : "";
+    const key = param("resourcekey");
+    const ok = (part) => /^[A-Za-z0-9_-]*$/.test(part);
+    if (!id || !ok(id) || !ok(key)) return void 0;
+    return `https://drive.usercontent.google.com/download?id=${id}&export=download&confirm=t${key ? `&resourcekey=${key}` : ""}`;
+  }
+  function iCloudShareUrl(input) {
+    const url = input.trim().replace(/^https?:\/\//i, "").replace(/^www\./i, "");
+    if (!/^icloud\.com\/iclouddrive\//i.test(url)) return void 0;
+    const guid = url.slice(23).split(/[#?/]/)[0] ?? "";
+    return /^[A-Za-z0-9_-]+$/.test(guid) ? `https://www.icloud.com/iclouddrive/${guid}` : void 0;
+  }
+  function dropboxDownloadUrl(input) {
+    const url = input.trim().replace(/^https?:\/\//i, "").replace(/^www\./i, "");
+    if (!/^dropbox\.com\//i.test(url)) return void 0;
+    const rest = url.slice(12).split("#")[0] ?? "";
+    const [path = "", query = ""] = rest.split("?");
+    const parts = path.split("/").filter(Boolean);
+    const current = parts.length === 4 && parts[0] === "scl" && parts[1] === "fi";
+    const older = parts.length === 3 && parts[0] === "s";
+    if (!current && !older) return void 0;
+    const id = parts[parts.length - 2] ?? "";
+    const name = parts[parts.length - 1] ?? "";
+    const hit = query.split("&").find((p) => p.split("=")[0] === "rlkey");
+    const key = hit === void 0 ? "" : decodeURIComponent(hit.slice(6));
+    const idOk = (part) => /^[A-Za-z0-9_-]*$/.test(part);
+    let decoded;
+    try {
+      decoded = decodeURIComponent(name);
+    } catch {
+      return void 0;
+    }
+    if (!id || !idOk(id) || !/^[A-Za-z0-9._%~+()!-]+$/.test(name) || /[/\\]/.test(decoded) || !idOk(key) || current && !key) return void 0;
+    return `https://www.dropbox.com/${parts.join("/")}?${key ? `rlkey=${key}&` : ""}dl=1`;
+  }
   function localContentHost(id) {
     let host = "";
     for (const byte of new TextEncoder().encode(id)) {
@@ -3313,59 +3670,63 @@ var Luna = (() => {
       }
     }
   }
-  function preferenceCommands(root) {
+  function storageCommands(root) {
     const validName = (v) => typeof v === "string" && v !== "" && !v.includes("/");
+    const asJson = (v) => v === void 0 ? null : JSON.parse(JSON.stringify(v));
     const target = (body, verb) => {
-      if (body.context === void 0 || body.preference === void 0 || body.property === void 0) {
+      if (body.context === void 0 || body.record === void 0 || body.field === void 0) {
         throw new UAError("uasrv.missing_field", `${verb}: uasrv.missing_field`, { cmd: "post", path: `${root}/${verb}` });
       }
-      if (!validName(body.context) || !validName(body.preference) || !validName(body.property)) {
+      if (!validName(body.context) || !validName(body.record) || !validName(body.field)) {
         throw new UAError("uasrv.invalid_value", `${verb}: uasrv.invalid_value`, { cmd: "post", path: `${root}/${verb}` });
       }
-      return { node: `${root}/${body.context}/${body.preference}`, property: body.property };
+      return { node: `${root}/${body.context}/${body.record}`, field: body.field };
     };
     const prune = (engine, context) => {
-      for (const pref of engine.children(`${root}/${context}`)) {
-        const path = `${root}/${context}/${pref}`;
+      for (const record of engine.children(`${root}/${context}`)) {
+        const path = `${root}/${context}/${record}`;
         if (engine.propertyNames(path).length === 0) engine.removeNode(path);
       }
       if (engine.children(`${root}/${context}`).length === 0) engine.removeNode(`${root}/${context}`);
     };
     return {
-      add_preference: (data, engine) => {
+      add_field: (data, engine) => {
         const body = data ?? {};
-        const { node, property } = target(body, "add_preference");
-        if (engine.has(node) && engine.propertyNames(node).includes(property)) return null;
-        if (!engine.has(node)) engine.addNode(node, { properties: { [property]: body.value ?? null } });
-        else engine.setValue(node, property, body.value ?? null);
+        const { node, field } = target(body, "add_field");
+        if (engine.has(node) && engine.propertyNames(node).includes(field)) return null;
+        if (!engine.has(node)) engine.addNode(node, { properties: { [field]: asJson(body.value) } });
+        else engine.setValue(node, field, asJson(body.value));
         return null;
       },
-      set_preference: (data, engine) => {
+      set_field: (data, engine) => {
         const body = data ?? {};
-        if (body.value === void 0) throw new UAError("uasrv.missing_field", "set_preference: uasrv.missing_field", { cmd: "post", path: `${root}/set_preference` });
-        const { node, property } = target(body, "set_preference");
-        if (!engine.has(node) || !engine.propertyNames(node).includes(property)) {
-          throw new UAError("uasrv.invalid_property", "set_preference: uasrv.invalid_property", { cmd: "post", path: `${root}/set_preference` });
+        if (body.value === void 0) throw new UAError("uasrv.missing_field", "set_field: uasrv.missing_field", { cmd: "post", path: `${root}/set_field` });
+        const { node, field } = target(body, "set_field");
+        if (!engine.has(node) || !engine.propertyNames(node).includes(field)) {
+          throw new UAError("uasrv.invalid_property", "set_field: uasrv.invalid_property", { cmd: "post", path: `${root}/set_field` });
         }
-        engine.setValue(node, property, body.value);
+        engine.setValue(node, field, asJson(body.value));
         return null;
       },
-      remove_preference: (data, engine) => {
+      remove_field: (data, engine) => {
         const body = data ?? {};
-        const path = `${root}/remove_preference`;
-        if (body.context === void 0) throw new UAError("uasrv.missing_field", "remove_preference: uasrv.missing_field", { cmd: "post", path });
-        const pref = body.preference ?? "";
-        const prop = body.property ?? "";
-        if (!validName(body.context) || pref === "" && prop !== "") throw new UAError("uasrv.invalid_value", "remove_preference: uasrv.invalid_value", { cmd: "post", path });
+        const path = `${root}/remove_field`;
+        if (body.context === void 0) throw new UAError("uasrv.missing_field", "remove_field: uasrv.missing_field", { cmd: "post", path });
+        const record = body.record ?? "";
+        const field = body.field ?? "";
+        if (!validName(body.context) || record === "" && field !== "") throw new UAError("uasrv.invalid_value", "remove_field: uasrv.invalid_value", { cmd: "post", path });
         const contextPath = `${root}/${body.context}`;
         if (!engine.has(contextPath)) return null;
-        if (pref === "") engine.removeNode(contextPath);
-        else if (prop === "") engine.removeNode(`${contextPath}/${String(pref)}`);
-        else engine.deleteValue(`${contextPath}/${String(pref)}`, String(prop));
+        if (record === "") engine.removeNode(contextPath);
+        else if (field === "") engine.removeNode(`${contextPath}/${String(record)}`);
+        else engine.deleteValue(`${contextPath}/${String(record)}`, String(field));
         prune(engine, body.context);
         return null;
       }
     };
+  }
+  function sameWindow(a, b) {
+    return a.session_uid === b.session_uid && a.channel_uid === b.channel_uid && a.insert_type === b.insert_type;
   }
 
   // src/wire/wasm-port.ts
@@ -5750,6 +6111,7 @@ var Luna = (() => {
       this.controls = new Controls(client, `${path}/controls`);
       this.instanceId = this.prop("external_sdk_instance_id");
       this.loaded = derived([this.pluginId, this.instanceId, this.pluginError], () => !this.isEmpty && this.instanceId.value !== null && this.instanceId.value !== void 0 && !this.pluginError.value);
+      this.editorOpen = derived([client.gui.pluginWindows], () => client.gui.isPluginOpen(this.channelUid, this.id, this.sessionUid));
       const bypassValue = derived([this.bypassControl], () => {
         const name = this.bypassControl.value;
         return name ? this.controls.get(name).value.value : void 0;
@@ -5793,6 +6155,12 @@ var Luna = (() => {
     instanceId;
     /** True once a plugin is loaded in this slot without an error. */
     loaded;
+    /**
+     * True while LUNA has this plugin's editor window open, whoever opened it (fact 126).
+     * `undefined` until known and on a LUNA that does not report editor windows. Follows LUNA
+     * after `session.ready()`.
+     */
+    editorOpen;
     /**
      * Every child of the slot's `controls` folder, including parameters a cleared plugin left
      * behind (fact 86). Prefer {@link params}.
@@ -5852,6 +6220,20 @@ var Luna = (() => {
       if (error) throw new UAError(error, `${pluginId} did not load into ${this.id}: ${error}`, { path: this.path });
       return reply;
     }
+    /**
+     * The installed plugins LUNA would put in this slot, sorted by name: what LUNA's plugins
+     * browser offers here (fact 127). An instrument slot lists instruments, an effect slot
+     * effects that run in this channel's format. Narrow with search text, categories and
+     * favorites. A LUNA without the query rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * const choices = await slot.validPlugins({ search: 'comp', categories: ['Compressors & Limiters'] });
+     * await slot.setPlugin(choices[0].pluginId);
+     */
+    validPlugins(options = {}) {
+      this.assertLive();
+      return this.client.plugins.query({ ...options, insertType: this.id, sessionUid: this.sessionUid, channelUid: this.channelUid });
+    }
     /** Remove the plugin from this slot. */
     clear() {
       return this.wire.post(`/sessions/${this.sessionUid}/set_inserts`, { session_uid: this.sessionUid, channel_uid: this.channelUid, inserts: [{ insert_type: this.id, plugin_id: "" }] });
@@ -5895,6 +6277,44 @@ var Luna = (() => {
         channel_uid: this.channelUid,
         inserts: [this.id],
         value: on
+      });
+    }
+    /**
+     * Open this plugin's editor window in LUNA, as clicking it in LUNA's mixer does, or bring
+     * it to the front. Resolves once {@link editorOpen} shows it; LUNA's reply alone proves
+     * nothing, as an empty slot or a plugin LUNA will not show opens nothing (fact 126). That
+     * rejects with code `no_effect`; an empty slot rejects at once with `empty_slot`. Pass
+     * `wait: false` to resolve on the reply alone. Needs `/gui`: a headless engine or an older
+     * LUNA rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * nameLabel.onclick = () => slot.openEditor();
+     * slot.editorOpen.onChange(() => nameLabel.classList.toggle('open', slot.editorOpen.value === true));
+     */
+    async openEditor(options = {}) {
+      if (this.isEmpty) throw new UAError("empty_slot", `openEditor: ${this.id} has no plugin`, { path: this.path });
+      await this.client.gui.showPlugin(this.channelUid, this.id, { sessionUid: this.sessionUid });
+      if (options.wait !== false) await this.settleEditor(true, "openEditor", options.timeoutMs);
+    }
+    /**
+     * Close this plugin's editor window in LUNA, if it is open. Resolves once
+     * {@link editorOpen} is false; see {@link openEditor}.
+     *
+     * @example
+     * if (slot.editorOpen.value) await slot.closeEditor();
+     */
+    async closeEditor(options = {}) {
+      await this.client.gui.hidePlugin(this.channelUid, this.id, { sessionUid: this.sessionUid });
+      if (options.wait !== false) await this.settleEditor(false, "closeEditor", options.timeoutMs);
+    }
+    async settleEditor(open, what, timeoutMs) {
+      await this.client.gui.watchPluginWindows();
+      if (this.editorOpen.value === void 0) return;
+      await settle(() => this.editorOpen.value === open, what, {
+        path: this.path,
+        ...timeoutMs !== void 0 ? { timeoutMs } : {},
+        disposed: () => this.disposed,
+        refresh: () => this.client.store.load("/gui/plugin_windows")
       });
     }
     /**
@@ -6043,6 +6463,13 @@ var Luna = (() => {
     playlistUid;
     hasPreamp;
     recordMute;
+    /**
+     * The uid of the track preset (or instrument plugin preset) the track was made from or last
+     * had applied, or null (fact 132).
+     */
+    presetUid;
+    /** That preset's name, or null. */
+    presetName;
     /** @internal */
     constructor(client, path, sessionUid) {
       super(client, path, sessionUid);
@@ -6056,6 +6483,8 @@ var Luna = (() => {
       this.playlistUid = this.prop("playlist_uid");
       this.hasPreamp = this.prop("has_preamp");
       this.recordMute = this.prop("record_mute");
+      this.presetUid = this.prop("preset_uid");
+      this.presetName = this.prop("preset_name");
     }
     /** Track solo (a track-level control, unlike mute which is on the main output). */
     get solo() {
@@ -6064,6 +6493,21 @@ var Luna = (() => {
     /** Set the automation mode (`off | read | write | touch | latch`). */
     setAutomationMode(mode) {
       return this.wire.post(`/sessions/${this.sessionUid}/set_automode_on_tracks`, { uid: this.sessionUid, tracks: [this.id], automation_mode: automationModeOrdinal(mode) });
+    }
+    /**
+     * Apply a preset to this track in one undo step, as LUNA's track header PRESETS > Assign
+     * does (fact 132). A track preset replaces the track's plugins, sends and mixer settings; an
+     * instrument plugin's preset replaces the instrument only, and needs an instrument track. The
+     * track takes the preset's name unless it was renamed in LUNA; a name set with `name.set`
+     * does not count, and is replaced. `presetUid` follows.
+     *
+     * @example
+     * await track.loadPreset(sel.presets.items[0]);
+     * track.presetName.value; // that preset's name
+     */
+    async loadPreset(preset) {
+      const uid = typeof preset === "string" ? preset : preset.uid;
+      await this.wire.post("/presets/devices/track/load", { session_uid: this.sessionUid, uid: this.id, preset_uid: uid });
     }
     /** Delete this track. */
     async delete() {
@@ -8292,7 +8736,7 @@ var Luna = (() => {
     }
   };
 
-  // src/model/preferences.ts
+  // src/model/storage.ts
   function sameJson(a, b) {
     if (a === b) return true;
     if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
@@ -8305,173 +8749,185 @@ var Luna = (() => {
     const kb = Object.keys(b);
     return ka.length === kb.length && ka.every((k) => Object.hasOwn(b, k) && sameJson(a[k], b[k]));
   }
+  function asStored(value) {
+    return value === void 0 ? null : JSON.parse(JSON.stringify(value));
+  }
   function requireName(value, what) {
     if (typeof value !== "string" || value === "" || value.includes("/")) {
       throw new UAError("invalid_value", `${what} must be a non-empty string without '/'`);
     }
     return value;
   }
-  var PreferenceContext = class extends Node {
+  var StorageContext = class extends Node {
     /** @internal */
     constructor(client, path, owner) {
       super(client, path);
       this.owner = owner;
-      this.preferences = this.childNames();
+      this.records = this.childNames();
     }
     owner;
-    /** Names of this context's preferences. */
-    preferences;
+    /** Names of this context's records. */
+    records;
     /** The context's reverse-DNS name. */
     get name() {
       return this.id;
     }
     /**
-     * Fetch this context's preferences and their values. Call once before reading
+     * Fetch this context's records and their values. Call once before reading
      * {@link value}; pushes keep them current while the session is watched.
      *
-     * @example await prefs.load();
+     * @example await store.load();
      */
     load() {
       return super.load({ levels: 2, commands: false, flatvalue: true });
     }
     /**
-     * The value of one property as a live prop, `undefined` while it does not exist.
-     * `set` on it is a non-undoable write of an existing property.
+     * The value of one field as a live prop, `undefined` while it does not exist.
+     * `set` on it is a non-undoable write of an existing field.
      *
      * @example
-     * const timeline = prefs.value<{ height: number }>('layout', 'timeline');
+     * const timeline = store.value<{ height: number }>('layout', 'timeline');
      * timeline.onChange(() => console.log(timeline.value?.height));
      * await timeline.set({ height: 240 });
      */
-    value(preference, property) {
-      const path = `${this.path}/${requireName(preference, "preference")}`;
-      const cell = this.client.store.cell(path, requireName(property, "property"));
+    value(record, field) {
+      const path = `${this.path}/${requireName(record, "record")}`;
+      const cell = this.client.store.cell(path, requireName(field, "field"));
       return {
         get value() {
           return cell.value;
         },
         onChange: (listener) => cell.onChange(listener),
-        set: (value) => this.set(preference, property, value)
+        set: (value) => this.set(record, field, value)
       };
     }
     /**
-     * Add a property with an initial value (default `null`) and resolve once it is visible.
-     * A property that already exists keeps its value.
+     * Add a field with an initial value (default `null`) and resolve once it is visible.
+     * A field that already exists keeps its value.
      *
-     * @example await prefs.add('layout', 'timeline', { height: 200 });
+     * @example await store.add('layout', 'timeline', { height: 200 });
      */
-    add(preference, property, value = null, options = {}) {
-      return this.owner.add(this.name, preference, property, value, options);
+    add(record, field, value = null, options = {}) {
+      return this.owner.add(this.name, record, field, value, options);
     }
     /**
-     * Set an existing property and resolve once the new value is visible. Rejects with
-     * `uasrv.invalid_property` if the property was never added.
+     * Set an existing field and resolve once the new value is visible. Rejects with
+     * `uasrv.invalid_property` if the field was never added.
      *
-     * @example await prefs.set('layout', 'timeline', { height: 320 }, { undoable: true });
+     * @example await store.set('layout', 'timeline', { height: 320 }, { undoable: true });
      */
-    set(preference, property, value, options = {}) {
-      return this.owner.set(this.name, preference, property, value, options);
+    set(record, field, value, options = {}) {
+      return this.owner.set(this.name, record, field, value, options);
     }
     /**
-     * Remove one property, or a whole preference when `property` is left out.
+     * Remove one field, or a whole record when `field` is left out.
      *
      * @example
-     * await prefs.remove('layout', 'timeline');
-     * await prefs.remove('layout');
+     * await store.remove('layout', 'timeline');
+     * await store.remove('layout');
      */
-    remove(preference, property, options = {}) {
-      return this.owner.remove(this.name, preference, property, options);
+    remove(record, field, options = {}) {
+      return this.owner.remove(this.name, record, field, options);
     }
     /**
-     * Remove every preference in this context.
+     * Remove every record in this context.
      *
-     * @example await prefs.clear();
+     * @example await store.clear();
      */
     clear(options = {}) {
       return this.owner.remove(this.name, void 0, void 0, options);
     }
   };
-  var SessionPreferences = class extends Node {
-    /** Names of the contexts that hold at least one property. */
+  var SessionStorage = class extends Node {
+    /** Names of the contexts that hold at least one field. */
     contexts;
     byName = /* @__PURE__ */ new Map();
     /** @internal */
     constructor(client, sessionPath) {
-      super(client, `${sessionPath}/preferences`);
+      super(client, `${sessionPath}/storage`);
       this.contexts = this.childNames();
     }
     /**
      * Fetch the context names.
      *
-     * @example await session.preferences.load();
+     * @example await session.storage.load();
      */
     load() {
       return super.load({ levels: 1, commands: false, flatvalue: true });
     }
     /**
-     * One context's preferences. It need not exist yet: the first {@link PreferenceContext.add}
+     * One context's records. It need not exist yet: the first {@link StorageContext.add}
      * creates it.
      *
-     * @example const prefs = session.preferences.context('com.example.my-add-on');
+     * `name` is any non-empty name without `/`, not only your Add On's id. Give each kind of data
+     * its own context, your id plus a suffix, then use a record per item and a field per part,
+     * rather than one record in one value: each `set` replaces a value whole, and only whole
+     * values can be undoable or not.
+     *
+     * @example
+     * const store = session.storage.context('com.example.my-add-on');
+     * const tracks = session.storage.context('com.example.my-add-on.tracks');
+     * await tracks.add(track.id, 'channel', 0);
      */
     context(name) {
       requireName(name, "context");
       let ctx = this.byName.get(name);
       if (!ctx) {
-        ctx = new PreferenceContext(this.client, `${this.path}/${name}`, this);
+        ctx = new StorageContext(this.client, `${this.path}/${name}`, this);
         this.byName.set(name, ctx);
       }
       return ctx;
     }
     /** @internal */
-    async add(context, preference, property, value, options) {
-      const body = this.body(context, preference, property, options);
-      await this.post("add_preference", { ...body, value });
-      await this.settleOn(context, preference, () => this.client.store.cell(`${this.path}/${context}/${preference}`, property).value !== void 0, "add preference");
+    async add(context, record, field, value, options) {
+      const body = this.body(context, record, field, options);
+      await this.post("add_field", { ...body, value });
+      await this.settleOn(context, record, () => this.client.store.cell(`${this.path}/${context}/${record}`, field).value !== void 0, "add field");
     }
     /** @internal */
-    async set(context, preference, property, value, options) {
-      const body = this.body(context, preference, property, options);
-      await this.post("set_preference", { ...body, value });
-      await this.settleOn(context, preference, () => sameJson(this.client.store.cell(`${this.path}/${context}/${preference}`, property).value, value), "set preference");
+    async set(context, record, field, value, options) {
+      const body = this.body(context, record, field, options);
+      await this.post("set_field", { ...body, value });
+      const stored = asStored(value);
+      await this.settleOn(context, record, () => sameJson(this.client.store.cell(`${this.path}/${context}/${record}`, field).value, stored), "set field");
     }
     /** @internal */
-    async remove(context, preference, property, options) {
+    async remove(context, record, field, options) {
       requireName(context, "context");
-      if (preference !== void 0) requireName(preference, "preference");
-      if (property !== void 0) {
-        if (preference === void 0) throw new UAError("invalid_value", "remove: a property needs its preference");
-        requireName(property, "property");
+      if (record !== void 0) requireName(record, "record");
+      if (field !== void 0) {
+        if (record === void 0) throw new UAError("invalid_value", "remove: a field needs its record");
+        requireName(field, "field");
       }
-      await this.post("remove_preference", {
+      await this.post("remove_field", {
         context,
-        ...preference !== void 0 ? { preference } : {},
-        ...property !== void 0 ? { property } : {},
+        ...record !== void 0 ? { record } : {},
+        ...field !== void 0 ? { field } : {},
         undoable: options.undoable === true
       });
       const store = this.client.store;
       const contextPath = `${this.path}/${context}`;
-      if (preference !== void 0 && property !== void 0) {
-        store.cell(`${contextPath}/${preference}`, property).update(void 0);
+      if (record !== void 0 && field !== void 0) {
+        store.cell(`${contextPath}/${record}`, field).update(void 0);
         return;
       }
-      const gone = preference === void 0 ? () => !(store.children(this.path).value ?? []).includes(context) : () => !(store.children(contextPath).value ?? []).includes(preference);
-      await this.settleOn(context, preference, gone, "remove preference");
+      const gone = record === void 0 ? () => !(store.children(this.path).value ?? []).includes(context) : () => !(store.children(contextPath).value ?? []).includes(record);
+      await this.settleOn(context, record, gone, "remove field");
     }
-    body(context, preference, property, options) {
+    body(context, record, field, options) {
       return {
         context: requireName(context, "context"),
-        preference: requireName(preference, "preference"),
-        property: requireName(property, "property"),
+        record: requireName(record, "record"),
+        field: requireName(field, "field"),
         undoable: options.undoable === true
       };
     }
     /** Wait for the edit to show, re-reading the context while it has not. */
-    settleOn(context, preference, done, what) {
+    settleOn(context, record, done, what) {
       const store = this.client.store;
       const contextPath = `${this.path}/${context}`;
       return settle(done, what, {
-        path: preference !== void 0 ? `${contextPath}/${preference}` : contextPath,
+        path: record !== void 0 ? `${contextPath}/${record}` : contextPath,
         refresh: async () => {
           await store.load(this.path, { levels: 1, commands: false, flatvalue: true });
           if (store.knowsNode(contextPath)) await store.load(contextPath, { levels: 2, commands: false, flatvalue: true });
@@ -8602,6 +9058,19 @@ var Luna = (() => {
     manufacturer;
     /** The manifest's `description`, an array of strings already concatenated, or `''` when it has none. */
     description;
+    /** The manifest's `version`, or `''` when it has none. Follows a replace (fact 131). */
+    version;
+    /**
+     * Where it is installed (fact 131): `'folder'`, a folder in LUNA's Add Ons folder (from a
+     * `.lunaaddon`, the marketplace, or copied there); `'link'`, a symlink there, as
+     * `ua-builder install` makes on macOS; `'built_in'`, bundled with LUNA. {@link Gui.uninstallAddOn}
+     * removes `'folder'` and `'link'` ones (a link loses only the link) and refuses `'built_in'`.
+     * `undefined` on a LUNA older than the property.
+     *
+     * @example
+     * const removable = addOn.installedFrom.value === 'folder' || addOn.installedFrom.value === 'link';
+     */
+    installedFrom;
     /** @internal */
     constructor(client, path) {
       super(client, path);
@@ -8613,6 +9082,8 @@ var Luna = (() => {
       this.showWithSession = this.prop("show_with_session");
       this.manufacturer = this.prop("manufacturer");
       this.description = this.prop("description");
+      this.version = this.prop("version");
+      this.installedFrom = this.prop("installed_from");
     }
     /** Show it in LUNA by target: navigate to an `'app'`, open a `'window'` (toggling it like its
      *  menu item), show a `'browser'` in the secondary browser, or an `'editor'` in the Timeline's
@@ -8638,7 +9109,15 @@ var Luna = (() => {
     /** Record-arm mode of LUNA's transport bar. */
     armMode;
     priorLaunchCount;
+    /**
+     * The plugin editor windows open in LUNA, opened from the page or by the user (fact 126).
+     * `undefined` until known, and on a LUNA that does not publish them. Follows LUNA once
+     * {@link watchPluginWindows} has run, which `session.ready()` does. Read one slot's state
+     * from `effect.editorOpen`.
+     */
+    pluginWindows;
     presence;
+    pluginWindowsWatch;
     /** @internal */
     constructor(client) {
       super(client, "/gui");
@@ -8653,6 +9132,32 @@ var Luna = (() => {
         set: (v) => client.store.set("/gui/transport", "arm_mode", v)
       };
       this.priorLaunchCount = this.prop("prior_launch_count");
+      const open = client.store.cell("/gui/plugin_windows", "open");
+      this.pluginWindows = derived([open], () => {
+        const list = open.value;
+        if (!Array.isArray(list)) return void 0;
+        return list.map((w) => ({ sessionUid: w.session_uid ?? "", channelUid: w.channel_uid ?? "", slot: w.insert_type ?? "" }));
+      });
+    }
+    /**
+     * Follow {@link pluginWindows} for the life of the connection. Idempotent; resolves once
+     * the first list is in, or at once on an engine without `/gui`. `session.ready()` calls it.
+     *
+     * @example
+     * await luna.gui.watchPluginWindows();
+     * luna.gui.pluginWindows.value; // [{ sessionUid, channelUid, slot: 'effect_0' }]
+     */
+    watchPluginWindows() {
+      this.pluginWindowsWatch ??= this.available().then((has) => has ? this.client.store.watch("/gui/plugin_windows").ready : void 0).catch(() => {
+        this.pluginWindowsWatch = void 0;
+      });
+      return this.pluginWindowsWatch;
+    }
+    /** True when LUNA has the editor of `slot` on `channelUid` open; `undefined` until known. */
+    isPluginOpen(channelUid, slot, sessionUid) {
+      const list = this.pluginWindows.value;
+      if (list === void 0) return void 0;
+      return list.some((w) => w.slot === slot && sameUid(w.channelUid, channelUid) && (sessionUid === void 0 || sameUid(w.sessionUid, sessionUid)));
     }
     /**
      * True when the engine has LUNA's `/gui` (fact 103). Read once per connection: the
@@ -8702,6 +9207,98 @@ var Luna = (() => {
     }
     showAddOn(id) {
       return this.post("show_add_on", { id });
+    }
+    /**
+     * Install Add Ons into LUNA, as Settings > Add Ons > MARKETPLACE does (fact 128). Give
+     * `{ id }`, a marketplace package id or the id of an Add On in one (its whole package
+     * installs), or `{ url }`: a public GitHub repo (`https://github.com/<owner>/<repo>`; the
+     * scheme, `www.`, `.git` and a path inside the repo are tolerated), whose latest release
+     * LUNA lists in the marketplace and installs every `.lunaaddon` of; or a Google Drive share
+     * link to a `.lunaaddon` (`https://drive.google.com/file/d/<id>/view?usp=sharing`), an
+     * iCloud Drive one (`https://www.icloud.com/iclouddrive/<id>#<name>`) or a Dropbox one
+     * (`https://www.dropbox.com/scl/fi/<id>/<name>?rlkey=<key>&dl=0`), which LUNA downloads
+     * and installs. The file has to be shared with anyone who has the link: LUNA does not
+     * sign in to Google, iCloud or Dropbox. Either way LUNA asks the user to add the Add Ons, or
+     * replace what is installed, so the user always confirms. A url that installs and is not
+     * one of the marketplace's own repos is saved, and LUNA lists it in its marketplace from
+     * then on, to install again; {@link removeImportedAddOn} forgets it.
+     *
+     * Resolves as LUNA starts, not once installed: watch {@link addOns} for the result. A
+     * repo whose latest release has nothing LUNA can install, or a shared file that is not
+     * shared with anyone, a folder, or not an Add On, is only found out after this resolves, and LUNA tells the user. Rejects with a `Luna.Error` whose `code` is
+     * `uasrv.invalid_value` for an id no marketplace package has, a url that is not a GitHub
+     * repo or a Drive, iCloud Drive or Dropbox file link, or both given; `uasrv.missing_field` for neither; `uasrv.too_many_requests` while
+     * that package is already installing. A LUNA without the command (an older one, or one
+     * without its Add On marketplace) rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * await luna.gui.installAddOn({ url: 'https://github.com/uaudio-labs/video-window' });
+     * await luna.gui.installAddOn({ url: 'https://drive.google.com/file/d/<id>/view?usp=sharing' });
+     * await luna.gui.installAddOn({ url: 'https://www.icloud.com/iclouddrive/<id>#my-add-on' });
+     * await luna.gui.installAddOn({ url: 'https://www.dropbox.com/scl/fi/<id>/my-add-on.lunaaddon?rlkey=<key>&dl=0' });
+     * await luna.gui.installAddOn({ id: 'uaudio-labs.midi-notation' });
+     */
+    async installAddOn(from) {
+      await this.post("install_add_on", from).catch(olderLuna("installAddOn", "install_add_on"));
+    }
+    /**
+     * Forget a link {@link installAddOn} (or LUNA's IMPORT URL) saved, as Remove from
+     * Marketplace in LUNA's Settings does (fact 128). `id` is the package's id under
+     * `/gui/marketplace/packages`, or the id of an Add On in it. Its listing leaves LUNA's
+     * marketplace now and at the next launch; the installed Add On is not touched. Rejects with
+     * a `Luna.Error` whose `code` is `uasrv.invalid_value` for an id no marketplace package
+     * has, `uasrv.not_permitted` for a package of the marketplace's own repos, and
+     * `uasrv.missing_field` with no id. A LUNA without the command rejects with
+     * `Luna.Unsupported`.
+     *
+     * @example
+     * await luna.gui.removeImportedAddOn('com.uaudio.qwerty_midi');
+     */
+    async removeImportedAddOn(id) {
+      await this.post("remove_imported_add_on", { id }).catch(olderLuna("removeImportedAddOn", "remove_imported_add_on"));
+    }
+    /**
+     * Ask the user to remove an installed Add On (fact 130). LUNA shows its own prompt ("Remove
+     * "Video Window"?"), so a page can never remove one silently. If the user agrees, LUNA closes
+     * the Add On wherever it shows, deletes its folder in the Add Ons folder (with every other
+     * Add On installed in that folder, which the prompt names) and rescans, so it leaves
+     * {@link addOns}. An Add On installed with `ua-builder install` on macOS is a symlink: LUNA
+     * removes only the link, never your project.
+     *
+     * Resolves as the prompt opens, not once removed: watch {@link addOns} for the result (it
+     * stays there if the user cancels). Rejects with a `Luna.Error` whose `code` is
+     * `uasrv.invalid_value` for an id not in {@link addOns}, `uasrv.not_permitted` for an Add On
+     * built into LUNA, `uasrv.too_many_requests` while LUNA is already asking, and
+     * `uasrv.missing_field` with no id. A LUNA without the command rejects with
+     * `Luna.Unsupported`.
+     *
+     * @example
+     * await luna.gui.uninstallAddOn('com.uaudio.video_window');
+     */
+    async uninstallAddOn(id) {
+      await this.post("uninstall_add_on", { id }).catch(olderLuna("uninstallAddOn", "uninstall_add_on"));
+    }
+    /**
+     * Open the editor window of the plugin in `slot` on a track or bus, as clicking it in
+     * LUNA's mixer does (or bring it to the front). LUNA answers before the window opens, and
+     * an empty slot opens nothing: `effect.openEditor()` waits for the window and says so.
+     * `sessionUid` defaults to the session in LUNA's window. A LUNA without the command
+     * rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * await luna.gui.showPlugin(track.id, 'effect_0');
+     */
+    showPlugin(channelUid, slot, options = {}) {
+      return this.post("show_plugin", pluginPayload(channelUid, slot, options.sessionUid)).catch(olderLuna("showPlugin", "show_plugin"));
+    }
+    /**
+     * Close the editor window of the plugin in `slot`, if it is open. See {@link showPlugin}.
+     *
+     * @example
+     * await luna.gui.hidePlugin(track.id, 'effect_0');
+     */
+    hidePlugin(channelUid, slot, options = {}) {
+      return this.post("hide_plugin", pluginPayload(channelUid, slot, options.sessionUid)).catch(olderLuna("hidePlugin", "hide_plugin"));
     }
     /** Run a LUNA rack command by id with extra fields as its data. Escape hatch. */
     execute(command, data = {}) {
@@ -8783,7 +9380,7 @@ var Luna = (() => {
     /**
      * The URL your Add On's page loads a local audio or video file from, given its absolute
      * `path` (from {@link chooseFiles}, `Luna.onPathDrop()`, or a path you saved, say in
-     * `session.preferences`). Set it as a `<video>` or `<audio>` `src`, or read the bytes with
+     * `session.storage`). Set it as a `<video>` or `<audio>` `src`, or read the bytes with
      * XMLHttpRequest (fact 114). This is how a page plays or reads a file it knows only by path.
      *
      * `addOnId` is your manifest's `id`: the file is served to that Add On's pages only. On
@@ -8793,10 +9390,11 @@ var Luna = (() => {
      * after every reload: LUNA forgets the files it served when it quits.
      *
      * Only real media is served. LUNA follows links and checks the file they lead to: it needs
-     * an audio or video extension (`mp4`, `m4v`, `mov`, `webm`, `ogv`, `wav`, `aif`, `aiff`,
-     * `mp3`, `m4a`, `flac`, `ogg`, `oga`, `opus`) and that format's signature in its first
-     * bytes. Rejects with a `Luna.Error` whose `code` is `uasrv.invalid_value` for a relative
-     * path, a folder, or a file that is not audio or video; `uasrv.filesystem_error` when
+     * an audio, video or MIDI extension (`mp4`, `m4v`, `mov`, `webm`, `ogv`, `wav`, `aif`,
+     * `aiff`, `mp3`, `m4a`, `flac`, `ogg`, `oga`, `opus`, `mid`, `midi`) and that format's
+     * signature in its first bytes (`MThd` for a Standard MIDI File). Rejects with a
+     * `Luna.Error` whose `code` is `uasrv.invalid_value` for a relative path, a folder, or a
+     * file that is not audio, video or MIDI; `uasrv.filesystem_error` when
      * nothing is at `path` (a session opened on another computer, a file moved) or it cannot
      * be read; `uasrv.not_installed` when `addOnId` names no installed Add On with a local
      * page. A LUNA without the command rejects with `Luna.Unsupported`.
@@ -8876,6 +9474,14 @@ var Luna = (() => {
       }
       throw err;
     };
+  }
+  function pluginPayload(channelUid, slot, sessionUid) {
+    const payload = { channel_uid: channelUid, insert_type: slot };
+    if (sessionUid !== void 0) payload["session_uid"] = sessionUid;
+    return payload;
+  }
+  function sameUid(a, b) {
+    return a.replaceAll("-", "").toLowerCase() === b.replaceAll("-", "").toLowerCase();
   }
   function randomUid() {
     const g = globalThis;
@@ -9761,6 +10367,42 @@ var Luna = (() => {
       for (const p of this.items) for (const c of p.categories) set.add(c);
       return [...set].sort();
     }
+    /**
+     * Ask LUNA for the installed plugins matching a search, categories and favorites, sorted by
+     * name (fact 127). With `insertType`, only those LUNA's plugins browser offers for that slot:
+     * an instrument slot takes instruments, an effect slot effects, and with `channelUid` only
+     * plugins that run in the channel's format. LUNA applies the rules; the catalog need not be
+     * loaded. A LUNA without the query rejects with `Luna.Unsupported`.
+     *
+     * @example
+     * const eqs = await luna.plugins.query({ categories: ['EQ'], search: 'pultec' });
+     * const instruments = await luna.plugins.query({ insertType: 'instrument' });
+     * await track.effects.byId('effect_0')!.setPlugin(eqs[0].pluginId);
+     */
+    async query(options = {}) {
+      const payload = {};
+      if (options.search !== void 0) payload["search"] = options.search;
+      if (options.categories !== void 0) payload["categories"] = [...options.categories];
+      if (options.favoritesOnly !== void 0) payload["favorite"] = options.favoritesOnly;
+      if (options.insertType !== void 0) payload["insert_type"] = options.insertType;
+      if (options.sessionUid !== void 0) payload["session_uid"] = options.sessionUid;
+      if (options.channelUid !== void 0) payload["channel_uid"] = options.channelUid;
+      if (options.limit !== void 0) payload["limit"] = options.limit;
+      let reply;
+      try {
+        reply = await this.client.raw.post("/plugins/query", payload);
+      } catch (err) {
+        if (err instanceof UAError && err.code === "uasrv.invalid_object") throw new Unsupported("luna.plugins.query: this LUNA has no /plugins/query; it needs a newer LUNA.");
+        throw err;
+      }
+      return (reply?.plugins ?? []).map((p) => ({
+        pluginId: String(p["plugin_id"] ?? ""),
+        name: String(p["name"] ?? ""),
+        manufacturer: String(p["manufacturer"] ?? ""),
+        categories: Array.isArray(p["categories"]) ? p["categories"].map(String) : [],
+        favorite: p["favorite"] === true
+      }));
+    }
     /** Ask the engine to rescan installed plugins. */
     rescan() {
       return this.client.raw.post("/plugins/rescan");
@@ -9768,7 +10410,11 @@ var Luna = (() => {
   };
 
   // src/model/presets.ts
+  var TRACK_PRESET_CATEGORIES = ["Audio", "Instrument", "Bus", "Multi-Track"];
+  var TAG_GROUP_WAIT_MS = 3e3;
+  var HIDDEN_TRACK_TAGS = /* @__PURE__ */ new Set([...TRACK_PRESET_CATEGORIES, "All"]);
   var Presets = class extends Node {
+    instrumentList;
     /** @internal */
     constructor(client) {
       super(client, "/presets");
@@ -9793,8 +10439,54 @@ var Luna = (() => {
       if (options.withTags) payload["tags"] = true;
       if (options.favorite !== void 0) payload["favorite"] = options.favorite;
       if (options.limit !== void 0) payload["limit"] = options.limit;
+      if (options.includeInstrumentPresets !== void 0) payload["include_instrument_presets"] = options.includeInstrumentPresets;
       const reply = await this.post("query", payload);
-      return rowsFrom(reply?.results);
+      const rows = rowsFrom(reply?.results);
+      if (rows.some((r) => r.isInstrumentPreset)) await this.namePlugins(rows);
+      return rows;
+    }
+    /** Give each instrument preset its plugin, by the preset folder that holds it (fact 132). */
+    async namePlugins(rows) {
+      const sources = await this.instruments();
+      for (const row of rows) {
+        if (!row.isInstrumentPreset) continue;
+        let best;
+        for (const source of sources) {
+          for (const root of source.roots) {
+            const inside = row.path === root || row.path.startsWith(`${root}/`);
+            if (inside && root.length > (best?.length ?? -1)) best = { source, length: root.length };
+          }
+        }
+        if (best) {
+          row.pluginId = best.source.pluginId;
+          row.pluginName = best.source.name;
+        }
+      }
+    }
+    /**
+     * The installed instruments with their preset folders, read once and kept: LUNA's own
+     * browser asks for the same list. {@link forgetInstruments} reads it again next time.
+     */
+    instruments() {
+      if (!this.instrumentList) {
+        const reading = (async () => {
+          const plugins = await this.client.plugins.query({ insertType: "instrument" }).catch(() => []);
+          return Promise.all(
+            plugins.filter((p) => addressable(p.pluginId)).map(async (p) => {
+              const node = await within(this.wire.get(`/presets/plugins/${p.pluginId}`, { properties: true, children: false, commands: false, flatvalue: true, propfilter: ["factory_root", "user_root"] }), null);
+              const roots = [node?.properties?.["factory_root"], node?.properties?.["user_root"]].filter((r) => typeof r === "string" && r !== "").map((r) => r.replace(/\/+$/, ""));
+              return { pluginId: p.pluginId, name: p.name, roots };
+            })
+          );
+        })();
+        reading.catch(() => this.instrumentList = void 0);
+        this.instrumentList = reading;
+      }
+      return this.instrumentList;
+    }
+    /** Read the installed instruments again on the next query, for example after one was installed. */
+    forgetInstruments() {
+      this.instrumentList = void 0;
     }
     /**
      * The plugin's preset name exactly `name` (case-insensitive), or `undefined`. When the
@@ -9820,7 +10512,32 @@ var Luna = (() => {
      * groups.map((g) => g.name); // ['TYPE', 'GENRE', 'DESCRIPTION']
      */
     async tagGroups(pluginId) {
-      const tree = await this.wire.get(`/presets/plugins/${pluginId}/categories`, { recursive: true, children: true, properties: true, commands: false, flatvalue: true });
+      return this.groupsAt(`/presets/plugins/${pluginId}/categories`);
+    }
+    /**
+     * The tag groups LUNA's track preset browser shows: the track presets' own groups and every
+     * installed instrument plugin's, merged by group name, without the category tags (`Audio`,
+     * `Instrument`, `Bus`, `Multi-Track`), which {@link TRACK_PRESET_CATEGORIES} lists (fact 132).
+     *
+     * @example
+     * const groups = await luna.presets.trackTagGroups();
+     * groups.map((g) => g.name); // ['GENRE', 'TYPE', ...]
+     */
+    async trackTagGroups() {
+      const instruments = await this.instruments();
+      const sources = [`/presets/devices/track/categories`, ...instruments.map((p) => `/presets/plugins/${p.pluginId}/categories`)];
+      const all = (await Promise.all(sources.map((path) => within(this.groupsAt(path), [])))).flat();
+      const byName = /* @__PURE__ */ new Map();
+      for (const group of all) {
+        const tags = group.tags.filter((t) => !HIDDEN_TRACK_TAGS.has(t));
+        const seen = byName.get(group.name);
+        if (seen) seen.tags.push(...tags.filter((t) => !seen.tags.includes(t)));
+        else byName.set(group.name, { ...group, tags: [...new Set(tags)] });
+      }
+      return [...byName.values()].filter((g) => g.tags.length > 0);
+    }
+    async groupsAt(path) {
+      const tree = await this.wire.get(path, { recursive: true, children: true, properties: true, commands: false, flatvalue: true });
       const groups = [];
       for (const category of tree?.children ?? []) {
         const subs = category.children?.find((c) => c.path === "sub_categories");
@@ -9884,6 +10601,26 @@ var Luna = (() => {
     selection(pluginId, options = {}) {
       return new PresetSelection(this.client, pluginId, options);
     }
+    /**
+     * A live selection over track presets, as LUNA's track preset browser offers them: a
+     * `category` (one of {@link TRACK_PRESET_CATEGORIES}, or `null` for all), tags, and search
+     * text. With no category or `Instrument`, installed instrument plugins' presets are listed
+     * too, marked `isInstrumentPreset` (fact 132). Pass a row to {@link Session.newTrackFromPreset}
+     * to make a track from it, or to {@link Track.loadPreset} to apply it to a track. Call
+     * `dispose()` when done.
+     *
+     * @example
+     * const sel = luna.presets.trackSelection({ category: 'Instrument' });
+     * await sel.ready();
+     * await sel.search.set('piano');
+     * await sel.settled();
+     * const [track] = await session.newTrackFromPreset(sel.presets.items[0]);
+     * await track.loadPreset(sel.presets.items[1]);   // replace it with another
+     * sel.dispose();
+     */
+    trackSelection(options = {}) {
+      return new TrackPresetSelection(this.client, options);
+    }
   };
   var Assistant = class extends Node {
     /** True while UA Assistant is connected to LUNA. */
@@ -9894,84 +10631,62 @@ var Luna = (() => {
       this.enabled = this.prop("enabled");
     }
   };
-  var PresetSelection = class {
-    /** @internal Use {@link Presets.selection}. */
-    constructor(client, pluginId, options = {}) {
+  var PresetSelectionBase = class {
+    constructor(client, base) {
       this.client = client;
-      this.pluginId = pluginId;
-      this.options = options;
+      this.base = base;
       const scheduler = client.store.scheduler;
       this.presetsApi = client.presets;
       this.searchCell = new Cell(scheduler, "");
       this.tagsCell = new Cell(scheduler, []);
-      this.anyCell = new Cell(scheduler, false);
       this.groupsCell = new Cell(scheduler, []);
       this.presetsCell = new Cell(scheduler, []);
-      this.recsCell = new Cell(scheduler, []);
       this.loadingCell = new Cell(scheduler, false);
       this.errorCell = new Cell(scheduler, null);
-      this.recErrorCell = new Cell(scheduler, null);
-      const input = (cell) => writable(cell, async (value) => {
-        if (cell.update(value)) this.changed();
-      });
-      this.search = input(this.searchCell);
-      this.tags = input(this.tagsCell);
-      this.matchAnyTag = input(this.anyCell);
+      this.search = this.input(this.searchCell);
+      this.tags = this.input(this.tagsCell);
       this.groups = this.groupsCell;
       this.presets = listOf(this.presetsCell, (row) => row.uid);
-      this.recommendations = listOf(this.recsCell, (rec) => rec.uid);
-      this.recommendationsAvailable = derived([client.assistant.enabled], () => client.assistant.enabled.value === true);
       this.loading = this.loadingCell;
       this.error = this.errorCell;
-      this.recommendationError = this.recErrorCell;
     }
     client;
-    pluginId;
-    options;
-    /** Search text. Filters `presets` by name and is what recommendations are asked for. */
+    base;
+    /** Search text. Filters `presets` by name; for a plugin's presets, it is also what recommendations are asked for. */
     search;
     /** Selected tags. */
     tags;
-    /** Match presets carrying any selected tag rather than all of them. Default false. */
-    matchAnyTag;
-    /** The plugin's tag groups, once {@link ready}. */
+    /** The tag groups, once {@link ready}. */
     groups;
     /** Presets matching the search text and tags, with their tags. */
     presets;
-    /** UA Assistant's picks for the search text, among presets carrying the tags. Best first. */
-    recommendations;
-    /** True while UA Assistant is connected, so recommendations can come. */
-    recommendationsAvailable;
-    /** True while a list query or a recommendation request is in flight or waiting. */
+    /** True while a request is in flight or waiting. */
     loading;
     /** The last list query's failure, or `null`. */
     error;
-    /** The last recommendation request's failure, or `null`. */
-    recommendationError;
     searchCell;
     tagsCell;
-    anyCell;
     groupsCell;
     presetsCell;
-    recsCell;
     loadingCell;
     errorCell;
-    recErrorCell;
     presetsApi;
     releases = [];
-    queryTimer;
-    recTimer;
-    queryGen = 0;
-    recGen = 0;
+    timers = /* @__PURE__ */ new Map();
+    gens = /* @__PURE__ */ new Map();
     inFlight = 0;
     waiters = [];
     readyPromise;
-    /** Uids carrying the selected tags, by tag selection, for filtering recommendations. */
-    taggedUids = /* @__PURE__ */ new Map();
     isDisposed = false;
+    /** A writable input over `cell`: setting a new value queries again. */
+    input(cell) {
+      return writable(cell, async (value) => {
+        if (cell.update(value)) this.changed();
+      });
+    }
     /**
-     * Read the tag groups and the first list, and start following UA Assistant's connection.
-     * Idempotent.
+     * Read the tag groups and the first list (and, for a plugin's presets, start following UA
+     * Assistant's connection). Idempotent.
      *
      * @example
      * await sel.ready();
@@ -9981,15 +10696,8 @@ var Luna = (() => {
       return this.readyPromise;
     }
     async start() {
-      if (this.wantsRecommendations) {
-        const watch = this.client.assistant.watch();
-        this.releases.push(watch.release);
-        this.releases.push(this.client.assistant.enabled.onChange(() => this.scheduleRecommendations(0)));
-        await watch.ready.catch(() => {
-        });
-      }
-      const groups = this.track(this.presetsApi.tagGroups(this.pluginId).catch(() => []));
-      this.scheduleQuery(0);
+      const groups = this.track(this.loadGroups().catch(() => []));
+      this.schedule("query", 0, (current) => this.runQuery(current));
       this.groupsCell.update(await groups);
       await this.settled();
     }
@@ -10011,7 +10719,6 @@ var Luna = (() => {
     }
     /** Query again with the current inputs, for example after presets were saved or deleted. */
     refresh() {
-      this.taggedUids.clear();
       this.changed();
     }
     /**
@@ -10029,100 +10736,56 @@ var Luna = (() => {
     dispose() {
       if (this.isDisposed) return;
       this.isDisposed = true;
-      clearTimeout(this.queryTimer);
-      clearTimeout(this.recTimer);
-      this.queryTimer = this.recTimer = void 0;
-      this.queryGen++;
-      this.recGen++;
+      for (const timer of this.timers.values()) clearTimeout(timer);
+      this.timers.clear();
+      for (const [key, gen] of this.gens) this.gens.set(key, gen + 1);
       for (const release2 of this.releases.splice(0)) release2();
       this.wake();
     }
     get disposed() {
       return this.isDisposed;
     }
-    get wantsRecommendations() {
-      return this.options.recommend !== false;
+    get started() {
+      return this.readyPromise !== void 0;
     }
     get idle() {
-      return this.inFlight === 0 && this.queryTimer === void 0 && this.recTimer === void 0;
+      return this.inFlight === 0 && this.timers.size === 0;
     }
+    /** An input moved: query again after the quiet time. */
     changed() {
-      if (this.isDisposed || !this.readyPromise) return;
-      this.scheduleQuery(this.options.queryDelayMs ?? 100);
-      this.scheduleRecommendations(this.options.recommendDelayMs ?? 300);
+      if (this.isDisposed || !this.started) return;
+      this.schedule("query", this.base.queryDelayMs ?? 100, (current) => this.runQuery(current));
     }
-    scheduleQuery(delayMs) {
+    /**
+     * Run `job` after `delayMs`, replacing a pending job under the same `key`. `current()` turns
+     * false once a newer job for the key is scheduled, so a stale reply can be dropped.
+     */
+    schedule(key, delayMs, job) {
       if (this.isDisposed) return;
-      clearTimeout(this.queryTimer);
-      this.queryGen++;
-      this.queryTimer = setTimeout(() => {
-        this.queryTimer = void 0;
-        void this.runQuery();
-      }, delayMs);
+      clearTimeout(this.timers.get(key));
+      const gen = (this.gens.get(key) ?? 0) + 1;
+      this.gens.set(key, gen);
+      this.timers.set(
+        key,
+        setTimeout(() => {
+          this.timers.delete(key);
+          void job(() => this.gens.get(key) === gen).finally(() => this.wake());
+        }, delayMs)
+      );
       this.loadingCell.update(true);
     }
-    scheduleRecommendations(delayMs) {
-      if (this.isDisposed || !this.readyPromise) return;
-      clearTimeout(this.recTimer);
-      this.recGen++;
-      this.recTimer = setTimeout(() => {
-        this.recTimer = void 0;
-        void this.runRecommendations();
-      }, delayMs);
-      this.loadingCell.update(true);
-    }
-    async runQuery() {
-      const gen = this.queryGen;
-      const tags = this.tagsCell.value ?? [];
-      const options = { pluginId: this.pluginId, search: this.searchCell.value ?? "", withTags: true };
-      if (tags.length > 0) {
-        options.tags = tags;
-        options.matchAnyTag = this.anyCell.value === true;
-      }
-      if (this.options.limit !== void 0) options.limit = this.options.limit;
+    async runQuery(current) {
+      const options = { ...this.listQuery(), withTags: true };
+      if (this.base.limit !== void 0) options.limit = this.base.limit;
       try {
         const rows = await this.track(this.presetsApi.query(options));
-        if (gen !== this.queryGen) return;
+        if (!current()) return;
         this.presetsCell.update(rows);
         this.errorCell.update(null);
       } catch (err) {
-        if (gen !== this.queryGen) return;
+        if (!current()) return;
         this.errorCell.update(asError(err));
       }
-    }
-    async runRecommendations() {
-      const gen = this.recGen;
-      const text = (this.searchCell.value ?? "").trim();
-      if (!this.wantsRecommendations || text === "" || this.client.assistant.enabled.value !== true) {
-        this.recsCell.update([]);
-        this.recErrorCell.update(null);
-        this.wake();
-        return;
-      }
-      const tags = this.tagsCell.value ?? [];
-      const any = this.anyCell.value === true;
-      try {
-        const [recs, allowed] = await this.track(Promise.all([this.presetsApi.recommend(this.pluginId, text), tags.length > 0 ? this.tagged(tags, any) : Promise.resolve(void 0)]));
-        if (gen !== this.recGen) return;
-        const kept = allowed ? recs.filter((r) => allowed.has(r.uid)) : recs;
-        this.recsCell.update(kept.slice(0, this.options.maxRecommendations ?? 5));
-        this.recErrorCell.update(null);
-      } catch (err) {
-        if (gen !== this.recGen) return;
-        this.recsCell.update([]);
-        this.recErrorCell.update(asError(err));
-      }
-    }
-    /** Every preset uid carrying `tags`, ignoring the search text. Cached per tag selection. */
-    tagged(tags, any) {
-      const key = JSON.stringify([any, [...tags].sort()]);
-      let found = this.taggedUids.get(key);
-      if (!found) {
-        found = this.presetsApi.query({ pluginId: this.pluginId, tags, matchAnyTag: any }).then((rows) => new Set(rows.map((r) => r.uid)));
-        found.catch(() => this.taggedUids.delete(key));
-        this.taggedUids.set(key, found);
-      }
-      return found;
     }
     /** Count `work` as in flight until it settles. */
     track(work) {
@@ -10139,6 +10802,149 @@ var Luna = (() => {
       for (const w of waiters) w();
     }
   };
+  var PresetSelection = class extends PresetSelectionBase {
+    /** @internal Use {@link Presets.selection}. */
+    constructor(client, pluginId, options = {}) {
+      super(client, options);
+      this.pluginId = pluginId;
+      this.options = options;
+      const scheduler = client.store.scheduler;
+      this.anyCell = new Cell(scheduler, false);
+      this.recsCell = new Cell(scheduler, []);
+      this.recErrorCell = new Cell(scheduler, null);
+      this.matchAnyTag = this.input(this.anyCell);
+      this.recommendations = listOf(this.recsCell, (rec) => rec.uid);
+      this.recommendationsAvailable = derived([client.assistant.enabled], () => client.assistant.enabled.value === true);
+      this.recommendationError = this.recErrorCell;
+    }
+    pluginId;
+    options;
+    /** Match presets carrying any selected tag rather than all of them. Default false. */
+    matchAnyTag;
+    /** UA Assistant's picks for the search text, among presets carrying the tags. Best first. */
+    recommendations;
+    /** True while UA Assistant is connected, so recommendations can come. */
+    recommendationsAvailable;
+    /** The last recommendation request's failure, or `null`. */
+    recommendationError;
+    anyCell;
+    recsCell;
+    recErrorCell;
+    /** Uids carrying the selected tags, by tag selection, for filtering recommendations. */
+    taggedUids = /* @__PURE__ */ new Map();
+    /** Query again with the current inputs, for example after presets were saved or deleted. */
+    refresh() {
+      this.taggedUids.clear();
+      super.refresh();
+    }
+    async start() {
+      if (this.wantsRecommendations) {
+        const watch = this.client.assistant.watch();
+        this.releases.push(watch.release);
+        this.releases.push(this.client.assistant.enabled.onChange(() => this.scheduleRecommendations(0)));
+        await watch.ready.catch(() => {
+        });
+      }
+      await super.start();
+    }
+    loadGroups() {
+      return this.presetsApi.tagGroups(this.pluginId);
+    }
+    listQuery() {
+      const tags = this.tagsCell.value ?? [];
+      const options = { pluginId: this.pluginId, search: this.searchCell.value ?? "" };
+      if (tags.length > 0) {
+        options.tags = tags;
+        options.matchAnyTag = this.anyCell.value === true;
+      }
+      return options;
+    }
+    changed() {
+      super.changed();
+      this.scheduleRecommendations(this.options.recommendDelayMs ?? 300);
+    }
+    get wantsRecommendations() {
+      return this.options.recommend !== false;
+    }
+    scheduleRecommendations(delayMs) {
+      if (!this.started) return;
+      this.schedule("recommend", delayMs, (current) => this.runRecommendations(current));
+    }
+    async runRecommendations(current) {
+      const text = (this.searchCell.value ?? "").trim();
+      if (!this.wantsRecommendations || text === "" || this.client.assistant.enabled.value !== true) {
+        this.recsCell.update([]);
+        this.recErrorCell.update(null);
+        return;
+      }
+      const tags = this.tagsCell.value ?? [];
+      const any = this.anyCell.value === true;
+      try {
+        const [recs, allowed] = await this.track(Promise.all([this.presetsApi.recommend(this.pluginId, text), tags.length > 0 ? this.tagged(tags, any) : Promise.resolve(void 0)]));
+        if (!current()) return;
+        const kept = allowed ? recs.filter((r) => allowed.has(r.uid)) : recs;
+        this.recsCell.update(kept.slice(0, this.options.maxRecommendations ?? 5));
+        this.recErrorCell.update(null);
+      } catch (err) {
+        if (!current()) return;
+        this.recsCell.update([]);
+        this.recErrorCell.update(asError(err));
+      }
+    }
+    /** Every preset uid carrying `tags`, ignoring the search text. Cached per tag selection. */
+    tagged(tags, any) {
+      const key = JSON.stringify([any, [...tags].sort()]);
+      let found = this.taggedUids.get(key);
+      if (!found) {
+        found = this.presetsApi.query({ pluginId: this.pluginId, tags, matchAnyTag: any }).then((rows) => new Set(rows.map((r) => r.uid)));
+        found.catch(() => this.taggedUids.delete(key));
+        this.taggedUids.set(key, found);
+      }
+      return found;
+    }
+  };
+  var TrackPresetSelection = class extends PresetSelectionBase {
+    /**
+     * The category, one of {@link TRACK_PRESET_CATEGORIES}, or `null` for all of them. With
+     * `null` or `Instrument`, instrument plugins' presets are listed too (fact 132).
+     */
+    category;
+    categoryCell;
+    /** @internal Use {@link Presets.trackSelection}. */
+    constructor(client, options = {}) {
+      super(client, options);
+      this.categoryCell = new Cell(client.store.scheduler, options.category ?? null);
+      this.category = this.input(this.categoryCell);
+    }
+    /** Query again with the current inputs, and read the installed instruments again. */
+    refresh() {
+      this.presetsApi.forgetInstruments();
+      super.refresh();
+    }
+    /** True when the current category lists instrument plugins' presets as well. */
+    get includesInstrumentPresets() {
+      const category = this.categoryCell.value ?? null;
+      return category === null || category === "Instrument";
+    }
+    loadGroups() {
+      return this.presetsApi.trackTagGroups();
+    }
+    listQuery() {
+      const category = this.categoryCell.value ?? null;
+      const tags = [...category ? [category] : [], ...this.tagsCell.value ?? []];
+      const options = { deviceTypeId: "track", search: this.searchCell.value ?? "", includeInstrumentPresets: this.includesInstrumentPresets };
+      if (tags.length > 0) options.tags = tags;
+      return options;
+    }
+  };
+  function addressable(pluginId) {
+    return pluginId !== "" && pluginId === pluginId.trim();
+  }
+  function within(work, fallback) {
+    let timer;
+    const late = new Promise((resolve) => timer = setTimeout(() => resolve(fallback), TAG_GROUP_WAIT_MS));
+    return Promise.race([work.catch(() => fallback), late]).finally(() => clearTimeout(timer));
+  }
   function asError(err) {
     return err instanceof UAError ? err : new UAError("unknown", err instanceof Error ? err.message : String(err));
   }
@@ -10150,6 +10956,7 @@ var Luna = (() => {
       return Array.isArray(arr) && arr[i] !== void 0 ? arr[i] : fallback;
     };
     const withTags = Array.isArray(results["tags"]);
+    const withInstrument = Array.isArray(results["is_instrument_preset"]);
     const rows = [];
     for (let i = 0; i < n; i++) {
       const row = {
@@ -10162,6 +10969,7 @@ var Luna = (() => {
         path: col("path", i, "")
       };
       if (withTags) row.tags = col("tags", i, []);
+      if (withInstrument) row.isInstrumentPreset = Boolean(col("is_instrument_preset", i, false));
       rows.push(row);
     }
     return rows;
@@ -10722,8 +11530,8 @@ var Luna = (() => {
     /** Tempo map, time and key signatures, and tick/bar/seconds conversion. */
     musical;
     markers;
-    /** Settings Add Ons keep with this session, by reverse-DNS context (fact 110). */
-    preferences;
+    /** Data Add Ons keep with this session, by reverse-DNS context (fact 129). */
+    storage;
     /** Edit contexts (`main`, `editor`, `alt_<n>`). */
     contexts;
     /** The `main` edit context: selection, zoom and the context edit commands. */
@@ -10767,7 +11575,7 @@ var Luna = (() => {
       this.playlists = new Collection(client, `${this.path}/playlists`, (p) => new Playlist(client, p, uid, () => this.transactionMode), { levels: 2, commands: false, flatvalue: true });
       this.musical = new Musical(client, this.path, uid, (name, fn) => this.transaction(name, fn));
       this.markers = new Markers(client, this.path, uid, () => this.musical.timeline);
-      this.preferences = new SessionPreferences(client, this.path);
+      this.storage = new SessionStorage(client, this.path);
       this.contexts = new Collection(client, `${this.path}/contexts`, (p) => new Context(client, p, uid), { levels: 2, commands: false, flatvalue: true });
       this.context = new Context(client, `${this.path}/contexts/main`, uid);
       const focusedId = derived([this.context.lastSelectedTrack, this.context.selectionTracks, this.tracks], () => this.focusedTrackId(), { distinct: true });
@@ -10793,7 +11601,7 @@ var Luna = (() => {
       if (!this.readyPromise) {
         const watch = this.client.store.watch(this.path, { recursive: true, load: { flatvalue: true, commands: false } });
         this.watchRelease = watch.release;
-        const ready = watch.ready.then(() => Promise.all([this.tracks.load(), this.buses.load(), this.playlists.load(), this.musical.ready(), this.markers.load(), this.contexts.load()])).then(() => void 0);
+        const ready = watch.ready.then(() => Promise.all([this.tracks.load(), this.buses.load(), this.playlists.load(), this.musical.ready(), this.markers.load(), this.contexts.load(), this.client.gui.watchPluginWindows()])).then(() => void 0);
         ready.catch(() => {
           if (this.readyPromise !== ready) return;
           this.readyPromise = void 0;
@@ -10869,6 +11677,43 @@ var Luna = (() => {
       });
       await this.buses.membersReady();
       return this.buses.byId(uid);
+    }
+    /**
+     * Make a track from a preset in one undo step (fact 132), as LUNA's New Track From Preset
+     * does, and resolve to the new tracks once they are listed in {@link tracks} with their
+     * properties loaded. The preset is a row from {@link Presets.trackSelection} or
+     * `luna.presets.query({ deviceTypeId: 'track', includeInstrumentPresets: true })`:
+     *
+     * - a track preset makes its tracks with its plugins and settings: one named `name`, or
+     *   for a multi-track preset several, keeping the names saved in it; a master bus preset
+     *   loads onto the master bus and makes none, so `[]`;
+     * - an instrument plugin's preset makes a stereo instrument track with the plugin on it,
+     *   on that preset; an effect plugin's preset an audio track with the plugin.
+     *
+     * LUNA selects the new tracks. Rejects with `device.database_error` for an unknown preset.
+     *
+     * @example
+     * const sel = luna.presets.trackSelection({ category: 'Instrument' });
+     * await sel.ready();
+     * const [track] = await session.newTrackFromPreset(sel.presets.items[0]);
+     * track.name.value; // the preset's name
+     */
+    async newTrackFromPreset(preset, options = {}) {
+      const payload = { uid: this.uid, name: options.name ?? preset.name, preset_uid: preset.uid, count: 1, make_name_unique: options.makeNameUnique ?? true };
+      if (options.beforeUid !== void 0) payload["before_uid"] = options.beforeUid;
+      if (options.folderUid !== void 0) payload["folder_uid"] = options.folderUid;
+      if (options.stemFormat !== void 0) payload["stem_format"] = options.stemFormat;
+      const reply = await this.post("new_track", payload);
+      const uids = (Array.isArray(reply) ? reply : reply ? [reply] : []).map((r) => r?.uid).filter((u) => typeof u === "string" && u !== "");
+      if (uids.length === 0) return [];
+      await settle(() => uids.every((uid) => this.tracks.byId(uid) !== void 0 || this.buses.byId(uid) !== void 0), "new tracks", {
+        path: `${this.path}/tracks`,
+        refresh: () => Promise.all([this.tracks.reload(), this.buses.reload()]).then(() => void 0),
+        flush: () => this.client.store.scheduler.flush()
+      });
+      await this.tracks.membersReady();
+      await this.client.settled();
+      return uids.map((uid) => this.tracks.byId(uid)).filter((t) => t !== void 0);
     }
     undo(count = 1) {
       return this.post("undo", { session_uid: this.uid, count });
@@ -11364,7 +12209,7 @@ var Luna = (() => {
       this.playlists.dispose();
       this.musical.dispose();
       this.markers.dispose();
-      this.preferences.dispose();
+      this.storage.dispose();
       this.contexts.dispose();
       this.sourcesCollection?.dispose();
       this.sourcesRelease?.();
@@ -11900,6 +12745,6 @@ var Luna = (() => {
   }
 
   // src/luna.ts
-  var VERSION = "0.2.1";
+  var VERSION = "3.1.1";
   return __toCommonJS(global_exports);
 })();

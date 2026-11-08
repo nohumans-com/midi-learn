@@ -42,7 +42,7 @@ panel (the chevron).
 
 The Learn and Parameters sections fold away from their headers.
 
-- **Session mappings** are saved inside the LUNA session itself (`session.preferences`), so they
+- **Session mappings** are saved inside the LUNA session itself (`session.storage`; a LUNA that predates it keeps them in its older `preferences` node, which MIDI Learn detects and still reads and writes), so they
   come back when you reopen it, and travel with the session file to another machine. Mappings
   made before 0.3.0 sat in this machine's storage, keyed by the session's package uid; the first
   time such a session opens, they move into it.
@@ -180,6 +180,10 @@ without a driver prefix: mappings keep working whichever source is live.
 
 Feedback goes out the same way: through LUNA's output port when it has one, else Web MIDI.
 
+## Looks
+
+The Add On keeps its own colourway by default. Click the round swatch at the top right, then choose **Look: Default | LUNA** to switch to the shared LUNA look (flat dark panels, steel-blue and amber, light-gray action buttons, amber toggle switches). The choice is saved with the other settings (`midilearn.skin`). The look comes from `luna-skin.css` and `luna-skin.js` (copied from the LUNA design system with `sync.sh`); the rules for MIDI Learn's own pieces are the `LUNA look` block at the end of the `<style>` in `index.html`.
+
 ## Run
 
 ```sh
@@ -210,7 +214,7 @@ The `.lunaaddon` is all you hand out. The recipient double-clicks it to install 
 
 ## The vendored SDK is patched
 
-`vendor/luna.global.js` is SDK 0.2.1 (`@uaudio/luna-builder-sdk`) plus one fix that
+`vendor/luna.global.js` is SDK 3.1.1 (`@uaudio/luna-builder-sdk`) plus one fix that
 isn't in the SDK yet. In the released SDK, a load that fails is remembered: `Session.ready()`,
 `Node.load()` and `Collection.load()` keep returning the same error. LUNA can time a read out
 while it's still opening a session, so switching sessions could leave the page on "No session
@@ -250,10 +254,10 @@ as "touch a knob in its window while learning", and a parameter joins the list o
 - Whether a single Qi parameter reads quickly. A read that takes more than 5 s is abandoned, and
   the page says so.
 - **Storage:** session mappings (and any section with Save with this session on) are in the
-  session, in the `com.uaudio.midi-learn` preference context. Everything else (global mappings,
+  session, in the `com.uaudio.midi-learn` storage context. Everything else (global mappings,
   templates, the shared layouts, the colour, the MIDI choice) is in the page's `localStorage`.
   On macOS each Add On has its own, kept across launches while the manifest `id` stays the same.
-  Session preferences need a LUNA that
-  has them; without, session mappings stay in `localStorage` as before.
+  Session storage needs a LUNA that has it (or the older preferences node); without either, session
+  mappings stay in `localStorage` as before.
 - Relative (endless) encoders, 14-bit CC pairs, NRPN and soft takeover are not supported yet.
   An endless encoder that sends 1 or 127 will jump.

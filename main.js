@@ -1311,10 +1311,16 @@ function setColor(hex, remember = true) {
   // The slightest gradient: a touch lighter at the top, a touch darker at the bottom.
   document.documentElement.style.setProperty('--tape-hi', shade(hex, 255, 0.1));
   document.documentElement.style.setProperty('--tape-lo', shade(hex, 0, 0.12));
+  const luna = document.documentElement.dataset.skin === 'luna'; // the LUNA look owns tone and highlight
   const { hit, onHit } = hitColors(hex);
-  document.documentElement.style.setProperty('--hit', hit);
-  document.documentElement.style.setProperty('--on-hit', onHit);
-  document.documentElement.dataset.tone = luminance(hex) < 0.2 ? 'dark' : 'light';
+  if (luna) {
+    document.documentElement.style.removeProperty('--hit');
+    document.documentElement.style.removeProperty('--on-hit');
+  } else {
+    document.documentElement.style.setProperty('--hit', hit);
+    document.documentElement.style.setProperty('--on-hit', onHit);
+    document.documentElement.dataset.tone = luminance(hex) < 0.2 ? 'dark' : 'light';
+  }
   if (remember) store.set('midilearn.color', hex);
   paintColors();
   return true;
@@ -1346,6 +1352,7 @@ function openColors() {
   }
   colorsEl.querySelector('.reset').onclick = () => setColor(DEFAULT_COLOR);
   wirePicker(colorsEl);
+  colorsEl.prepend(colorsEl.querySelector('h4'), LunaSkin.looksRow());
   document.body.appendChild(colorsEl);
   paintColors();
   (grid.querySelector('[aria-pressed="true"]') ?? grid.firstChild).focus();
@@ -1447,6 +1454,9 @@ document.addEventListener('pointerdown', (e) => {
   if (templatesEl && !templatesEl.contains(e.target) && e.target !== $('open-templates')) closeTemplates();
 });
 setColor(store.get('midilearn.color') ?? DEFAULT_COLOR, false);
+// The Look (Default | LUNA) was applied by the early script in index.html; from here it saves through the settings store.
+LunaSkin.init({ key: 'midilearn.skin', get: (k) => store.get(k), set: (k, v) => store.set(k, v) });
+LunaSkin.onchange = () => setColor(store.get('midilearn.color') ?? DEFAULT_COLOR, false);
 
 // ---- Session ------------------------------------------------------------------------------
 // LUNA swaps sessions under the page: closing one empties the list, opening one adds a node that
@@ -1727,5 +1737,54 @@ function healthCheck() {
 setInterval(healthCheck, 30000);
 
 renderDevices();
-connect();
+
+// ---- Licence ---------------------------------------------------------------------------------
+// Until Gumroad accepts a key on this machine, the board stays hidden and MIDI Learn doesn't connect.
+// With the template's placeholder product id nothing is enforced; add ?license to preview the screen.
+function startWithLicense() {
+  const lic = AddOnLicense;
+  const placeholder = lic.isPlaceholder();
+  const preview = new URLSearchParams(location.search).has('license');
+  if (placeholder && !preview) return connect();
+  // The placeholder product has no Gumroad behind it: a fake that knows one key, kept in memory so a preview always starts locked.
+  const fake = async (url, { body }) => ({ json: async () => (body.get('license_key') === 'TEST-1234' ? { success: true, uses: 1, purchase: {} } : { success: false }) });
+  const mgr = lic.manager({ store: placeholder ? { get: () => undefined, set() {} } : store, fetch: placeholder ? fake : undefined });
+  const card = $('license');
+  const msg = $('lic-msg');
+  let started = false;
+  const start = () => {
+    if (started) return;
+    started = true;
+    card.hidden = true;
+    document.body.classList.remove('locked');
+    connect();
+    // A key Gumroad now refuses (a refund, say) stops working at the next check.
+    const check = async () => {
+      if (!mgr.due()) return;
+      const res = await mgr.recheck();
+      if (!res.ok && !res.offline && !mgr.licensed) location.reload();
+    };
+    check();
+    setInterval(check, 6 * 3600 * 1000);
+  };
+  if (mgr.licensed) return start();
+  document.body.classList.add('locked');
+  card.hidden = false;
+  $('lic-buy').href = lic.config.buyUrl;
+  $('lic-preview').hidden = !placeholder;
+  $('lic-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const go = $('lic-go');
+    go.disabled = true;
+    msg.className = 'lic-msg';
+    msg.textContent = 'Checking with Gumroad…';
+    const res = await mgr.activate($('lic-key').value);
+    go.disabled = false;
+    msg.textContent = res.ok ? 'Activated. Thank you!' : res.reason;
+    msg.classList.toggle('ok', !!res.ok);
+    if (res.ok) setTimeout(start, 600);
+  };
+  $('lic-key').focus();
+}
+startWithLicense();
 

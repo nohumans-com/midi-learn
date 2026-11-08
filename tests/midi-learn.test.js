@@ -1534,14 +1534,15 @@ describe('saved with the session', () => {
     expect(third.mapper.focusMappings).toHaveLength(1);
   });
 
-  it('falls back to local storage on a LUNA without session preferences', async () => {
+  it('falls back to local storage on a LUNA without session storage', async () => {
     const engine = new Luna.MockEngine();
     engine.addSession('abc', { name: 'Demo', tracks: ['Vocal', 'Bass'], packageUid: 'pkg_abc' });
     await engine.settled();
     const luna = await Luna.connect({ port_: engine.port() });
     const session = await luna.session();
     const sessionStore = new logic.SessionSettings(session);
-    sessionStore.ctx.load = () => Promise.reject(new Error('no preferences'));
+    sessionStore.ctx.load = () => Promise.reject(new Error('no storage'));
+    sessionStore.openLegacy = () => ({ load: () => Promise.reject(new Error('no preferences')) }); // and no older node either
     expect(await sessionStore.load()).toBe(false);
     const storage = logic.memoryStore();
     const mapper = new logic.Mapper(session, { storage, sessionStore });
@@ -1551,6 +1552,63 @@ describe('saved with the session', () => {
     mapper.save();
     expect(storage.get(logic.KEYS.session('pkg_abc'))).toEqual([{ id: 'x' }]);
     expect(mapper.setSavedWithSession('focus', true)).toBe(false);
+  });
+
+  // A fake of the older LUNA's /preferences node: same surface as LegacyPreferences.
+  const fakeLegacy = (data = {}) => ({
+    data,
+    load: async () => {},
+    value: (rec, field) => ({ value: data[`${rec}/${field}`] }),
+    add: async (rec, field, v) => { data[`${rec}/${field}`] = v; },
+    set: async (rec, field, v) => { data[`${rec}/${field}`] = v; },
+    remove: async (rec, field) => { delete data[`${rec}/${field}`]; },
+  });
+  async function oldLuna(legacy, { storageWorks = false } = {}) {
+    const engine = new Luna.MockEngine();
+    engine.addSession('abc', { name: 'Demo', tracks: ['Vocal', 'Bass'], packageUid: 'pkg_abc' });
+    await engine.settled();
+    const luna = await Luna.connect({ port_: engine.port() });
+    const session = await luna.session();
+    const store = new logic.SessionSettings(session);
+    if (!storageWorks) store.ctx.load = () => Promise.reject(new Error('no storage'));
+    store.openLegacy = () => legacy;
+    return store;
+  }
+
+  it('keeps its settings in the older preferences node on a LUNA that has no session storage', async () => {
+    const legacy = fakeLegacy({ 'settings/focus': { v: [{ id: 'f' }] } });
+    const store = await oldLuna(legacy);
+    expect(await store.load()).toBe(true);
+    expect(store.legacy).toBe(true);
+    expect(store.get('focus')).toEqual([{ id: 'f' }]); // what that LUNA saved earlier is still read
+    store.set('plugins', [{ id: 'p' }]);
+    store.remove('focus');
+    await store.flush();
+    expect(legacy.data).toEqual({ 'settings/plugins': { v: [{ id: 'p' }] } });
+  });
+
+  it('moves to the older node when /storage reads fine but rejects writes', async () => {
+    const legacy = fakeLegacy();
+    const store = await oldLuna(legacy, { storageWorks: true });
+    expect(await store.load()).toBe(true);
+    expect(store.legacy).toBe(false);
+    store.ctx.add = () => Promise.reject(new Error('uasrv.unknown_command'));
+    store.set('mighty', { m: 1 });
+    await store.flush();
+    expect(store.legacy).toBe(true);
+    expect(legacy.data['settings/mighty']).toEqual({ v: { m: 1 } });
+    expect(store.get('mighty')).toEqual({ m: 1 });
+  });
+
+  it('adopts settings an older LUNA saved when /storage has none, and saves them there', async () => {
+    const legacy = fakeLegacy({ 'settings/focus': { v: [{ id: 'f' }] } });
+    const store = await oldLuna(legacy, { storageWorks: true });
+    await store.load();
+    await store.flush();
+    expect(store.legacy).toBe(false);
+    expect(store.get('focus')).toEqual([{ id: 'f' }]);
+    expect(store.ctx.value('settings', 'focus').value).toEqual({ v: [{ id: 'f' }] });
+    expect(legacy.data['settings/focus']).toBeDefined(); // the old copy is left alone
   });
 });
 
