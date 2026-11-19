@@ -1,7 +1,7 @@
 {
   "name": "midi_learn",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "description": "MIDI Learn, a LUNA Add On built with @uaudio/luna-builder-sdk",
   "scripts": {

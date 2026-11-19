@@ -214,7 +214,7 @@ The `.lunaaddon` is all you hand out. The recipient double-clicks it to install 
 
 ## The vendored SDK is patched
 
-`vendor/luna.global.js` is SDK 3.1.1 (`@uaudio/luna-builder-sdk`) plus one fix that
+`vendor/luna.global.js` is SDK 3.1.2 (`@uaudio/luna-builder-sdk`) plus one fix that
 isn't in the SDK yet. In the released SDK, a load that fails is remembered: `Session.ready()`,
 `Node.load()` and `Collection.load()` keep returning the same error. LUNA can time a read out
 while it's still opening a session, so switching sessions could leave the page on "No session
