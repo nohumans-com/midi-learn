@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512">
+  <!-- MIDI Learn Add On icon, in the style of the Markers icon: a controller strip (three knobs
+       with value arcs and a fader) above the mapping list, each row's swatch matching its knob,
+       a source chip, an arrow and its target; the row being learned is lit amber.
+       Rendered to icon.png (1024 px) with:
+       rsvg-convert -w 1024 -h 1024 icon.svg -o icon.png
+       or by opening it in headless Chrome at 1024 x 1024. -->
+  <defs>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2C2D30"/>
+      <stop offset="1" stop-color="#17181A"/>
+    </linearGradient>
+  </defs>
+
+  <!-- dark edge, panel face, inset top highlight -->
+  <rect x="0" y="0" width="512" height="512" fill="#0D0E0F"/>
+  <rect x="4" y="4" width="504" height="504" fill="url(#panel)"/>
+  <rect x="4" y="4" width="504" height="4" fill="#ffffff" opacity="0.08"/>
+
+  <!-- the controller: a well with three knobs and a fader -->
+  <rect x="48" y="56" width="416" height="128" rx="10" fill="#151618"/>
+  <g>
+    <circle cx="112" cy="120" r="36" fill="none" stroke="#2A2B2F" stroke-width="7" stroke-linecap="round" stroke-dasharray="169.6 226.2" transform="rotate(135 112 120)"/>
+    <circle cx="112" cy="120" r="36" fill="none" stroke="#B45BC4" stroke-width="7" stroke-linecap="round" stroke-dasharray="67.9 226.2" transform="rotate(135 112 120)"/>
+    <circle cx="112" cy="120" r="25" fill="#2D2E33"/>
+    <circle cx="112" cy="120" r="25" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+    <line x1="112" y1="120" x2="103.4" y2="103.1" stroke="#F4F5F7" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="208" cy="120" r="36" fill="none" stroke="#2A2B2F" stroke-width="7" stroke-linecap="round" stroke-dasharray="169.6 226.2" transform="rotate(135 208 120)"/>
+    <circle cx="208" cy="120" r="36" fill="none" stroke="#E9B23C" stroke-width="7" stroke-linecap="round" stroke-dasharray="122.1 226.2" transform="rotate(135 208 120)"/>
+    <circle cx="208" cy="120" r="25" fill="#2D2E33"/>
+    <circle cx="208" cy="120" r="25" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+    <line x1="208" y1="120" x2="224.4" y2="110.3" stroke="#F4F5F7" stroke-width="5" stroke-linecap="round"/>
+    <circle cx="304" cy="120" r="36" fill="none" stroke="#2A2B2F" stroke-width="7" stroke-linecap="round" stroke-dasharray="169.6 226.2" transform="rotate(135 304 120)"/>
+    <circle cx="304" cy="120" r="36" fill="none" stroke="#4FA8D8" stroke-width="7" stroke-linecap="round" stroke-dasharray="42.4 226.2" transform="rotate(135 304 120)"/>
+    <circle cx="304" cy="120" r="25" fill="#2D2E33"/>
+    <circle cx="304" cy="120" r="25" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+    <line x1="304" y1="120" x2="286.4" y2="112.7" stroke="#F4F5F7" stroke-width="5" stroke-linecap="round"/>
+  </g>
+  <g>
+    <rect x="413" y="76" width="6" height="88" rx="3" fill="#3A3B40"/>
+    <rect x="396" y="94" width="40" height="24" rx="4" fill="#E8E9EB"/>
+    <rect x="400" y="105" width="32" height="2" fill="#5A5C63"/>
+  </g>
+
+  <!-- the mappings: knob swatch, MIDI source, arrow, target, value; the learning row is lit -->
+  <g>
+    <rect x="48" y="208" width="416" height="72" rx="10" fill="#25262A"/>
+    <circle cx="86" cy="244" r="18" fill="#B45BC4"/>
+    <rect x="124" y="232" width="52" height="24" rx="5" fill="none" stroke="#8A8C93" stroke-width="3"/>
+    <path d="M192 235 l10 9 l-10 9" fill="none" stroke="#5A5C63" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="218" y="236" width="120" height="16" rx="8" fill="#8A8C93"/>
+    <rect x="384" y="236" width="60" height="16" rx="8" fill="#5A5C63"/>
+
+    <rect x="48" y="296" width="416" height="72" rx="10" fill="#2D2E33"/>
+    <rect x="48" y="296" width="8" height="72" rx="3" fill="#E9B23C"/>
+    <circle cx="86" cy="332" r="18" fill="#E9B23C"/>
+    <rect x="124" y="320" width="52" height="24" rx="5" fill="none" stroke="#E8E9EB" stroke-width="3"/>
+    <path d="M192 323 l10 9 l-10 9" fill="none" stroke="#8A8C93" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="218" y="324" width="140" height="16" rx="8" fill="#E8E9EB"/>
+    <rect x="384" y="324" width="60" height="16" rx="8" fill="#8A8C93"/>
+
+    <rect x="48" y="384" width="416" height="72" rx="10" fill="#25262A"/>
+    <circle cx="86" cy="420" r="18" fill="#4FA8D8"/>
+    <rect x="124" y="408" width="52" height="24" rx="5" fill="none" stroke="#8A8C93" stroke-width="3"/>
+    <path d="M192 411 l10 9 l-10 9" fill="none" stroke="#5A5C63" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="218" y="412" width="96" height="16" rx="8" fill="#8A8C93"/>
+    <rect x="384" y="412" width="60" height="16" rx="8" fill="#5A5C63"/>
+  </g>
+</svg>

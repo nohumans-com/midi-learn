@@ -11,6 +11,7 @@
         "luna"
     ],
     "html": "index.html",
+    "icon": "icon.png",
     "target": "browser",
     "width": 360,
     "height": 720,
