@@ -16,11 +16,11 @@ transport commands. No scripts, no setup files.
   When that plugin is in focus its map takes over, and your other mappings come back when it isn't.
 - **Click & Turn:** one knob that controls whatever you last clicked in LUNA.
 
-## Why you'll like it
+## Benefits
 
 - **Fast learning.** Press Learn, click a control, move a knob. Turn on Hold to map a whole bank of
   knobs in one pass.
-- **Motorized controllers stay in sync.** With Feedback on, knobs and button lights follow LUNA
+- **Motorized controllers stay in sync.** With "Feedback" on, knobs and button lights follow LUNA
   through automation, mouse moves and session recall, without fighting your hand.
 - **Knobs and buttons work your way.** Set a range or invert a knob; make a button fire on press or
   toggle like a latch.
@@ -29,5 +29,4 @@ transport commands. No scripts, no setup files.
 
 ## Get started
 
-Open **Add Ons → Browsers → MIDI Learn** on the Timeline or Mixer page. Requires LUNA 3.1.1 or
-later.
+Open the **Add Ons browser** in LUNA and select **MIDI Learn**. Requires LUNA 3.1.1 or later.
