@@ -11,6 +11,7 @@ const logic = globalThis.AddOnLogic;
 const CC = (n, v, ch = 1) => logic.parseMidi([0xb0 | (ch - 1), n, v]);
 const NOTE_ON = (n, v = 100, ch = 1) => logic.parseMidi([0x90 | (ch - 1), n, v]);
 const NOTE_OFF = (n, ch = 1) => logic.parseMidi([0x80 | (ch - 1), n, 0]);
+const PROGRAM = (n, ch = 1) => logic.parseMidi([0xc0 | (ch - 1), n]);
 
 async function connected({ uid = 'abc', tracks = ['Vocal', 'Bass'], storage = logic.memoryStore(), engine = new Luna.MockEngine() } = {}) {
   engine.addSession(uid, { name: 'Demo', tracks, packageUid: `pkg_${uid}` });
@@ -208,6 +209,81 @@ describe('applying MIDI', () => {
     mapper.midi(CC(41, 127), 'Ctl'); // held: no new edge
     await settle();
     expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+  });
+
+  it('runs a command on every Note On even when the controller sends no Note Off', async () => {
+    const { engine, mapper, settle } = await connected();
+    mapper.pick(logic.commandTarget('togglePlayback'));
+    mapper.midi(NOTE_ON(94, 127), 'MPK mini IV');
+    mapper.midi(NOTE_ON(94, 127), 'MPK mini IV');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+    mapper.midi(NOTE_ON(94, 127), 'MPK mini IV'); // 2nd press without Note Off
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(false);
+    mapper.midi(NOTE_ON(94, 30), 'MPK mini IV'); // soft press (velocity < 64) still fires
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+  });
+
+  it('runs a command on every Program Change message', async () => {
+    const { engine, mapper, settle } = await connected();
+    mapper.pick(logic.commandTarget('togglePlayback'));
+    mapper.midi(PROGRAM(1), 'Ctl');
+    mapper.midi(PROGRAM(1), 'Ctl');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+    mapper.midi(PROGRAM(1), 'Ctl');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(false);
+  });
+
+  it('runs a command again on a one-shot CC button (127 with no 0 release) after a quiet gap', async () => {
+    let clock = 1000;
+    const engine = new Luna.MockEngine();
+    engine.addSession('abc', { name: 'Demo', tracks: ['Vocal'], packageUid: 'pkg_abc' });
+    await engine.settled();
+    const luna = await Luna.connect({ port_: engine.port() });
+    const session = await luna.session();
+    const mapper = new logic.Mapper(session, { storage: logic.memoryStore(), now: () => clock });
+    await mapper.start();
+    const settle = async () => {
+      await mapper.settled();
+      await engine.settled();
+      await luna.settled();
+    };
+    mapper.pick(logic.commandTarget('togglePlayback'));
+    mapper.midi(CC(76, 127), 'MPK mini IV DAW Port');
+    // 1st press
+    clock += 500;
+    mapper.midi(CC(76, 127), 'MPK mini IV DAW Port');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+    // Rapid repeat (held button) does not re-trigger
+    clock += 30;
+    mapper.midi(CC(76, 127), 'MPK mini IV DAW Port');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+    // 2nd press after a quiet gap triggers again even without CC 0
+    clock += 300;
+    mapper.midi(CC(76, 127), 'MPK mini IV DAW Port');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(false);
+    // 3rd press also works
+    clock += 300;
+    mapper.midi(CC(76, 127), 'MPK mini IV DAW Port');
+    await settle();
+    expect(engine.value('/sessions/abc', 'playing')).toBe(true);
+  });
+
+  it('toggles a switch on every Note On even without Note Off', async () => {
+    const { engine, mapper, entry, settle } = await mapped('Mute', 'Bass', NOTE_ON(40, 127));
+    mapper.midi(NOTE_ON(40, 127), 'Ctl');
+    await settle();
+    expect(engine.value(entry.path, 'real_value')).toBe(true);
+    mapper.midi(NOTE_ON(40, 127), 'Ctl');
+    await settle();
+    expect(engine.value(entry.path, 'real_value')).toBe(false);
   });
 
   it('does not take its own touches for a target while learning', async () => {
