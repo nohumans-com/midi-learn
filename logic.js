@@ -221,6 +221,12 @@ class SessionSettings {
 
 /** A touch held open this long after the last MIDI value is released (one undo step per move). */
 const RELEASE_MS = 400;
+/**
+ * An identical high CC value (e.g. CC 127 from a one-shot DAW transport button that sends no 0 on
+ * release) arriving after a quiet gap of at least this long counts as a fresh press; faster
+ * repeats are treated as a held button.
+ */
+const REPEAT_MS = 120;
 /** Touches LUNA reports on a control we just wrote are ours, not the user picking a target. */
 const SELF_TOUCH_MS = 1000;
 
@@ -1363,8 +1369,9 @@ class Mapper {
       return;
     }
     const key = AddOnLogic.sourceKey(source);
-    const prev = this.edges.get(key) ?? 0;
-    this.edges.set(key, msg.value);
+    const now = this.now();
+    const prev = this.edges.get(key) ?? { value: 0, at: -Infinity };
+    this.edges.set(key, { value: msg.value, at: now });
     this.fb.seen.set(AddOnLogic.sourceKey({ ...source, device: null, channel: null }), { device: source.device, channel: source.channel });
     // The focused plugin's map is a layer on top: where it uses a source, it alone gets it.
     const layer = this.activePluginMappings().filter((m) => this.matches(m.source, source));
@@ -1694,13 +1701,21 @@ class Mapper {
   // ---- Applying MIDI ---------------------------------------------------------------------
 
   async apply(m, msg, prev) {
-    const rising = msg.value >= 0.5 && prev < 0.5;
+    const prevVal = typeof prev === 'object' ? prev.value : prev ?? 0;
+    const prevAt = typeof prev === 'object' ? prev.at : -Infinity;
+    // A Note On or Program Change is a discrete press event (some controllers send Note On without
+    // Note Off, and Program Change has no release). Some DAW-mode buttons (such as Akai MPK mini IV
+    // DAW Port) send CC 127 on press with no CC 0 on release: treat an identical high CC value
+    // after a quiet gap (REPEAT_MS) as a fresh press, while ignoring rapid held repeats and sweeps.
+    const discrete = msg.type === 'note' || msg.type === 'program';
+    const repeat = !discrete && msg.value >= 0.5 && msg.value === prevVal && this.now() - prevAt >= REPEAT_MS;
+    const rising = discrete ? !!msg.on : (msg.value >= 0.5 && prevVal < 0.5) || repeat;
     // A button target (a command, an automation mode) fires on the press in Follow, or on every
     // change in Toggle: a latching button sends 127 on one press and 0 on the next, and each of
     // those is a press. ('trigger', the older name, is Follow.)
     const relative = m.mode === 'relative';
     const delta = relative ? AddOnLogic.relativeDelta(m.encoding ?? 'twos', msg.raw) : 0;
-    const pressed = relative ? delta * (m.invert ? -1 : 1) > 0 : m.mode === 'toggle' ? msg.value !== prev : rising;
+    const pressed = relative ? delta * (m.invert ? -1 : 1) > 0 : m.mode === 'toggle' ? (discrete ? !!msg.on || msg.value !== prevVal : msg.value !== prevVal || repeat) : rising;
     if (m.target.kind === 'command') {
       if (!pressed) return;
       const cmd = COMMANDS.find((c) => c.id === m.target.command);
